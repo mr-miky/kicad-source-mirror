@@ -158,6 +158,12 @@ struct ATTRIBUTE
     std::string vjust;
     bool right_reading = false;
 
+    // Binary PADS placement-field rendered world AABB. ASCII files do not
+    // serialize this information, so has_bbox remains false there.
+    bool  has_bbox = false;
+    POINT bbox_min;
+    POINT bbox_max;
+
     // Line 2
     std::string font_info;
 
@@ -222,14 +228,22 @@ struct DIFF_PAIR_DEF
 
 struct TEARDROP
 {
-    double pad_width = 0.0;
-    double pad_length = 0.0;
-    int pad_flags = 0;
-    double net_width = 0.0;
-    double net_length = 0.0;
-    int net_flags = 0;
-    bool has_pad_teardrop = false;
-    bool has_net_teardrop = false;
+    // PADS stores teardrop metadata on a ROUTE vertex.
+    // P/N select the Previous/Next segment adjacent to that vertex.
+    double x = 0.0;
+    double y = 0.0;
+    int layer = 0;
+
+    double previous_width = 0.0;
+    double previous_length = 0.0;
+    int previous_flags = 0;
+
+    double next_width = 0.0;
+    double next_length = 0.0;
+    int next_flags = 0;
+
+    bool has_previous = false;
+    bool has_next = false;
 };
 
 struct JUMPER_MARKER
@@ -469,6 +483,13 @@ struct TEXT
 {
     std::string content;
     POINT location;
+
+    // PADS binary direct-import test v2.4: serialized text bounding box.
+    // Source-coordinate, axis-aligned bounds.  For binary section 8 the fourth
+    // coordinate wraps into the first DWORD of the following circular record.
+    POINT bbox_min;
+    POINT bbox_max;
+    bool  has_bbox = false;
     double height = 0.0;
     double width = 0.0;
     int layer = 0;

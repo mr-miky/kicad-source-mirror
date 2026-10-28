@@ -65,6 +65,9 @@ public:
      */
     static STROKE_FONT* LoadFont( const wxString& aFontName );
 
+    /** Load the document embedded alternate stroke font, if one is present. */
+    static STROKE_FONT* LoadAlternateFont( const std::vector<wxString>* aEmbeddedFiles );
+
     /**
      * Compute the distance (interline) between 2 lines of text (for multiline texts).
      *
@@ -104,6 +107,8 @@ private:
      */
     void loadNewStrokeFont( const char* const aNewStrokeFont[], int aNewStrokeFontSize );
 
+    bool loadEmbeddedStrokeFont( const wxString& aFileName );
+
 private:
     static constexpr double m_superSubSize = 0.8;
     static constexpr double m_subscriptBaselineOffset = 0.15;
@@ -111,7 +116,10 @@ private:
 
     const std::vector<std::shared_ptr<GLYPH>>* m_glyphs;
     const std::vector<BOX2D>*                  m_glyphBoundingBoxes;
+    std::vector<std::shared_ptr<GLYPH>>        m_ownedGlyphs;
+    std::vector<BOX2D>                         m_ownedGlyphBoundingBoxes;
     double                                     m_maxGlyphWidth;
+    double                                     m_interChar;
 };
 
 } //namespace KIFONT

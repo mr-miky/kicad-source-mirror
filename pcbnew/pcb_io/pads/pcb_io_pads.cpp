@@ -136,6 +136,8 @@ void PCB_IO_PADS::loadBoard( const wxString& aFileName, BOARD& aBoard, bool aIsN
     m_loadBoard = &aBoard;
     m_parser = &parser;
     m_converter = std::make_unique<PADS_PCB_CONVERTER>( m_loadBoard, m_reporter );
+    // Activate the document alternate stroke font before any PADS text is created.
+    m_converter->PreparePadsRomansimFont();
     m_testPointIndex = 1;
     m_minObjectSize = ADVANCED_CFG::GetCfg().m_PcbImportMinObjectSizeNm;
 
@@ -388,6 +390,8 @@ void PCB_IO_PADS::loadFootprints()
         if( iaIt != partInstanceAttrs.end() )
             instanceAttrs = &iaIt->second;
 
+        std::map<std::string, PCB_FIELD*> customFieldsByName;
+
         auto applyAttributes =
                 [&]( const std::vector<PADS_IO::ATTRIBUTE>& attrs, std::function<int(double)> scaler )
                 {
@@ -426,12 +430,26 @@ void PCB_IO_PADS::loadFootprints()
 
                             if( !attrValue.empty() )
                             {
-                                field = new PCB_FIELD( footprint, FIELD_T::USER,
-                                                       PADS_COMMON::ConvertText( attr.name ) );
+                                auto existing = customFieldsByName.find( attr.name );
+
+                                if( existing != customFieldsByName.end() )
+                                {
+                                    // PART-level presentation overrides the same label from
+                                    // PARTDECAL. Reuse the existing field instead of creating
+                                    // a duplicate custom field.
+                                    field = existing->second;
+                                }
+                                else
+                                {
+                                    field = new PCB_FIELD( footprint, FIELD_T::USER,
+                                                           PADS_COMMON::ConvertText( attr.name ) );
+                                    customFieldsByName[attr.name] = field;
+                                    ownsField = true;
+                                }
+
                                 field->SetText( PADS_COMMON::ConvertText( attrValue ) );
 
-                                // Footprint text fields on copper layers are almost always documentation
-                                // labels. Redirect to the corresponding silkscreen layer.
+                                // Keep the existing source heuristic for layer mapping.
                                 PCB_LAYER_ID fieldLayer = getMappedLayer( attr.level );
 
                                 if( fieldLayer == UNDEFINED_LAYER )
@@ -440,19 +458,27 @@ void PCB_IO_PADS::loadFootprints()
                                     fieldLayer = IsBackLayer( fieldLayer ) ? B_SilkS : F_SilkS;
 
                                 field->SetLayer( fieldLayer );
-                                ownsField = true;
                             }
                         }
 
                         if( !field )
                             continue;
 
+                        auto* padsRomansim = m_converter->GetPadsRomansimFont();
                         int scaledSize = scaler( attr.height );
-                        int charHeight =
-                                static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
-                        int charWidth =
-                                static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
-                        field->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+
+                        if( padsRomansim )
+                        {
+                            field->SetTextSize( VECTOR2I( scaledSize, scaledSize ) );
+                        }
+                        else
+                        {
+                            int charHeight =
+                                    static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
+                            int charWidth =
+                                    static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
+                            field->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+                        }
 
                         if( attr.width > 0 )
                             field->SetTextThickness( scaler( attr.width ) );
@@ -466,9 +492,24 @@ void PCB_IO_PADS::loadFootprints()
                         // PADS text anchor differs from KiCad by a small offset along the
                         // reading direction. Shift left (toward text start) to compensate.
                         EDA_ANGLE textAngle = EDA_ANGLE( attr.orientation, DEGREES_T ) + part_orient;
-                        VECTOR2I textShift( -ADVANCED_CFG::GetCfg().m_PadsTextAnchorOffsetNm, 0 );
-                        RotatePoint( textShift, textAngle );
+                        VECTOR2I textShift( 0, 0 );
+
+                        if( !padsRomansim )
+                        {
+                            textShift.x = -ADVANCED_CFG::GetCfg().m_PadsTextAnchorOffsetNm;
+                            RotatePoint( textShift, textAngle );
+                        }
+
                         offset += textShift;
+
+                        // PADS Romansim v3.6 anchor metric correction.
+                        if( padsRomansim )
+                        {
+                            VECTOR2I metricShift = m_converter->GetPadsRomansimAnchorCorrection(
+                                    attr.vjust, scaledSize, field->GetTextThickness(), attr.mirrored );
+                            RotatePoint( metricShift, textAngle );
+                            offset += metricShift;
+                        }
 
                         field->SetPosition( footprint->GetPosition() + offset );
                         field->SetTextAngle( textAngle );
@@ -482,12 +523,25 @@ void PCB_IO_PADS::loadFootprints()
                         else
                             field->SetHorizJustify( GR_TEXT_H_ALIGN_CENTER );
 
-                        if( attr.vjust == "UP" )
-                            field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
-                        else if( attr.vjust == "DOWN" )
-                            field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                        // PADS Romansim v3.5.2 field vertical-justify mapping.
+                        if( padsRomansim )
+                        {
+                            if( attr.vjust == "UP" )
+                                field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                            else if( attr.vjust == "DOWN" )
+                                field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+                            else
+                                field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                        }
                         else
-                            field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                        {
+                            if( attr.vjust == "UP" )
+                                field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+                            else if( attr.vjust == "DOWN" )
+                                field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                            else
+                                field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                        }
 
                         if( ownsField )
                             footprint->Add( field );
@@ -1539,12 +1593,344 @@ void PCB_IO_PADS::loadTracksAndVias()
             m_loadBoard->Add( via );
         }
     }
+
+    // First teardrop pass: recover only PADS -> KiCad ownership.
+    // Width/length/flags are intentionally left untouched for the next pass.
+    size_t tdPadAnchors = 0;
+    size_t tdViaAnchors = 0;
+    size_t tdUnmatched = 0;
+
+    for( const PADS_IO::ROUTE& route : routes )
+    {
+        NETINFO_ITEM* net =
+                m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( route.net_name ) );
+
+        if( !net )
+            continue;
+
+        for( const PADS_IO::TEARDROP& td : route.teardrops )
+        {
+            PCB_LAYER_ID layer = getMappedLayer( td.layer );
+
+            if( !IsCopperLayer( layer ) )
+            {
+                ++tdUnmatched;
+                continue;
+            }
+
+            VECTOR2I pos( scaleCoord( td.x, true ), scaleCoord( td.y, false ) );
+            bool matched = false;
+
+            // Pad anchor.
+            for( FOOTPRINT* fp : m_loadBoard->Footprints() )
+            {
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( pad->GetPosition() != pos
+                        || pad->GetNetCode() != net->GetNetCode()
+                        || !pad->IsOnLayer( layer ) )
+                    {
+                        continue;
+                    }
+
+                    // PADS teardrop ratio mapping v1.2
+                    // WID/LEN are percentages of the pad/via size.
+                    // A (optional FLAGS) is intentionally ignored for now.
+                    TEARDROP_PARAMETERS& tdParams = pad->GetTeardropParams();
+
+                    tdParams.m_Enabled = true;
+
+                    if( td.has_previous )
+                        tdParams.SetTeardropSizeRatio( td.previous_length / 100.0,
+                                                       td.previous_width / 100.0 );
+                    else if( td.has_next )
+                        tdParams.SetTeardropSizeRatio( td.next_length / 100.0,
+                                                       td.next_width / 100.0 );
+
+                    ++tdPadAnchors;
+                    matched = true;
+                    break;
+                }
+
+                if( matched )
+                    break;
+            }
+
+            if( matched )
+                continue;
+
+            // Via anchor.
+            for( PCB_TRACK* item : m_loadBoard->Tracks() )
+            {
+                if( item->Type() != PCB_VIA_T )
+                    continue;
+
+                PCB_VIA* via = static_cast<PCB_VIA*>( item );
+
+                if( via->GetPosition() != pos
+                    || via->GetNetCode() != net->GetNetCode()
+                    || !via->IsOnLayer( layer ) )
+                {
+                    continue;
+                }
+
+                TEARDROP_PARAMETERS& tdParams = via->GetTeardropParams();
+
+                tdParams.m_Enabled = true;
+
+                if( td.has_previous )
+                    tdParams.SetTeardropSizeRatio( td.previous_length / 100.0,
+                                                   td.previous_width / 100.0 );
+                else if( td.has_next )
+                    tdParams.SetTeardropSizeRatio( td.next_length / 100.0,
+                                                   td.next_width / 100.0 );
+
+                ++tdViaAnchors;
+                matched = true;
+                break;
+            }
+
+            if( !matched )
+                ++tdUnmatched;
+        }
+    }
+
+    if( m_reporter )
+    {
+        m_reporter->Report(
+                wxString::Format(
+                        _( "PADS teardrop anchors: %zu pad, %zu via, %zu unmatched; WID/LEN mapped as ratios" ),
+                        tdPadAnchors, tdViaAnchors, tdUnmatched ),
+                tdUnmatched ? RPT_SEVERITY_WARNING : RPT_SEVERITY_INFO );
+    }
+
+    // PADS teardrop anchor preview v1.1
+    //
+    // Deliberately provisional geometry: this pass verifies only ownership and
+    // P/N direction. It does NOT map PADS WID/LEN/flags yet.
+    //
+    // The preview is a native KiCad TD_VIAPAD zone placed on the exact adjacent
+    // route segment selected by P (= previous) or N (= next).
+    size_t tdPreviewZones = 0;
+
+    for( const PADS_IO::ROUTE& route : routes )
+    {
+        NETINFO_ITEM* net =
+                m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( route.net_name ) );
+
+        if( !net )
+            continue;
+
+        for( const PADS_IO::TEARDROP& td : route.teardrops )
+        {
+            PCB_LAYER_ID layer = getMappedLayer( td.layer );
+
+            if( !IsCopperLayer( layer ) )
+                continue;
+
+            const VECTOR2I anchorPos( scaleCoord( td.x, true ), scaleCoord( td.y, false ) );
+            int anchorSize = 0;
+
+            for( FOOTPRINT* fp : m_loadBoard->Footprints() )
+            {
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( pad->GetPosition() == anchorPos
+                        && pad->GetNetCode() == net->GetNetCode()
+                        && pad->IsOnLayer( layer ) )
+                    {
+                        VECTOR2I sz = pad->GetSize( layer );
+                        anchorSize = std::max( 1, std::min( sz.x, sz.y ) );
+                        break;
+                    }
+                }
+
+                if( anchorSize > 0 )
+                    break;
+            }
+
+            if( anchorSize == 0 )
+            {
+                for( PCB_TRACK* item : m_loadBoard->Tracks() )
+                {
+                    if( item->Type() != PCB_VIA_T )
+                        continue;
+
+                    PCB_VIA* via = static_cast<PCB_VIA*>( item );
+
+                    if( via->GetPosition() == anchorPos
+                        && via->GetNetCode() == net->GetNetCode()
+                        && via->IsOnLayer( layer ) )
+                    {
+                        anchorSize = via->GetWidth( layer );
+                        break;
+                    }
+                }
+            }
+
+            bool trackNodeAnchor = false;
+
+            // PADS teardrop track-node fallback v1.5.
+            //
+            // PADS can put TEARDROP P/N on a pure routing node, with no PAD/VIA
+            // at that coordinate.  In that case use the widest copper segment
+            // touching the node as the reference size.  This preserves the
+            // P/N-selected side while allowing track-to-track teardrops.
+            if( anchorSize <= 0 )
+            {
+                for( PCB_TRACK* item : m_loadBoard->Tracks() )
+                {
+                    if( item->Type() != PCB_TRACE_T
+                        || item->GetNetCode() != net->GetNetCode()
+                        || item->GetLayer() != layer )
+                    {
+                        continue;
+                    }
+
+                    if( item->GetStart() == anchorPos || item->GetEnd() == anchorPos )
+                        anchorSize = std::max( anchorSize, item->GetWidth() );
+                }
+
+                if( anchorSize > 0 )
+                    trackNodeAnchor = true;
+            }
+
+            if( anchorSize <= 0 )
+                continue;
+
+            auto emitPreview =
+                    [&]( bool aPrevious )
+                    {
+                        PCB_TRACK* source = nullptr;
+                        VECTOR2I outside;
+
+                        for( PCB_TRACK* item : m_loadBoard->Tracks() )
+                        {
+                            if( item->Type() != PCB_TRACE_T
+                                || item->GetLayer() != layer
+                                || item->GetNetCode() != net->GetNetCode() )
+                            {
+                                continue;
+                            }
+
+                            if( aPrevious && item->GetEnd() == anchorPos )
+                            {
+                                source = item;
+                                outside = item->GetStart();
+                                break;
+                            }
+
+                            if( !aPrevious && item->GetStart() == anchorPos )
+                            {
+                                source = item;
+                                outside = item->GetEnd();
+                                break;
+                            }
+                        }
+
+                        if( !source )
+                            return;
+
+                        VECTOR2D dir( static_cast<double>( outside.x - anchorPos.x ),
+                                      static_cast<double>( outside.y - anchorPos.y ) );
+                        double segLen = std::hypot( dir.x, dir.y );
+
+                        if( segLen < 1.0 )
+                            return;
+
+                        dir.x /= segLen;
+                        dir.y /= segLen;
+
+                        VECTOR2D norm( -dir.y, dir.x );
+
+                        // PADS teardrop preview ratios v1.3b:
+                        // WID and LEN are percentages of the pad/via anchor size.
+                        const double widthRatio =
+                                ( aPrevious ? td.previous_width : td.next_width ) / 100.0;
+                        const double lengthRatio =
+                                ( aPrevious ? td.previous_length : td.next_length ) / 100.0;
+
+                        const double tdWidth = anchorSize * widthRatio;
+                        const double tdLength = anchorSize * lengthRatio;
+                        const double wideHalf = tdWidth * 0.5;
+                        const double trackHalf = source->GetWidth() * 0.5;
+
+                        VECTOR2D c0( anchorPos.x, anchorPos.y );
+                        VECTOR2D c1( anchorPos.x + dir.x * std::min( segLen, tdLength ),
+                                      anchorPos.y + dir.y * std::min( segLen, tdLength ) );
+
+                        SHAPE_LINE_CHAIN contour;
+                        contour.Append( KiROUND( c0.x + norm.x * wideHalf ),
+                                        KiROUND( c0.y + norm.y * wideHalf ) );
+                        contour.Append( KiROUND( c1.x + norm.x * trackHalf ),
+                                        KiROUND( c1.y + norm.y * trackHalf ) );
+                        contour.Append( KiROUND( c1.x - norm.x * trackHalf ),
+                                        KiROUND( c1.y - norm.y * trackHalf ) );
+                        contour.Append( KiROUND( c0.x - norm.x * wideHalf ),
+                                        KiROUND( c0.y - norm.y * wideHalf ) );
+                        contour.SetClosed( true );
+
+                        ZONE* zone = new ZONE( m_loadBoard );
+                        zone->SetNet( net );
+                        zone->SetLayer( layer );
+                        zone->Outline()->Append( contour );
+                        zone->SetFilledPolysList( layer, *zone->Outline() );
+                        zone->SetNeedRefill( false );
+                        zone->SetIsFilled( true );
+                        zone->SetLocalClearance( 0 );
+                        zone->SetMinThickness( 0 );
+                        zone->SetAssignedPriority( 600 );
+                        zone->SetTeardropAreaType(
+                                trackNodeAnchor ? TEARDROP_TYPE::TD_TRACKEND
+                                                : TEARDROP_TYPE::TD_VIAPAD );
+
+                        m_loadBoard->Add( zone );
+                        ++tdPreviewZones;
+                    };
+
+            if( td.has_previous )
+                emitPreview( true );
+
+            if( td.has_next )
+                emitPreview( false );
+        }
+    }
+
+    if( m_reporter )
+    {
+        m_reporter->Report(
+                wxString::Format(
+                        _( "PADS teardrop preview zones: %zu (pad/via + track-node)" ),
+                        tdPreviewZones ),
+                RPT_SEVERITY_INFO );
+    }
 }
 
 
 void PCB_IO_PADS::loadCopperShapes()
 {
     const std::vector<PADS_IO::COPPER_SHAPE>& copperShapes = m_parser->GetCopperShapes();
+
+    // PADS COPPER items are static copper, whereas POUROUT items are generated pours.
+    // A generated pour must yield to static copper regardless of its own PADS priority.
+    // KiCad resolves overlaps in the opposite direction (higher numeric priority wins),
+    // so place standalone COPPER zones one level above every imported pour.
+    int maxPadsPourPriority = 0;
+
+    for( const PADS_IO::POUR& pour : m_parser->GetPours() )
+    {
+        if( !pour.is_cutout )
+            maxPadsPourPriority = std::max( maxPadsPourPriority, pour.priority );
+    }
+
+    int staticCopperPriority = 1;
+
+    for( const PADS_IO::POUR& pour : m_parser->GetPours() )
+    {
+        if( !pour.is_cutout )
+            staticCopperPriority =
+                    std::max( staticCopperPriority, maxPadsPourPriority - pour.priority + 2 );
+    }
 
     // Check if a COPPER_SHAPE is a non-copper straight-line segment suitable for
     // rectangle grouping (2 outline points, no arcs, not filled, not cutout).
@@ -1724,6 +2110,7 @@ void PCB_IO_PADS::loadCopperShapes()
             ZONE* zone = new ZONE( m_loadBoard );
             zone->SetLayer( layer );
             zone->SetIsRuleArea( false );
+            zone->SetAssignedPriority( staticCopperPriority );
 
             if( net )
                 zone->SetNet( net );

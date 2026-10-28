@@ -29,6 +29,11 @@
 #include <wx/filename.h>
 #include <wx/log.h>
 
+#include <memory>
+#include <embedded_files.h>
+#include <font/font.h>
+#include <paths.h>
+
 #include <advanced_config.h>
 #include <board.h>
 #include <board_design_settings.h>
@@ -52,6 +57,282 @@ PADS_PCB_CONVERTER::PADS_PCB_CONVERTER( BOARD* aBoard, REPORTER* aReporter ) :
         m_board( aBoard ),
         m_reporter( aReporter )
 {
+}
+
+
+namespace
+{
+uint16_t padsFontU16( const std::vector<unsigned char>& aData, size_t aOffset )
+{
+    return static_cast<uint16_t>( aData[aOffset] )
+           | static_cast<uint16_t>( aData[aOffset + 1] << 8 );
+}
+
+
+void appendU16( std::vector<char>& aOut, uint16_t aValue )
+{
+    aOut.push_back( static_cast<char>( aValue & 0xFF ) );
+    aOut.push_back( static_cast<char>( ( aValue >> 8 ) & 0xFF ) );
+}
+
+
+void appendI16( std::vector<char>& aOut, int16_t aValue )
+{
+    appendU16( aOut, static_cast<uint16_t>( aValue ) );
+}
+
+
+bool validatePadsRomansim( const std::vector<unsigned char>& aData )
+{
+    static constexpr size_t TABLE_OFFSET = 0x1C;
+    static constexpr size_t GLYPH_COUNT = 224; // U+0020..U+00FF
+    static constexpr size_t SENTINEL_OFFSET = TABLE_OFFSET + GLYPH_COUNT * 4;
+    static constexpr size_t GEOMETRY_OFFSET = SENTINEL_OFFSET + 4;
+
+    if( aData.size() < GEOMETRY_OFFSET )
+        return false;
+
+    if( padsFontU16( aData, 0x00 ) != 0x2267 || padsFontU16( aData, 0x02 ) != 0x0101
+        || padsFontU16( aData, 0x08 ) != 32 || padsFontU16( aData, 0x0C ) != 7
+        || padsFontU16( aData, 0x14 ) != 32 || padsFontU16( aData, 0x16 ) != 255
+        || padsFontU16( aData, SENTINEL_OFFSET + 2 ) != 0xFFFF )
+    {
+        return false;
+    }
+
+    const uint16_t geometrySize = padsFontU16( aData, SENTINEL_OFFSET );
+
+    if( GEOMETRY_OFFSET + geometrySize != aData.size() )
+        return false;
+
+    uint16_t previous = 0;
+
+    for( size_t i = 0; i < GLYPH_COUNT; ++i )
+    {
+        uint16_t start = padsFontU16( aData, TABLE_OFFSET + i * 4 );
+        uint16_t end = ( i + 1 < GLYPH_COUNT )
+                               ? padsFontU16( aData, TABLE_OFFSET + ( i + 1 ) * 4 )
+                               : geometrySize;
+
+        if( start < previous || end < start || end > geometrySize || ( end - start ) % 2 )
+            return false;
+
+        if( end - start < 2 )
+            return false;
+
+        size_t pos = GEOMETRY_OFFSET + start;
+        size_t limit = GEOMETRY_OFFSET + end;
+        bool terminated = false;
+
+        while( pos + 1 < limit )
+        {
+            unsigned char x = aData[pos++];
+            unsigned char y = aData[pos++];
+
+            if( x == 0xFF )
+            {
+                if( y == 0xFF )
+                {
+                    terminated = true;
+                    break;
+                }
+
+                if( y != 0xFE )
+                    return false;
+            }
+            else if( x > 0x7F || y > 0x7F )
+            {
+                return false;
+            }
+        }
+
+        if( !terminated )
+            return false;
+
+        previous = start;
+    }
+
+    return true;
+}
+
+
+bool convertPadsRomansim( const std::vector<unsigned char>& aData, std::vector<char>& aOut )
+{
+    if( !validatePadsRomansim( aData ) )
+        return false;
+
+    static constexpr size_t TABLE_OFFSET = 0x1C;
+    static constexpr size_t GLYPH_COUNT = 224;
+    static constexpr size_t SENTINEL_OFFSET = TABLE_OFFSET + GLYPH_COUNT * 4;
+    static constexpr size_t GEOMETRY_OFFSET = SENTINEL_OFFSET + 4;
+    static constexpr int BASELINE = 7;
+    static constexpr int X_UNITS = 34;
+    static constexpr int Y_UNITS = 32;
+    static constexpr char FONT_NAME[] = "PADS Romansim";
+
+    aOut.clear();
+    aOut.insert( aOut.end(), { 'K', 'I', 'C', 'A', 'D', 'S', 'F', '1' } );
+    appendU16( aOut, sizeof( FONT_NAME ) - 1 );
+    appendU16( aOut, 32 );
+    appendU16( aOut, GLYPH_COUNT );
+    appendU16( aOut, X_UNITS );
+    appendU16( aOut, Y_UNITS );
+    aOut.insert( aOut.end(), FONT_NAME, FONT_NAME + sizeof( FONT_NAME ) - 1 );
+
+    const uint16_t geometrySize = padsFontU16( aData, SENTINEL_OFFSET );
+
+    for( size_t i = 0; i < GLYPH_COUNT; ++i )
+    {
+        uint16_t start = padsFontU16( aData, TABLE_OFFSET + i * 4 );
+        uint16_t advance = padsFontU16( aData, TABLE_OFFSET + i * 4 + 2 );
+        uint16_t end = ( i + 1 < GLYPH_COUNT )
+                               ? padsFontU16( aData, TABLE_OFFSET + ( i + 1 ) * 4 )
+                               : geometrySize;
+
+        std::vector<std::vector<std::pair<int16_t, int16_t>>> strokes;
+        std::vector<std::pair<int16_t, int16_t>> current;
+        size_t pos = GEOMETRY_OFFSET + start;
+        size_t limit = GEOMETRY_OFFSET + end;
+
+        while( pos + 1 < limit )
+        {
+            unsigned char x = aData[pos++];
+            unsigned char y = aData[pos++];
+
+            if( x == 0xFF && y == 0xFF )
+            {
+                if( !current.empty() )
+                    strokes.push_back( std::move( current ) );
+                break;
+            }
+
+            if( x == 0xFF && y == 0xFE )
+            {
+                if( !current.empty() )
+                {
+                    strokes.push_back( std::move( current ) );
+                    current.clear();
+                }
+                continue;
+            }
+
+            current.emplace_back( static_cast<int16_t>( x ),
+                                  static_cast<int16_t>( BASELINE - static_cast<int>( y ) ) );
+        }
+
+        appendU16( aOut, advance );
+        appendU16( aOut, static_cast<uint16_t>( strokes.size() ) );
+
+        for( const auto& stroke : strokes )
+        {
+            appendU16( aOut, static_cast<uint16_t>( stroke.size() ) );
+
+            for( const auto& point : stroke )
+            {
+                appendI16( aOut, point.first );
+                appendI16( aOut, point.second );
+            }
+        }
+    }
+
+    return true;
+}
+}
+
+
+void PADS_PCB_CONVERTER::PreparePadsRomansimFont()
+{
+    if( !m_board )
+        return;
+
+    wxFileName fontPath;
+    fontPath.AssignDir( PATHS::GetStockDataPath() );
+    fontPath.AppendDir( wxS( "resources" ) );
+    fontPath.AppendDir( wxS( "pads" ) );
+    fontPath.SetFullName( wxS( "romansim.fnt" ) );
+
+    if( !fontPath.FileExists() )
+        return; // Deliberately silent: the established v2.9 path remains the fallback.
+
+    wxFile file( fontPath.GetFullPath() );
+
+    if( !file.IsOpened() )
+        return;
+
+    wxFileOffset length = file.Length();
+
+    if( length <= 0 || length > 1024 * 1024 )
+        return;
+
+    std::vector<unsigned char> source( static_cast<size_t>( length ) );
+
+    if( file.Read( source.data(), source.size() ) != source.size() )
+        return;
+
+    std::vector<char> converted;
+
+    if( !convertPadsRomansim( source, converted ) )
+    {
+        if( m_reporter )
+            m_reporter->Report( _( "romansim.fnt was found but is not a recognized PADS Romansim stroke font; using the standard PADS text fallback." ),
+                                RPT_SEVERITY_WARNING );
+        return;
+    }
+
+    auto embedded = std::make_shared<EMBEDDED_FILES::EMBEDDED_FILE>();
+    embedded->name = wxS( "alternate.kicad_stroke_font" );
+    embedded->type = EMBEDDED_FILES::EMBEDDED_FILE::FILE_TYPE::FONT;
+    embedded->decompressedData = std::move( converted );
+
+    if( EMBEDDED_FILES::CompressAndEncode( *embedded ) != EMBEDDED_FILES::RETURN_CODE::OK )
+        return;
+
+    m_board->GetEmbeddedFiles()->AddFile( embedded );
+    m_board->GetEmbeddedFiles()->SetAreFontsEmbedded( true );
+    const std::vector<wxString>* embeddedFonts = m_board->GetEmbeddedFiles()->UpdateFontFiles();
+
+    KIFONT::FONT* font = KIFONT::FONT::GetFont( wxEmptyString, false, false, embeddedFonts );
+    KIFONT::FONT* builtin = KIFONT::FONT::GetFont();
+
+    if( font && font->IsStroke() && font != builtin )
+    {
+        m_padsRomansimFont = font;
+
+        if( m_reporter )
+            m_reporter->Report( _( "Using PADS Romansim as the embedded alternate stroke font." ), RPT_SEVERITY_INFO );
+    }
+    else
+    {
+        m_board->GetEmbeddedFiles()->RemoveFile( embedded->name );
+    }
+}
+
+
+VECTOR2I PADS_PCB_CONVERTER::GetPadsRomansimAnchorCorrection( const wxString& aVJust,
+                                                               int aTextSize,
+                                                               int aStrokeWidth,
+                                                               bool aMirrored ) const
+{
+    // PADS Romansim v3.6 anchor metric correction.
+    //
+    // Keep the v3.5.2 vertical model unchanged; controlled binary tests showed that
+    // it gives the expected UP/CENTER/DOWN displacement.  v3.6 adds the independent
+    // horizontal metric visible in PADS' serialized rendered bounding boxes: the
+    // selected LEFT/CENTER/RIGHT anchor lies half a stroke to the right of the
+    // corresponding rendered bbox edge/centre.  Mirroring reverses local X.
+    const double stroke = static_cast<double>( aStrokeWidth );
+    const double horizontalShift = ( aMirrored ? 0.5 : -0.5 ) * stroke;
+
+    double verticalShift = 0.0;
+
+    if( aVJust == wxS( "UP" ) )
+        verticalShift = -( 7.0 / 32.0 ) * aTextSize + 0.052 * stroke;
+    else if( aVJust == wxS( "DOWN" ) )
+        verticalShift = 0.17 * aTextSize + 0.052 * stroke;
+    else
+        verticalShift = ( 12.5 / 32.0 - 0.415 ) * aTextSize + 0.052 * stroke;
+
+    return VECTOR2I( KiROUND( horizontalShift ), KiROUND( verticalShift ) );
 }
 
 
@@ -459,9 +740,17 @@ void PADS_PCB_CONVERTER::LoadTexts( const std::vector<PADS_IO::TEXT>& aTexts )
         // PADS text cell height includes internal leading and descender space.
         // Scale factors calibrated to match PADS rendered character dimensions.
         int scaledSize = ScaleSize( padsText.height );
-        int charHeight = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
-        int charWidth = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
-        text->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+
+        if( m_padsRomansimFont )
+        {
+            text->SetTextSize( VECTOR2I( scaledSize, scaledSize ) );
+        }
+        else
+        {
+            int charHeight = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
+            int charWidth = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
+            text->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+        }
 
         if( padsText.width > 0 )
             text->SetTextThickness( ScaleSize( padsText.width ) );
@@ -469,12 +758,21 @@ void PADS_PCB_CONVERTER::LoadTexts( const std::vector<PADS_IO::TEXT>& aTexts )
         EDA_ANGLE textAngle( padsText.rotation, DEGREES_T );
         text->SetTextAngle( textAngle );
 
-        // PADS text anchor differs from KiCad by a small offset along the
-        // reading direction. Shift left (toward text start) to compensate.
-        VECTOR2I pos = ScalePoint( padsText.location.x, padsText.location.y );
-        VECTOR2I textShift( -ADVANCED_CFG::GetCfg().m_PadsTextAnchorOffsetNm, 0 );
-        RotatePoint( textShift, textAngle );
-        text->SetPosition( pos + textShift );
+        // PADS binary direct-import test v2.3: PADS coordinates are already anchors.
+        //
+        // X is the left edge for LEFT, the center for CENTER and the right edge
+        // for RIGHT. KiCad represents the same model with SetPosition() plus
+        // horizontal/vertical justification, so no fixed anchor correction belongs here.
+        text->SetPosition( ScalePoint( padsText.location.x, padsText.location.y ) );
+
+        // PADS Romansim v3.6 anchor metric correction.
+        if( m_padsRomansimFont )
+        {
+            VECTOR2I metricShift = GetPadsRomansimAnchorCorrection(
+                    padsText.vjust, scaledSize, text->GetTextThickness(), padsText.mirrored );
+            RotatePoint( metricShift, textAngle );
+            text->SetPosition( text->GetPosition() + metricShift );
+        }
 
         if( padsText.hjust == "LEFT" )
             text->SetHorizJustify( GR_TEXT_H_ALIGN_LEFT );
@@ -495,6 +793,117 @@ void PADS_PCB_CONVERTER::LoadTexts( const std::vector<PADS_IO::TEXT>& aTexts )
 
         // Honor the PADS back-side mirror flag.
         text->SetMirrored( padsText.mirrored );
+
+        // PADS binary direct-import test v2.5: bbox-fit rotated free text.
+        //
+        // PADS serializes the final world-axis-aligned bounding box of the rendered
+        // text, after rotation and including stroke.  Fit the KiCad rendering directly
+        // against that AABB.  At arbitrary angles the measured AABB width depends on
+        // both text-size X and Y (and likewise for height), so use a small numerical
+        // 2x2 Jacobian instead of applying independent width/height scale ratios.
+        if( !m_padsRomansimFont && padsText.has_bbox )
+        {
+            const double padsWidth = padsText.bbox_max.x - padsText.bbox_min.x;
+            const double padsHeight = padsText.bbox_max.y - padsText.bbox_min.y;
+            const int    targetWidth = ScaleSize( padsWidth );
+            const int    targetHeight = ScaleSize( padsHeight );
+
+            if( targetWidth > 0 && targetHeight > 0 )
+            {
+                // PADS Y increases upward while KiCad Y increases downward, therefore
+                // source minX/maxY is the KiCad top-left corner of the target world AABB.
+                const VECTOR2I targetTopLeft =
+                        ScalePoint( padsText.bbox_min.x, padsText.bbox_max.y );
+
+                // The fixed stroke width means bbox size is not exactly proportional to
+                // glyph size.  Newton iterations on the actual KiCad renderer converge
+                // quickly while naturally handling 90/123/180 degree rotations.
+                for( int pass = 0; pass < 6; ++pass )
+                {
+                    const BOX2I currentBox = text->GetBoundingBox();
+
+                    if( currentBox.GetWidth() <= 0 || currentBox.GetHeight() <= 0 )
+                        break;
+
+                    const double errW = static_cast<double>( currentBox.GetWidth() - targetWidth );
+                    const double errH = static_cast<double>( currentBox.GetHeight() - targetHeight );
+                    const double tolerance = 1000.0; // 1 um in KiCad internal nanometres
+
+                    if( std::abs( errW ) <= tolerance && std::abs( errH ) <= tolerance )
+                        break;
+
+                    const VECTOR2I size = text->GetTextSize();
+                    const int stepX = std::max( 1000, std::max( 1, size.x / 128 ) );
+                    const int stepY = std::max( 1000, std::max( 1, size.y / 128 ) );
+
+                    text->SetTextSize( VECTOR2I( size.x + stepX, size.y ) );
+                    const BOX2I boxX = text->GetBoundingBox();
+
+                    text->SetTextSize( VECTOR2I( size.x, size.y + stepY ) );
+                    const BOX2I boxY = text->GetBoundingBox();
+
+                    text->SetTextSize( size );
+
+                    if( boxX.GetWidth() <= 0 || boxX.GetHeight() <= 0
+                        || boxY.GetWidth() <= 0 || boxY.GetHeight() <= 0 )
+                    {
+                        break;
+                    }
+
+                    const double j00 = static_cast<double>( boxX.GetWidth() - currentBox.GetWidth() ) / stepX;
+                    const double j10 = static_cast<double>( boxX.GetHeight() - currentBox.GetHeight() ) / stepX;
+                    const double j01 = static_cast<double>( boxY.GetWidth() - currentBox.GetWidth() ) / stepY;
+                    const double j11 = static_cast<double>( boxY.GetHeight() - currentBox.GetHeight() ) / stepY;
+                    const double det = j00 * j11 - j01 * j10;
+
+                    int newX = size.x;
+                    int newY = size.y;
+
+                    if( std::abs( det ) > 1e-6 )
+                    {
+                        // Solve J * delta = -error.
+                        double deltaX = ( -j11 * errW + j01 * errH ) / det;
+                        double deltaY = (  j10 * errW - j00 * errH ) / det;
+
+                        // Limit each Newton step to avoid a noisy finite-difference
+                        // derivative producing a wild jump on unusual glyph strings.
+                        const double maxStepX = std::max( 1000.0, static_cast<double>( size.x ) * 0.50 );
+                        const double maxStepY = std::max( 1000.0, static_cast<double>( size.y ) * 0.50 );
+                        deltaX = std::clamp( deltaX, -maxStepX, maxStepX );
+                        deltaY = std::clamp( deltaY, -maxStepY, maxStepY );
+
+                        newX = std::max( 1, KiROUND( static_cast<double>( size.x ) + deltaX ) );
+                        newY = std::max( 1, KiROUND( static_cast<double>( size.y ) + deltaY ) );
+                    }
+                    else
+                    {
+                        // Near 45/135 degrees the world AABB is intrinsically unable to
+                        // distinguish local X from Y: both dimensions depend mainly on
+                        // their sum.  Preserve the current aspect ratio and fit uniformly.
+                        const double scaleW = static_cast<double>( targetWidth ) / currentBox.GetWidth();
+                        const double scaleH = static_cast<double>( targetHeight ) / currentBox.GetHeight();
+                        const double uniformScale = std::sqrt( std::max( 1e-12, scaleW * scaleH ) );
+
+                        newX = std::max( 1, KiROUND( static_cast<double>( size.x ) * uniformScale ) );
+                        newY = std::max( 1, KiROUND( static_cast<double>( size.y ) * uniformScale ) );
+                    }
+
+                    if( std::abs( newX - size.x ) <= 1 && std::abs( newY - size.y ) <= 1 )
+                        break;
+
+                    text->SetTextSize( VECTOR2I( newX, newY ) );
+                }
+
+                const BOX2I fittedBox = text->GetBoundingBox();
+
+                if( fittedBox.GetWidth() > 0 && fittedBox.GetHeight() > 0 )
+                {
+                    const VECTOR2I delta( targetTopLeft.x - fittedBox.GetLeft(),
+                                          targetTopLeft.y - fittedBox.GetTop() );
+                    text->SetPosition( text->GetPosition() + delta );
+                }
+            }
+        }
 
         m_board->Add( text );
     }
@@ -643,9 +1052,17 @@ void PADS_PCB_CONVERTER::LoadDimensions( const std::vector<PADS_IO::DIMENSION>& 
         if( dim.text_height > 0 )
         {
             int scaledSize = ScaleSize( dim.text_height );
-            int charHeight = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
-            int charWidth = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
-            dimension->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+
+            if( m_padsRomansimFont )
+            {
+                dimension->SetTextSize( VECTOR2I( scaledSize, scaledSize ) );
+            }
+            else
+            {
+                int charHeight = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
+                int charWidth = static_cast<int>( scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
+                dimension->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+            }
 
             if( dim.text_width > 0 )
                 dimension->SetTextThickness( ScaleSize( dim.text_width ) );

@@ -3300,6 +3300,7 @@ void PCB_PAINTER::draw( const PCB_TEXT* aText, int aLayer )
 
     KIFONT::FONT* font = aText->GetDrawFont( &m_pcbSettings );
 
+    attrs.m_Font = font;
     m_gal->SetStrokeColor( color );
     m_gal->SetFillColor( color );
     attrs.m_Angle = aText->GetDrawRotation();

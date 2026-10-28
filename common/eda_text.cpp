@@ -650,10 +650,16 @@ KIFONT::FONT* EDA_TEXT::GetDrawFont( const RENDER_SETTINGS* aSettings ) const
 
     if( !font )
     {
+        const std::vector<wxString>* embeddedFonts = nullptr;
+
+        if( EDA_ITEM* item = dynamic_cast<EDA_ITEM*>( const_cast<EDA_TEXT*>( this ) ) )
+            embeddedFonts = item->GetEmbeddedFonts();
+
         if( aSettings )
-            font = KIFONT::FONT::GetFont( aSettings->GetDefaultFont(), IsBold(), IsItalic() );
+            font = KIFONT::FONT::GetFont( aSettings->GetDefaultFont(), IsBold(), IsItalic(),
+                                             embeddedFonts );
         else
-            font = KIFONT::FONT::GetFont( wxEmptyString, IsBold(), IsItalic() );
+            font = KIFONT::FONT::GetFont( wxEmptyString, IsBold(), IsItalic(), embeddedFonts );
     }
 
     return font;

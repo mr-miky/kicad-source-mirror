@@ -169,3 +169,18 @@ endif()
 
 add_subdirectory(bitmaps_png)
 add_subdirectory(project_template)
+
+# PADS Romansim optional source for alternate stroke font (added by pads-direct v3.0)
+# The font itself is intentionally not part of this patch.  If the user places a legitimate
+# PADS romansim.fnt at resources/pads/romansim.fnt, make it available to run-from-build-dir
+# and installed builds.  Its absence is supported and leaves the v2.9 text fallback unchanged.
+set( PADS_ROMANSIM_FONT "${PROJECT_SOURCE_DIR}/resources/pads/romansim.fnt" )
+if( EXISTS "${PADS_ROMANSIM_FONT}" )
+    file( MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/resources/pads" )
+    configure_file( "${PADS_ROMANSIM_FONT}"
+                    "${PROJECT_BINARY_DIR}/resources/pads/romansim.fnt"
+                    COPYONLY )
+    install( FILES "${PADS_ROMANSIM_FONT}"
+             DESTINATION "${KICAD_DATA}/resources/pads"
+             COMPONENT resources )
+endif()

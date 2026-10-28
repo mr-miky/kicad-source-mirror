@@ -151,7 +151,15 @@ namespace DRW_ITEM_V2022
 {
     constexpr size_t SIZE = 100;
     constexpr size_t NAME = 32;
-    constexpr size_t ORIGIN_X = 72;
+
+    // Legacy section-10 record layout:
+    //   +72 = drawing type/class tag
+    //   +76 = origin X
+    //   +80 = origin Y
+    //
+    // Using +72 as ORIGIN_X shifted/rotated board-level graphics because the
+    // parser interpreted the class tag as X and the real X coordinate as Y.
+    constexpr size_t ORIGIN_X = 76;
 } // namespace DRW_ITEM_V2022
 
 
@@ -245,6 +253,7 @@ void BINARY_PARSER::Parse( const wxString& aFileName )
     // owner/piece links before any graphic decoder consumes them.
     KITIME( computeSec12CleanRows() );
     KITIME( buildOwnerRuns() );
+    KITIME( parseDecalGraphics() );
 
     KITIME( parseBoardOutlineDirect() );
     KITIME( parseGraphicLines() );
@@ -388,6 +397,11 @@ void BINARY_PARSER::parsePartPlacements()
         else
         {
             m_partTypeIndex[m_parts.size()] = nextRecord.U32( 4 );
+
+            // PADS binary direct-import test v2: the lagged placement record carries
+            // the actual selected PARTDECAL as a direct section-14 index at +8.
+            // +17 is retained only as a compatibility fallback.
+            m_partDecalIndex[m_parts.size()] = nextRecord.U32( 8 );
             m_partDecalAlternate[m_parts.size()] = nextRecord.U8( 17 );
         }
 
@@ -1909,10 +1923,131 @@ void BINARY_PARSER::parseTextRecords()
     }
 
     parsePlacementFields( *s8, recordBase, recordSize, ringRotation );
+
+    // PADS binary direct-import test v2.6: modern decal fields.
+    //
+    // Modern section-8 field-presentation records are shared by placed PARTs and
+    // PARTDECAL defaults. Placement chains terminate with association kind 0x16,
+    // while decal chains terminate with 0x0E and carry the DecalHeader index in
+    // the low 24 bits. Recover Ref.Des. and Part Type defaults here so a PART
+    // without an explicit presentation inherits the decal presentation.
+    //
+    // Verified display-mode bits in fieldKind & 0xE0:
+    //   0x00 NONE
+    //   0x20 VALUE
+    //   0x60 NAME AND VALUE
+    //   0xA0 FULL NAME AND VALUE
+    // KiCad's native Reference/Value fields store only the value, therefore all
+    // non-NONE PADS modes are represented as visible.
+    if( m_version > 0x2022 )
+    {
+        auto resolveDecalFieldOwner = [&]( uint32_t aStartIndex ) -> int32_t
+        {
+            std::set<uint32_t> visited;
+            uint32_t           index = aStartIndex;
+
+            while( index < s8->physicalCount && visited.insert( index ).second )
+            {
+                SDB_RECORD metadata =
+                        m_sdb.RecordAt( recordBase + static_cast<size_t>( index + 1 ) * recordSize );
+
+                if( metadata.U16( 4 ) != 0xFFFE )
+                    return -1;
+
+                const uint32_t association = metadata.U32( 12 );
+                const uint8_t  associationKind = static_cast<uint8_t>( association >> 24 );
+                const uint32_t target = association & 0x00FFFFFFU;
+
+                if( associationKind == 0x0E )
+                    return target < m_decalNameTable.size() ? static_cast<int32_t>( target ) : -1;
+
+                if( associationKind != 0x08 || target >= s8->physicalCount )
+                    return -1;
+
+                index = target;
+            }
+
+            return -1;
+        };
+
+        for( uint32_t fieldIndex = 0; fieldIndex < s8->physicalCount; ++fieldIndex )
+        {
+            SDB_RECORD geom =
+                    m_sdb.RecordAt( recordBase + static_cast<size_t>( fieldIndex ) * recordSize );
+            SDB_RECORD metadata =
+                    m_sdb.RecordAt( recordBase + static_cast<size_t>( fieldIndex + 1 ) * recordSize );
+
+            if( metadata.U16( 4 ) != 0xFFFE )
+                continue;
+
+            const uint32_t presentation = metadata.U32( 24 );
+            const uint8_t  fieldKind = static_cast<uint8_t>( presentation >> 16 );
+            const uint8_t  labelType = fieldKind & 0x07U; // PADS binary direct-import test v2.7: fieldKind base-type mask
+
+            if( labelType != 0x02 && labelType != 0x03 )
+                continue;
+
+            const int32_t ownerIndex = resolveDecalFieldOwner( fieldIndex );
+
+            if( ownerIndex < 0 )
+                continue;
+
+            const std::string& decalName = m_decalNameTable[static_cast<size_t>( ownerIndex )];
+            auto               decalIt = m_decals.find( decalName );
+
+            if( decalName.empty() || decalIt == m_decals.end() )
+                continue;
+
+            ATTRIBUTE attribute;
+            attribute.name = labelType == 0x02 ? "Ref.Des." : "Part Type";
+            attribute.height = geom.I32( ringRotation );
+            attribute.width = geom.I32( ringRotation + 4 );
+            attribute.x = geom.I32( ringRotation + 8 );
+            attribute.y = geom.I32( ringRotation + 12 );
+            attribute.orientation = toBasicAngle( geom.I32( ringRotation + 16 ) );
+            attribute.mirrored = geom.I32( ringRotation + 20 ) != 0;
+            attribute.bbox_min.x = geom.I32( ringRotation + 24 );
+            attribute.bbox_min.y = geom.I32( ringRotation + 28 );
+            attribute.bbox_max.x = geom.I32( ringRotation + 32 );
+            attribute.bbox_max.y = metadata.I32( 0 );
+            attribute.has_bbox = attribute.bbox_max.x > attribute.bbox_min.x
+                                 && attribute.bbox_max.y > attribute.bbox_min.y;
+            attribute.level = static_cast<int16_t>( presentation & 0xFFFFU );
+
+            const uint8_t displayMode = fieldKind & 0xE0U;
+            attribute.visible = displayMode != 0x00U;
+            attribute.right_reading = ( fieldKind & 0x18U ) == 0x08U;
+
+            if( ( presentation & 0x11000000U ) == 0x11000000U )
+            {
+                attribute.hjust = "CENTER";
+                attribute.vjust = "CENTER";
+            }
+            else
+            {
+                attribute.hjust = "LEFT";
+                attribute.vjust = ( presentation & 0x20000000U ) ? "UP" : "DOWN";
+            }
+
+            auto& attrs = decalIt->second.attributes;
+            auto  existing = std::find_if( attrs.begin(), attrs.end(),
+                                           [&]( const ATTRIBUTE& aAttribute )
+                                           {
+                                               return aAttribute.name == attribute.name;
+                                           } );
+
+            if( existing == attrs.end() )
+                attrs.push_back( std::move( attribute ) );
+            else
+                *existing = std::move( attribute );
+        }
+    }
+
     parseFreeText( *s8, recordBase, recordSize, ringRotation, poolBase, poolHi );
 }
 
 
+// PADS binary direct-import test v2.8: bbox-fit PART fields
 void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aRecordBase, size_t aRecordSize,
                                           size_t aRingRotation )
 {
@@ -1926,8 +2061,83 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
         attribute.y = record.I32( aRingRotation + 12 );
         attribute.orientation = toBasicAngle( record.I32( aRingRotation + 16 ) );
         attribute.mirrored = record.I32( aRingRotation + 20 ) != 0;
+
+        SDB_RECORD nextRecord =
+                m_sdb.RecordAt( aRecordBase + static_cast<size_t>( aIndex + 1 ) * aRecordSize );
+
+        attribute.bbox_min.x = record.I32( aRingRotation + 24 );
+        attribute.bbox_min.y = record.I32( aRingRotation + 28 );
+        attribute.bbox_max.x = record.I32( aRingRotation + 32 );
+        attribute.bbox_max.y = nextRecord.I32( 0 );
+        attribute.has_bbox = attribute.bbox_max.x > attribute.bbox_min.x
+                             && attribute.bbox_max.y > attribute.bbox_min.y;
         return attribute;
     };
+
+    // PADS binary direct-import test v1: legacy placement field recovery.
+    // 96-byte placement records have no +96 field-list head. Section 8 still carries
+    // the complete chain: 0x08 links field records and 0x16 terminates at the
+    // zero-based placement index. Reconstruct only heads missing from the direct map.
+    if( m_version <= 0x2022 && m_partFieldStart.size() < m_parts.size() )
+    {
+        std::vector<int32_t> predecessor( aText.physicalCount, -1 );
+        std::vector<int32_t> placementOwner( aText.physicalCount, -1 );
+
+        for( uint32_t index = 0; index < aText.physicalCount; ++index )
+        {
+            SDB_RECORD metadata =
+                    m_sdb.RecordAt( aRecordBase + static_cast<size_t>( index + 1 ) * aRecordSize );
+
+            if( metadata.U16( 4 ) != 0xFFFE )
+                continue;
+
+            uint32_t association = metadata.U32( 12 );
+            uint8_t  associationKind = static_cast<uint8_t>( association >> 24 );
+            uint32_t target = association & 0x00FFFFFFU;
+
+            if( associationKind == 0x08 )
+            {
+                if( target >= aText.physicalCount )
+                    THROW_IO_ERROR( "Invalid PADS legacy placement field-list link" );
+
+                if( predecessor[target] >= 0 && predecessor[target] != static_cast<int32_t>( index ) )
+                    THROW_IO_ERROR( "Ambiguous PADS legacy placement field-list link" );
+
+                predecessor[target] = static_cast<int32_t>( index );
+            }
+            else if( associationKind == 0x16 )
+            {
+                if( target >= m_parts.size() )
+                    THROW_IO_ERROR( "Invalid PADS legacy placement field-list owner" );
+
+                placementOwner[index] = static_cast<int32_t>( target );
+            }
+        }
+
+        for( uint32_t terminal = 0; terminal < aText.physicalCount; ++terminal )
+        {
+            if( placementOwner[terminal] < 0 )
+                continue;
+
+            size_t partIndex = static_cast<size_t>( placementOwner[terminal] );
+
+            if( m_partFieldStart.count( partIndex ) )
+                continue;
+
+            uint32_t           head = terminal;
+            std::set<uint32_t> visited;
+
+            while( predecessor[head] >= 0 )
+            {
+                if( !visited.insert( head ).second )
+                    THROW_IO_ERROR( "Cyclic PADS legacy placement field-list link" );
+
+                head = static_cast<uint32_t>( predecessor[head] );
+            }
+
+            m_partFieldStart[partIndex] = static_cast<int32_t>( head );
+        }
+    }
 
     for( const auto& [partIndex, fieldStart] : m_partFieldStart )
     {
@@ -1953,7 +2163,9 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
             SDB_RECORD metadata = m_sdb.RecordAt( aRecordBase + static_cast<size_t>( fieldIndex + 1 ) * aRecordSize );
             uint32_t   presentation = metadata.U32( 24 );
             uint8_t    fieldKind = static_cast<uint8_t>( presentation >> 16 );
-            attribute.visible = ( fieldKind & 0x20 ) != 0;
+            const uint8_t displayMode = fieldKind & 0xE0U;
+            attribute.visible = displayMode != 0x00U;
+            attribute.right_reading = ( fieldKind & 0x18U ) == 0x08U;
 
             if( ( presentation & 0x11000000U ) == 0x11000000U )
             {
@@ -1966,9 +2178,9 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
                 attribute.vjust = ( presentation & 0x20000000U ) ? "UP" : "DOWN";
             }
 
-            if( ( fieldKind & 0x1FU ) == 0x03 )
+            if( ( fieldKind & 0x07U ) == 0x03 )
                 attribute.name = "Part Type";
-            else if( ( fieldKind & 0x1FU ) == 0x02 )
+            else if( ( fieldKind & 0x07U ) == 0x02 )
                 attribute.name = "Ref.Des.";
 
             if( !attribute.name.empty() )
@@ -2028,8 +2240,23 @@ void BINARY_PARSER::parseFreeText( const SDB_SECTION& aText, size_t aRecordBase,
 
         uint32_t layerWord = meta.U32( 24 );
 
-        if( ( layerWord >> 16 ) != 0x0020 || geom.I32( aRingRotation ) <= 0 || geom.I32( aRingRotation + 4 ) <= 0 )
+        // PADS binary direct-import test v2.3: free-text justification.
+        //
+        // layerWord layout verified against matching binary/ASCII test boards:
+        //
+        //   bits  0..7   PADS layer
+        //   bits 16..23  free-text class marker (0x20)
+        //   bits 24..25  horizontal justification: 0=LEFT, 1=CENTER, 2=RIGHT
+        //   bits 28..29  vertical justification:   0=DOWN, 1=CENTER, 2=UP
+        //
+        // The old test compared the complete upper 16 bits with 0x0020, which
+        // accidentally accepted LEFT/DOWN only and discarded CENTER/RIGHT text.
+        if( ( layerWord & 0x00FF0000U ) != 0x00200000U
+            || geom.I32( aRingRotation ) <= 0
+            || geom.I32( aRingRotation + 4 ) <= 0 )
+        {
             continue;
+        }
 
         size_t soff = aPoolBase + meta.U32( 8 );
 
@@ -2058,6 +2285,59 @@ void BINARY_PARSER::parseFreeText( const SDB_SECTION& aText, size_t aRecordBase,
         text.width = static_cast<double>( linewidth );
         text.layer = static_cast<int>( layerWord & 0xFF );
         text.rotation = toBasicAngle( angleRaw );
+
+        // Explicit PADS mirror flag. It is independent of the selected layer:
+        // a Bottom-layer text is not automatically mirrored by PADS.
+        text.mirrored = geom.I32( aRingRotation + 20 ) != 0;
+
+        // PADS binary direct-import test v2.4: section-8 bbox wraps across the
+        // circular record boundary.  The geometry tail stores minX/minY/maxX;
+        // maxY is DWORD 0 of the lagged metadata record used by this text.
+        text.bbox_min.x = static_cast<double>( geom.I32( aRingRotation + 24 ) );
+        text.bbox_min.y = static_cast<double>( geom.I32( aRingRotation + 28 ) );
+        text.bbox_max.x = static_cast<double>( geom.I32( aRingRotation + 32 ) );
+        text.bbox_max.y = static_cast<double>( meta.I32( 0 ) );
+        text.has_bbox = text.bbox_max.x > text.bbox_min.x && text.bbox_max.y > text.bbox_min.y;
+
+        const uint8_t justify = static_cast<uint8_t>( layerWord >> 24 );
+
+        switch( justify & 0x03U )
+        {
+        case 0:
+            text.hjust = "LEFT";
+            break;
+
+        case 1:
+            text.hjust = "CENTER";
+            break;
+
+        case 2:
+            text.hjust = "RIGHT";
+            break;
+
+        default:
+            text.hjust = "CENTER";
+            break;
+        }
+
+        switch( ( justify >> 4 ) & 0x03U )
+        {
+        case 0:
+            text.vjust = "DOWN";
+            break;
+
+        case 1:
+            text.vjust = "CENTER";
+            break;
+
+        case 2:
+            text.vjust = "UP";
+            break;
+
+        default:
+            text.vjust = "CENTER";
+            break;
+        }
 
         m_texts.push_back( text );
     }
@@ -2971,6 +3251,22 @@ void BINARY_PARSER::parseCopperShapes()
         copper.name = name;
         copper.filled = true;
 
+        // Standalone COPPER items store their section-23 net index in the
+        // lagged DRW record (owner + 1), at offset +4.  This is the same
+        // lag record from which buildOwnerRuns() obtains the geometry cursors.
+        // A negative value denotes an unconnected COPPER item.
+        const uint32_t lagIndex = ( run.ownerIndex + 1 ) % sec10->count;
+        const int32_t  netIndex =
+                ringI32( *sec10, DRW_ITEM::ROTATION, ownerStride, lagIndex, 4 );
+
+        if( netIndex >= 0 )
+        {
+            auto netIt = m_sec23IndexToNet.find( static_cast<uint32_t>( netIndex ) );
+
+            if( netIt != m_sec23IndexToNet.end() )
+                copper.net_name = netIt->second;
+        }
+
         size_t   pieceRotation = sec11->totalBytes - ( pieceStride - 8 );
         uint32_t levelIndex = ( sec11Index + 1 ) % sec11->count;
         uint8_t  level = ringU8( *sec11, pieceRotation, pieceStride, levelIndex, 1 );
@@ -3192,6 +3488,184 @@ static ARC deriveArc( const SDB_RECORD& aArcRecord, const ARC_VERTEX& aStart, co
     arc.delta_angle = EDA_ANGLE( endAngle - startAngle, DEGREES_T ).Normalize180().AsDegrees();
 
     return arc;
+}
+
+
+
+// Section-10 PARTDECAL owners use the same piece/vertex/arc pools as board drawings,
+// but their vertices are decal-local coordinates. Section-13 +16 packs the exact
+// PADS arc begin/sweep angles as signed tenths of a degree; keep them so major arcs
+// (for example CON_BNC's 302.7 degree arc) are not collapsed to their minor solution.
+static ARC deriveDecalArc( const SDB_RECORD& aArcRecord )
+{
+    double xmin = aArcRecord.I32( 0 );
+    double ymin = aArcRecord.I32( 4 );
+    double xmax = aArcRecord.I32( 8 );
+    double ymax = aArcRecord.I32( 12 );
+    uint32_t packedAngles = aArcRecord.U32( 16 );
+    int16_t  startTenths = static_cast<int16_t>( packedAngles & 0xFFFFU );
+    int16_t  deltaTenths = static_cast<int16_t>( ( packedAngles >> 16 ) & 0xFFFFU );
+
+    ARC arc{};
+    arc.cx = ( xmin + xmax ) / 2.0;
+    arc.cy = ( ymin + ymax ) / 2.0;
+    arc.radius = ( xmax - xmin ) / 2.0;
+    arc.start_angle = static_cast<double>( startTenths ) / 10.0;
+    arc.delta_angle = static_cast<double>( deltaTenths ) / 10.0;
+    return arc;
+}
+
+
+void BINARY_PARSER::parseDecalGraphics()
+{
+    const SDB_SECTION* pieces = getSection( SECTION::GraphicPieces );
+    const SDB_SECTION* vertices = getSection( SECTION::Vertices );
+    const SDB_SECTION* arcParameters = getSection( SECTION::DecalLibrary );
+
+    if( !pieces || !vertices || !arcParameters )
+        THROW_IO_ERROR( "Missing PADS decal graphic controllers" );
+
+    if( pieces->count == 0 )
+        return;
+
+    const size_t pieceStride = m_version <= 0x2024 ? 16 : 20;
+    const size_t pieceHead = pieceStride - 8;
+    const size_t cornerField = pieceStride - 4;
+    const size_t pieceRotation = pieces->totalBytes - pieceHead;
+
+    if( pieces->totalBytes != static_cast<uint64_t>( pieces->count ) * pieceStride
+        || vertices->totalBytes != static_cast<uint64_t>( vertices->count ) * 12
+        || arcParameters->totalBytes != static_cast<uint64_t>( arcParameters->count ) * 20 )
+    {
+        THROW_IO_ERROR( "Invalid PADS decal graphic-controller framing" );
+    }
+
+    for( const auto& [name, run] : m_ownerRuns )
+    {
+        if( ( run.itemKind & 0xFFFFU ) != 2 || run.pieceCount <= 0 || run.pieceStart < 0
+            || run.vertexStart < 0 )
+        {
+            continue;
+        }
+
+        auto decalIt = m_decals.find( name );
+
+        if( decalIt == m_decals.end() )
+            continue;
+
+        if( static_cast<uint64_t>( run.pieceStart ) + static_cast<uint64_t>( run.pieceCount ) > pieces->count )
+            THROW_IO_ERROR( wxString::Format( "Invalid PADS decal piece range (%s)", name.c_str() ) );
+
+        PART_DECAL& decal = decalIt->second;
+        int32_t     vertexCursor = run.vertexStart;
+
+        for( int32_t piece = 0; piece < run.pieceCount; ++piece )
+        {
+            uint32_t pieceIndex = static_cast<uint32_t>( run.pieceStart + piece );
+            uint32_t nextIndex = ( pieceIndex + 1 ) % pieces->count;
+            int32_t  corners = ringI32( *pieces, pieceRotation, pieceStride, pieceIndex, cornerField );
+
+            if( corners < 1
+                || static_cast<uint64_t>( vertexCursor ) + static_cast<uint64_t>( corners ) > vertices->count )
+            {
+                THROW_IO_ERROR( wxString::Format( "Invalid PADS decal vertex range (%s piece %d)",
+                                                  name.c_str(), piece ) );
+            }
+
+            std::vector<ARC_VERTEX> decoded;
+            decoded.reserve( static_cast<size_t>( corners ) );
+
+            for( int32_t corner = 0; corner < corners; ++corner )
+            {
+                SDB_RECORD record = m_sdb.RecordAt( vertices->physicalOffset
+                                                    + static_cast<uint32_t>( vertexCursor + corner ) * 12 );
+                decoded.push_back( { record.I32( 0 ), record.I32( 4 ), record.I32( 8 ) } );
+            }
+
+            vertexCursor += corners;
+
+            uint8_t kind = ringU8( *pieces, pieceRotation, pieceStride, nextIndex, 0 );
+
+            // Ordinary footprint drafting plus PADS footprint keepouts.  KPTCLS/KPTCIR
+            // use the same vertex pool; their +4 piece word is the restriction mask.
+            if( kind != 0 && kind != 1 && kind != 2 && kind != 10 && kind != 11 )
+                continue;
+
+            DECAL_ITEM item;
+            item.type = kind == 0  ? "OPEN"
+                        : kind == 1  ? "CLOSED"
+                        : kind == 2  ? "CIRCLE"
+                        : kind == 10 ? "KPTCLS"
+                                     : "KPTCIR";
+            item.width = static_cast<double>(
+                    ringI32( *pieces, pieceRotation, pieceStride, pieceIndex, pieceStride - 8 ) );
+
+            int rawLayer = static_cast<int>( ringU8( *pieces, pieceRotation, pieceStride, nextIndex, 1 ) );
+            item.layer = rawLayer >= 128 ? rawLayer - 256 : rawLayer;
+
+            if( kind == 10 || kind == 11 )
+            {
+                constexpr uint32_t KNOWN_RESTRICTIONS = 0x01U | 0x02U | 0x04U | 0x08U | 0x10U | 0x40U;
+                uint32_t restrictionMask = ringU32( *pieces, pieceRotation, pieceStride, nextIndex, 4 );
+
+                if( restrictionMask & ~KNOWN_RESTRICTIONS )
+                {
+                    THROW_IO_ERROR( wxString::Format( "Unknown PADS decal keepout restriction mask 0x%X",
+                                                      restrictionMask ) );
+                }
+
+                if( restrictionMask & 0x01U ) item.restrictions += 'P';
+                if( restrictionMask & 0x02U ) item.restrictions += 'R';
+                if( restrictionMask & 0x04U ) item.restrictions += 'C';
+                if( restrictionMask & 0x08U ) item.restrictions += 'V';
+                if( restrictionMask & 0x10U ) item.restrictions += 'T';
+                if( restrictionMask & 0x40U ) item.restrictions += 'A';
+            }
+
+            if( kind == 2 || kind == 11 )
+            {
+                if( decoded.size() == 2 )
+                {
+                    item.points.emplace_back( static_cast<double>( decoded[0].x ),
+                                              static_cast<double>( decoded[0].y ) );
+                    item.points.emplace_back( static_cast<double>( decoded[1].x ),
+                                              static_cast<double>( decoded[1].y ) );
+                    decal.items.push_back( std::move( item ) );
+                }
+
+                continue;
+            }
+
+            for( size_t index = 0; index < decoded.size(); ++index )
+            {
+                const ARC_VERTEX& vertex = decoded[index];
+
+                if( index > 0 && decoded[index - 1].attr >= 0 )
+                {
+                    SDB_RECORD arcRecord =
+                            arcRecordFor( *arcParameters, run.arcStart, decoded[index - 1].attr, "decal" );
+                    item.points.emplace_back( static_cast<double>( vertex.x ), static_cast<double>( vertex.y ),
+                                              deriveDecalArc( arcRecord ) );
+                }
+                else
+                {
+                    item.points.emplace_back( static_cast<double>( vertex.x ), static_cast<double>( vertex.y ) );
+                }
+            }
+
+            bool closedWithoutRepeatedPoint = ( kind == 1 || kind == 10 ) && decoded.size() >= 3
+                    && ( decoded.front().x != decoded.back().x || decoded.front().y != decoded.back().y );
+
+            if( closedWithoutRepeatedPoint && decoded.back().attr >= 0 && !item.points.empty() )
+            {
+                SDB_RECORD arcRecord = arcRecordFor( *arcParameters, run.arcStart, decoded.back().attr, "decal" );
+                item.points.front() = ARC_POINT( item.points.front().x, item.points.front().y,
+                                                deriveDecalArc( arcRecord ) );
+            }
+
+            decal.items.push_back( std::move( item ) );
+        }
+    }
 }
 
 
@@ -3615,155 +4089,361 @@ void BINARY_PARSER::parseKeepouts()
 }
 
 
+
+
 void BINARY_PARSER::parseCopperPours()
 {
-    // Section 52 is the declared 88-byte outline-owner array. The four-byte state stream after
-    // section 49 has one word per live section-46 slot; accounting for it places sections 52--55
-    // directly, with no signature search or phase selection.
+    // Section 52: pour-family owners, 88 bytes each.
+    // Section 53: piece descriptors, 16 bytes each.
+    // Section 54: corner coordinates, 8 bytes each.
+    // Section 55: arc descriptors, 16 bytes each:
     //
-    // Owner record (88 bytes):
-    //   +0   u32 first piece index
-    //   +4   u32 first vertex index
-    //   +8   u32 first arc index (arcs are not yet imported)
-    //   +12  i32 section-23 net record index, -1 when the pour has no net
-    //   +24  i32 raw XLOC -- each pour owns its own anchor, not a shared board anchor
-    //   +28  i32 raw YLOC
-    //   +70  char name[16]
+    //   +0  i32 center X
+    //   +4  i32 center Y
+    //   +8  u32 start-corner index within the current piece
+    //   +12 packed angles:
+    //         low  int16 = begin angle in tenths of a degree
+    //         high int16 = sweep angle in tenths of a degree
     //
-    // Piece record (16 bytes), addressed by the owner's piece index:
-    //   +0   u32 corner count
-    //   +4   u32 arc count
-    //   +8   i32 width, BASIC units
-    //   +12  u8  piece type: 0x32 = polygon, 0x33 = circle (two diametrically-opposite corners,
-    //        not a 2-point polygon)
-    //   +13  u8  layer
+    // Piece +0 = corner count, +4 = arc count.
+    // Owner +8 is the first section-55 record for that owner's pieces.
     //
-    // The vertex array is a flat run of 8-byte local (i32 x, i32 y) pairs.
-    // Arc records decorate specific corner-to-corner segments with a curve rather than adding
-    // extra boundary points, so the corner list alone still yields a closed (if not smoothly
-    // curved) outline; arc-to-curve conversion is not implemented.
+    // Owner types at +87:
+    //   0x32 POUROUT
+    //   0x33 HATOUT
+    //   0x34 VOIDOUT
+    //   0x35 PADTHERM
+    //   0x36 VIATHERM
     static constexpr size_t OWNER_SIZE = 88;
     static constexpr size_t PIECE_SIZE = 16;
     static constexpr size_t VERTEX_SIZE = 8;
+    static constexpr size_t ARC_SIZE = 16;
+
+    static constexpr uint8_t TYPE_POUROUT = 0x32;
+    static constexpr uint8_t TYPE_HATOUT = 0x33;
+    static constexpr uint8_t TYPE_VOIDOUT = 0x34;
 
     struct POUR_OWNER
     {
         uint32_t    pieceStart = 0;
         uint32_t    vertexStart = 0;
+        uint32_t    arcStart = 0;
         uint32_t    pieceCount = 0;
         int32_t     rawX = 0;
         int32_t     rawY = 0;
+        int32_t     childOrNextVoid = -1;
+        int32_t     childOrNextHat = -1;
+        uint8_t     type = 0;
         std::string name;
         std::string netName;
     };
 
-    std::vector<POUR_OWNER> owners;
-
     const SDB_SECTION* sec52 = getSection( SECTION::PourTokensA );
     const SDB_SECTION* sec53 = getSection( SECTION::PourTokensB );
     const SDB_SECTION* sec54 = getSection( SECTION::PourTokensC );
+    const SDB_SECTION* sec55 = getSection( SECTION::PourTokensD );
 
-    if( !sec52 || !sec53 || !sec54 )
+    if( !sec52 || !sec53 || !sec54 || !sec55 )
         THROW_IO_ERROR( "Missing PADS copper-pour controllers" );
 
-    if( sec52->physicalBytes != sec52->count * OWNER_SIZE || sec53->physicalBytes != sec53->count * PIECE_SIZE
-        || sec54->physicalBytes != sec54->count * VERTEX_SIZE )
+    if( sec52->physicalBytes != sec52->count * OWNER_SIZE
+        || sec53->physicalBytes != sec53->count * PIECE_SIZE
+        || sec54->physicalBytes != sec54->count * VERTEX_SIZE
+        || sec55->physicalBytes != sec55->count * ARC_SIZE )
+    {
         THROW_IO_ERROR( "Invalid PADS copper-pour controller framing" );
+    }
+
+    std::vector<POUR_OWNER> owners;
+    owners.reserve( sec52->count );
 
     for( uint32_t index = 0; index < sec52->count; ++index )
     {
-        const size_t  offset = sec52->physicalOffset + static_cast<size_t>( index ) * OWNER_SIZE;
-        const uint8_t outlineType = m_cursor.U8At( offset + 87 );
-        std::string   name = m_cursor.StringAt( offset + 70, 14 );
-
-        if( outlineType != 0x32 || name.rfind( "POR", 0 ) != 0 )
-            continue;
+        const size_t offset = sec52->physicalOffset + static_cast<size_t>( index ) * OWNER_SIZE;
 
         POUR_OWNER owner;
         owner.pieceStart = m_cursor.U32At( offset );
         owner.vertexStart = m_cursor.U32At( offset + 4 );
+        owner.arcStart = m_cursor.U32At( offset + 8 );
+        owner.childOrNextVoid = m_cursor.I32At( offset + 12 );
+        owner.childOrNextHat = m_cursor.I32At( offset + 16 );
         owner.rawX = m_cursor.I32At( offset + 24 );
         owner.rawY = m_cursor.I32At( offset + 28 );
         owner.pieceCount = m_cursor.U32At( offset + 64 );
-        owner.name = std::move( name );
+        owner.name = m_cursor.StringAt( offset + 70, 14 );
+        owner.type = m_cursor.U8At( offset + 87 );
 
-        if( auto netIt = m_sec23IndexToNet.find( m_cursor.U32At( offset + 12 ) ); netIt != m_sec23IndexToNet.end() )
-            owner.netName = netIt->second;
+        if( owner.type == TYPE_POUROUT )
+        {
+            uint32_t netIndex = m_cursor.U32At( offset + 12 );
+
+            if( auto netIt = m_sec23IndexToNet.find( netIndex );
+                netIt != m_sec23IndexToNet.end() )
+            {
+                owner.netName = netIt->second;
+            }
+        }
 
         owners.push_back( std::move( owner ) );
     }
 
-    for( const POUR_OWNER& owner : owners )
+    // Resolve HATOUT -> POUROUT ownership.
+    std::map<uint32_t, std::string> parentName;
+
+    for( uint32_t pourIndex = 0; pourIndex < owners.size(); ++pourIndex )
     {
-        uint32_t vertexIndex = owner.vertexStart;
+        const POUR_OWNER& pourOwner = owners[pourIndex];
 
-        for( uint32_t pieceOrdinal = 0; pieceOrdinal < owner.pieceCount; ++pieceOrdinal )
+        if( pourOwner.type != TYPE_POUROUT || pourOwner.name.empty() )
+            continue;
+
+        int32_t child = pourOwner.childOrNextHat;
+        std::set<uint32_t> visited;
+
+        while( child >= 0 && static_cast<uint32_t>( child ) < owners.size() )
         {
-            const uint32_t pieceIndex = owner.pieceStart + pieceOrdinal;
+            uint32_t childIndex = static_cast<uint32_t>( child );
 
-            if( pieceIndex >= sec53->count )
-                THROW_IO_ERROR( "Invalid PADS copper-pour piece range" );
+            if( !visited.insert( childIndex ).second )
+                break;
 
-            const size_t pieceOff = sec53->physicalOffset + static_cast<size_t>( pieceIndex ) * PIECE_SIZE;
-            uint32_t     cornerCount = m_cursor.U32At( pieceOff );
-            int32_t      width = m_cursor.I32At( pieceOff + 8 );
-            uint8_t      pieceType = m_cursor.U8At( pieceOff + 12 );
-            uint8_t      layer = m_cursor.U8At( pieceOff + 13 );
+            const POUR_OWNER& hatOwner = owners[childIndex];
 
-            if( cornerCount == 0 || vertexIndex > sec54->count || cornerCount > sec54->count - vertexIndex )
-                THROW_IO_ERROR( "Invalid PADS copper-pour vertex range" );
+            if( hatOwner.type != TYPE_HATOUT )
+                break;
 
-            const size_t vOff = sec54->physicalOffset + static_cast<size_t>( vertexIndex ) * VERTEX_SIZE;
-            vertexIndex += cornerCount;
+            parentName[childIndex] = pourOwner.name;
 
-            POUR pour;
-            pour.owner_pour = owner.name;
-            pour.net_name = owner.netName;
-            pour.width = static_cast<double>( width );
-            pour.layer = static_cast<int>( layer );
+            int32_t next = hatOwner.childOrNextHat;
 
-            if( pieceType == 0x33 && cornerCount == 2 )
-            {
-                // Circle piece: the two "corners" are diametrically opposite endpoints, not a
-                // 2-point polygon -- the downstream zone builder requires at least 3 points and
-                // would silently drop it. Synthesize a regular polygon approximation instead.
-                int32_t x0 = owner.rawX + m_cursor.I32At( vOff );
-                int32_t y0 = owner.rawY + m_cursor.I32At( vOff + 4 );
-                int32_t x1 = owner.rawX + m_cursor.I32At( vOff + VERTEX_SIZE );
-                int32_t y1 = owner.rawY + m_cursor.I32At( vOff + VERTEX_SIZE + 4 );
+            if( next == child )
+                break;
 
-                double cx = ( x0 + x1 ) / 2.0;
-                double cy = ( y0 + y1 ) / 2.0;
-                double radius = std::hypot( x1 - x0, y1 - y0 ) / 2.0;
-
-                static constexpr int CIRCLE_SEGMENTS = 48;
-
-                for( int s = 0; s < CIRCLE_SEGMENTS; ++s )
-                {
-                    double  angle = 2.0 * M_PI * s / CIRCLE_SEGMENTS;
-                    int32_t rawX = static_cast<int32_t>( std::lround( cx + radius * std::cos( angle ) ) );
-                    int32_t rawY = static_cast<int32_t>( std::lround( cy + radius * std::sin( angle ) ) );
-
-                    pour.points.emplace_back( toBasicCoordX( rawX ), toBasicCoordY( rawY ) );
-                }
-            }
-            else
-            {
-                for( uint32_t vertex = 0; vertex < cornerCount; ++vertex )
-                {
-                    size_t  offset = vOff + static_cast<size_t>( vertex ) * VERTEX_SIZE;
-                    int32_t localX = m_cursor.I32At( offset );
-                    int32_t localY = m_cursor.I32At( offset + 4 );
-
-                    pour.points.emplace_back( toBasicCoordX( owner.rawX + localX ),
-                                              toBasicCoordY( owner.rawY + localY ) );
-                }
-            }
-
-            m_pours.push_back( std::move( pour ) );
+            child = next;
         }
     }
+
+    // Resolve VOIDOUT -> HATOUT ownership.
+    for( uint32_t hatIndex = 0; hatIndex < owners.size(); ++hatIndex )
+    {
+        const POUR_OWNER& hatOwner = owners[hatIndex];
+
+        if( hatOwner.type != TYPE_HATOUT || !parentName.count( hatIndex ) )
+            continue;
+
+        int32_t child = hatOwner.childOrNextVoid;
+        std::set<uint32_t> visited;
+
+        while( child >= 0 && static_cast<uint32_t>( child ) < owners.size() )
+        {
+            uint32_t childIndex = static_cast<uint32_t>( child );
+
+            if( !visited.insert( childIndex ).second )
+                break;
+
+            const POUR_OWNER& voidOwner = owners[childIndex];
+
+            if( voidOwner.type != TYPE_VOIDOUT )
+                break;
+
+            parentName[childIndex] = hatOwner.name;
+
+            int32_t next = voidOwner.childOrNextVoid;
+
+            if( next == child )
+                break;
+
+            child = next;
+        }
+    }
+
+    auto appendOwnerGeometry =
+            [&]( uint32_t ownerIndex )
+            {
+                const POUR_OWNER& owner = owners[ownerIndex];
+
+                const bool isPour = owner.type == TYPE_POUROUT;
+                const bool isHat = owner.type == TYPE_HATOUT;
+                const bool isVoid = owner.type == TYPE_VOIDOUT;
+
+                if( !isPour && !isHat && !isVoid )
+                    return;
+
+                if( owner.name.empty() )
+                    return;
+
+                if( !isPour && !parentName.count( ownerIndex ) )
+                    return;
+
+                uint32_t vertexIndex = owner.vertexStart;
+                uint32_t arcIndex = owner.arcStart;
+
+                for( uint32_t pieceOrdinal = 0; pieceOrdinal < owner.pieceCount; ++pieceOrdinal )
+                {
+                    const uint32_t pieceIndex = owner.pieceStart + pieceOrdinal;
+
+                    if( pieceIndex >= sec53->count )
+                        THROW_IO_ERROR( "Invalid PADS copper-pour piece range" );
+
+                    const size_t pieceOff =
+                            sec53->physicalOffset + static_cast<size_t>( pieceIndex ) * PIECE_SIZE;
+
+                    uint32_t cornerCount = m_cursor.U32At( pieceOff );
+                    uint32_t arcCount = m_cursor.U32At( pieceOff + 4 );
+                    int32_t  width = m_cursor.I32At( pieceOff + 8 );
+                    uint8_t  pieceType = m_cursor.U8At( pieceOff + 12 );
+                    uint8_t  layer = m_cursor.U8At( pieceOff + 13 );
+
+                    if( cornerCount == 0 || vertexIndex > sec54->count
+                        || cornerCount > sec54->count - vertexIndex )
+                    {
+                        THROW_IO_ERROR( "Invalid PADS copper-pour vertex range" );
+                    }
+
+                    if( arcIndex > sec55->count || arcCount > sec55->count - arcIndex )
+                        THROW_IO_ERROR( "Invalid PADS copper-pour arc range" );
+
+                    const size_t vOff =
+                            sec54->physicalOffset + static_cast<size_t>( vertexIndex ) * VERTEX_SIZE;
+
+                    POUR pour;
+                    pour.name = owner.name;
+                    pour.net_name = isPour ? owner.netName : std::string();
+                    pour.owner_pour = isPour ? owner.name : parentName[ownerIndex];
+                    pour.width = static_cast<double>( width );
+                    pour.layer = static_cast<int>( layer );
+
+                    if( isHat )
+                        pour.style = POUR_STYLE::HATCHED;
+                    else if( isVoid )
+                    {
+                        pour.style = POUR_STYLE::VOIDOUT;
+                        pour.is_cutout = true;
+                    }
+
+                    auto rawPoint =
+                            [&]( uint32_t aVertex )
+                            {
+                                const size_t aVertexOffset =
+                                        vOff + static_cast<size_t>( aVertex ) * VERTEX_SIZE;
+
+                                int32_t x = m_cursor.I32At( aVertexOffset );
+                                int32_t y = m_cursor.I32At( aVertexOffset + 4 );
+
+                                // POUROUT corners/arc centers use the owner's local coordinate
+                                // frame. Cached fill HATOUT/VOIDOUT is already in raw board space.
+                                if( isPour )
+                                {
+                                    x += owner.rawX;
+                                    y += owner.rawY;
+                                }
+
+                                return VECTOR2I( x, y );
+                            };
+
+                    if( pieceType == 0x33 && cornerCount == 2 )
+                    {
+                        // CIRCLE/CIRCUT: two diametrically opposite endpoints.
+                        VECTOR2I p0 = rawPoint( 0 );
+                        VECTOR2I p1 = rawPoint( 1 );
+
+                        double cx = ( static_cast<double>( p0.x ) + p1.x ) / 2.0;
+                        double cy = ( static_cast<double>( p0.y ) + p1.y ) / 2.0;
+                        double radius =
+                                std::hypot( static_cast<double>( p1.x ) - p0.x,
+                                            static_cast<double>( p1.y ) - p0.y ) / 2.0;
+
+                        ARC arc{};
+                        arc.cx = toBasicCoordX( static_cast<int32_t>( std::lround( cx ) ) );
+                        arc.cy = toBasicCoordY( static_cast<int32_t>( std::lround( cy ) ) );
+                        arc.radius = radius;
+                        arc.start_angle = 0.0;
+                        arc.delta_angle = 360.0;
+
+                        pour.points.emplace_back(
+                                toBasicCoordX( static_cast<int32_t>( std::lround( cx + radius ) ) ),
+                                toBasicCoordY( static_cast<int32_t>( std::lround( cy ) ) ), arc );
+                    }
+                    else
+                    {
+                        // Decode section-55 arc decoration for this piece.  Key by the
+                        // start-corner ordinal: an arc from corner N to N+1 is stored on
+                        // ARC_POINT N+1, matching the ASCII parser representation.
+                        std::map<uint32_t, ARC> arcsByStart;
+
+                        for( uint32_t a = 0; a < arcCount; ++a )
+                        {
+                            const size_t arcOff =
+                                    sec55->physicalOffset
+                                    + static_cast<size_t>( arcIndex + a ) * ARC_SIZE;
+
+                            int32_t centerX = m_cursor.I32At( arcOff );
+                            int32_t centerY = m_cursor.I32At( arcOff + 4 );
+                            uint32_t startCorner = m_cursor.U32At( arcOff + 8 );
+                            uint32_t packedAngles = m_cursor.U32At( arcOff + 12 );
+
+                            if( startCorner >= cornerCount )
+                                THROW_IO_ERROR( "Invalid PADS copper-pour arc corner index" );
+
+                            int16_t beginTenths =
+                                    static_cast<int16_t>( packedAngles & 0xFFFFU );
+                            int16_t sweepTenths =
+                                    static_cast<int16_t>( ( packedAngles >> 16 ) & 0xFFFFU );
+
+                            if( isPour )
+                            {
+                                centerX += owner.rawX;
+                                centerY += owner.rawY;
+                            }
+
+                            VECTOR2I start = rawPoint( startCorner );
+
+                            ARC arc{};
+                            arc.cx = toBasicCoordX( centerX );
+                            arc.cy = toBasicCoordY( centerY );
+                            arc.radius =
+                                    std::hypot( static_cast<double>( start.x ) - centerX,
+                                                static_cast<double>( start.y ) - centerY );
+                            arc.start_angle = static_cast<double>( beginTenths ) / 10.0;
+                            arc.delta_angle = static_cast<double>( sweepTenths ) / 10.0;
+
+                            arcsByStart[startCorner] = arc;
+                        }
+
+                        for( uint32_t vertex = 0; vertex < cornerCount; ++vertex )
+                        {
+                            VECTOR2I p = rawPoint( vertex );
+
+                            if( vertex > 0 )
+                            {
+                                auto arcIt = arcsByStart.find( vertex - 1 );
+
+                                if( arcIt != arcsByStart.end() )
+                                {
+                                    pour.points.emplace_back( toBasicCoordX( p.x ),
+                                                              toBasicCoordY( p.y ),
+                                                              arcIt->second );
+                                    continue;
+                                }
+                            }
+
+                            pour.points.emplace_back( toBasicCoordX( p.x ),
+                                                      toBasicCoordY( p.y ) );
+                        }
+                    }
+
+                    vertexIndex += cornerCount;
+                    arcIndex += arcCount;
+
+                    m_pours.push_back( std::move( pour ) );
+                }
+            };
+
+    for( uint32_t ownerIndex = 0; ownerIndex < owners.size(); ++ownerIndex )
+        appendOwnerGeometry( ownerIndex );
 }
+
+
 
 
 /// Section 69 begins with 12 bytes of controller state followed by its logical layer records.
@@ -3927,17 +4607,29 @@ void BINARY_PARSER::linkPartsToDecals()
         if( partTypeIdx >= m_partTypeDecalIndices.size() )
             continue;
 
-        uint8_t alternate = 0;
-        auto    alternateIt = m_partDecalAlternate.find( partIdx );
-
-        if( alternateIt != m_partDecalAlternate.end() )
-            alternate = alternateIt->second;
-
         const std::vector<int32_t>& decalIndices = m_partTypeDecalIndices[partTypeIdx];
         int32_t                     decalIndex = decalIndices.empty() ? -1 : decalIndices.front();
 
-        if( alternate < decalIndices.size() )
-            decalIndex = decalIndices[alternate];
+        // PADS binary direct-import test v2: modern placements serialize the selected
+        // decal directly in the lagged placement record (+8).  This reproduces explicit
+        // ASCII PARTTYPE@DECAL placements such as Y1, U3, J3 and D3.
+        auto directDecalIt = m_partDecalIndex.find( partIdx );
+
+        if( directDecalIt != m_partDecalIndex.end() && directDecalIt->second < m_decalNameTable.size() )
+        {
+            decalIndex = static_cast<int32_t>( directDecalIt->second );
+        }
+        else
+        {
+            uint8_t alternate = 0;
+            auto    alternateIt = m_partDecalAlternate.find( partIdx );
+
+            if( alternateIt != m_partDecalAlternate.end() )
+                alternate = alternateIt->second;
+
+            if( alternate < decalIndices.size() )
+                decalIndex = decalIndices[alternate];
+        }
 
         if( decalIndex < 0 || static_cast<size_t>( decalIndex ) >= m_decalNameTable.size() )
             continue;

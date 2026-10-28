@@ -147,7 +147,14 @@ FONT* FONT::GetFont( const wxString& aFontName, bool aBold, bool aItalic,
     static const wxString s_kicadFontName( KICAD_FONT_NAME );
 
     if( aFontName.empty() || aFontName.StartsWith( s_kicadFontName ) )
+    {
+        // A document may carry one alternate stroke font.  It replaces only the
+        // default KiCad stroke font; explicitly selected outline fonts are untouched.
+        if( STROKE_FONT* alternate = STROKE_FONT::LoadAlternateFont( aEmbeddedFiles ) )
+            return alternate;
+
         return getDefaultFont();
+    }
 
     std::tuple<wxString, bool, bool, bool> key = { aFontName, aBold, aItalic, aForDrawingSheet };
 

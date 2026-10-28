@@ -99,11 +99,16 @@ void BOARD_ADAPTER::addText( const EDA_TEXT* aText, CONTAINER_2D_BASE* aContaine
     KIGFX::GAL_DISPLAY_OPTIONS empty_opts;
     TEXT_ATTRIBUTES            attrs = aText->GetAttributes();
     float                      penWidth_3DU = TO_3DU( aText->GetEffectiveTextPenWidth() );
-    KIFONT::FONT*              font = aText->GetFont();
-    wxString                   shownText = aText->GetShownText( FOR_CANVAS );
 
-    if( !font )
-        font = KIFONT::FONT::GetFont( wxEmptyString, aText->IsBold(), aText->IsItalic() );
+    // PADS Romansim v3.6.1: resolve alternate font in 3D viewer.
+    //
+    // GetDrawFont() is document-aware in the PADS Romansim patch stack: when the
+    // text has no explicitly selected font it can resolve the board's embedded
+    // alternate stroke font.  The old GetFont()/FONT::GetFont() fallback bypassed
+    // that resolver, so the 3D viewer always fell back to KiCad's built-in stroke
+    // font even though pcbnew rendered the embedded Romansim correctly.
+    KIFONT::FONT*              font = aText->GetDrawFont( nullptr );
+    wxString                   shownText = aText->GetShownText( FOR_CANVAS );
 
     if( aOwner && aOwner->IsKnockout() )
     {

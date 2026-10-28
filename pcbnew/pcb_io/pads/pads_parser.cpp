@@ -2037,6 +2037,9 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
         bool is_unrouted = ( layer == 0 );
         bool is_plane_connection = is_unrouted;
         TEARDROP teardrop;
+        teardrop.x = pt.x;
+        teardrop.y = pt.y;
+        teardrop.layer = layer;
         JUMPER_MARKER jumper;
         bool has_teardrop = false;
         bool has_jumper = false;
@@ -2084,17 +2087,15 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
                 {
                     if( td_token == "P" )
                     {
-                        teardrop.has_pad_teardrop = true;
-                        iss >> teardrop.pad_width >> teardrop.pad_length;
+                        // P = Previous route segment at this vertex.
+                        teardrop.has_previous = true;
+                        iss >> teardrop.previous_width >> teardrop.previous_length;
 
-                        // Check for optional flags (numeric)
                         std::streampos pos = iss.tellg();
                         int td_flags = 0;
 
                         if( iss >> td_flags )
-                        {
-                            teardrop.pad_flags = td_flags;
-                        }
+                            teardrop.previous_flags = td_flags;
                         else
                         {
                             iss.clear();
@@ -2103,16 +2104,15 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
                     }
                     else if( td_token == "N" )
                     {
-                        teardrop.has_net_teardrop = true;
-                        iss >> teardrop.net_width >> teardrop.net_length;
+                        // N = Next route segment at this vertex.
+                        teardrop.has_next = true;
+                        iss >> teardrop.next_width >> teardrop.next_length;
 
                         std::streampos pos = iss.tellg();
                         int td_flags = 0;
 
                         if( iss >> td_flags )
-                        {
-                            teardrop.net_flags = td_flags;
-                        }
+                            teardrop.next_flags = td_flags;
                         else
                         {
                             iss.clear();
