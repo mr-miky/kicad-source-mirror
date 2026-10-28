@@ -23,6 +23,11 @@
 #include <gal/graphics_abstraction_layer.h>
 #include <wx/string.h>
 #include <wx/textfile.h>
+#include <wx/file.h>
+#include <wx/filename.h>
+#include <cstring>
+#include <cstdint>
+#include <map>
 #include <newstroke_font.h>
 #include <font/glyph_types.h>
 #include <font/stroke_font.h>
@@ -53,7 +58,8 @@ std::mutex                          g_defaultFontLoadMutex;
 STROKE_FONT::STROKE_FONT() :
         m_glyphs( nullptr ),
         m_glyphBoundingBoxes( nullptr ),
-        m_maxGlyphWidth( 0.0 )
+        m_maxGlyphWidth( 0.0 ),
+        m_interChar( 0.2 )
 {
 }
 
@@ -74,6 +80,73 @@ STROKE_FONT* STROKE_FONT::LoadFont( const wxString& aFontName )
 }
 
 
+namespace
+{
+uint16_t readAltStrokeU16LE( const std::vector<unsigned char>& aData, size_t& aPos, bool& aOk )
+{
+    if( aPos + 2 > aData.size() )
+    {
+        aOk = false;
+        return 0;
+    }
+
+    uint16_t value = static_cast<uint16_t>( aData[aPos] )
+                     | static_cast<uint16_t>( aData[aPos + 1] << 8 );
+    aPos += 2;
+    return value;
+}
+
+
+int16_t readAltStrokeI16LE( const std::vector<unsigned char>& aData, size_t& aPos, bool& aOk )
+{
+    return static_cast<int16_t>( readAltStrokeU16LE( aData, aPos, aOk ) );
+}
+
+
+std::mutex                       g_alternateFontLoadMutex;
+std::map<wxString, STROKE_FONT*> g_alternateFontCache;
+}
+
+
+STROKE_FONT* STROKE_FONT::LoadAlternateFont( const std::vector<wxString>* aEmbeddedFiles )
+{
+    if( !aEmbeddedFiles )
+        return nullptr;
+
+    for( const wxString& fileName : *aEmbeddedFiles )
+    {
+        wxFileName fn( fileName );
+
+        if( fn.GetExt().CmpNoCase( wxS( "kicad_stroke_font" ) ) != 0 )
+            continue;
+
+        std::lock_guard<std::mutex> lock( g_alternateFontLoadMutex );
+        auto it = g_alternateFontCache.find( fileName );
+
+        if( it != g_alternateFontCache.end() )
+        {
+            if( it->second )
+                return it->second;
+
+            continue;
+        }
+
+        STROKE_FONT* font = new STROKE_FONT();
+
+        if( font->loadEmbeddedStrokeFont( fileName ) )
+        {
+            g_alternateFontCache[fileName] = font;
+            return font;
+        }
+
+        delete font;
+        g_alternateFontCache[fileName] = nullptr;
+    }
+
+    return nullptr;
+}
+
+
 void buildGlyphBoundingBox( std::shared_ptr<STROKE_GLYPH>& aGlyph, double aGlyphWidth )
 {
     VECTOR2D min( 0, 0 );
@@ -89,6 +162,106 @@ void buildGlyphBoundingBox( std::shared_ptr<STROKE_GLYPH>& aGlyph, double aGlyph
     }
 
     aGlyph->SetBoundingBox( BOX2D( min, max - min ) );
+}
+
+
+bool STROKE_FONT::loadEmbeddedStrokeFont( const wxString& aFileName )
+{
+    wxFile file( aFileName );
+
+    if( !file.IsOpened() )
+        return false;
+
+    wxFileOffset length = file.Length();
+
+    if( length < 18 || length > 4 * 1024 * 1024 )
+        return false;
+
+    std::vector<unsigned char> data( static_cast<size_t>( length ) );
+
+    if( file.Read( data.data(), data.size() ) != data.size() )
+        return false;
+
+    static constexpr char MAGIC[] = "KICADSF1";
+
+    if( std::memcmp( data.data(), MAGIC, 8 ) != 0 )
+        return false;
+
+    size_t pos = 8;
+    bool ok = true;
+    uint16_t nameLen = readAltStrokeU16LE( data, pos, ok );
+    uint16_t firstCodePoint = readAltStrokeU16LE( data, pos, ok );
+    uint16_t glyphCount = readAltStrokeU16LE( data, pos, ok );
+    uint16_t xUnits = readAltStrokeU16LE( data, pos, ok );
+    uint16_t yUnits = readAltStrokeU16LE( data, pos, ok );
+
+    if( !ok || nameLen == 0 || nameLen > 255 || firstCodePoint != ' ' || glyphCount == 0
+        || glyphCount > 65504 || xUnits == 0 || yUnits == 0 || pos + nameLen > data.size() )
+    {
+        return false;
+    }
+
+    // The descriptive name is metadata only.  An alternate stroke font replaces the
+    // document's default KiCad stroke font and is not a separately selected face.
+    pos += nameLen;
+
+    m_ownedGlyphs.clear();
+    m_ownedGlyphBoundingBoxes.clear();
+    m_ownedGlyphs.reserve( glyphCount );
+    m_ownedGlyphBoundingBoxes.reserve( glyphCount );
+    m_maxGlyphWidth = 0.0;
+
+    for( uint16_t glyphIndex = 0; glyphIndex < glyphCount; ++glyphIndex )
+    {
+        uint16_t advance = readAltStrokeU16LE( data, pos, ok );
+        uint16_t strokeCount = readAltStrokeU16LE( data, pos, ok );
+
+        if( !ok || strokeCount > 1024 )
+            return false;
+
+        auto glyph = std::make_shared<STROKE_GLYPH>();
+        glyph->reserve( strokeCount );
+
+        for( uint16_t strokeIndex = 0; strokeIndex < strokeCount; ++strokeIndex )
+        {
+            uint16_t pointCount = readAltStrokeU16LE( data, pos, ok );
+
+            if( !ok || pointCount > 4096 )
+                return false;
+
+            for( uint16_t pointIndex = 0; pointIndex < pointCount; ++pointIndex )
+            {
+                int16_t x = readAltStrokeI16LE( data, pos, ok );
+                int16_t y = readAltStrokeI16LE( data, pos, ok );
+
+                if( !ok )
+                    return false;
+
+                glyph->AddPoint( VECTOR2D( static_cast<double>( x ) / xUnits,
+                                           static_cast<double>( y ) / yUnits ) );
+            }
+
+            glyph->RaisePen();
+        }
+
+        glyph->Finalize();
+
+        const double glyphWidth = static_cast<double>( advance ) / xUnits;
+        buildGlyphBoundingBox( glyph, glyphWidth );
+        m_ownedGlyphBoundingBoxes.emplace_back( glyph->BoundingBox() );
+        m_ownedGlyphs.push_back( glyph );
+        m_maxGlyphWidth = std::max( m_maxGlyphWidth, glyphWidth );
+    }
+
+    if( pos != data.size() )
+        return false;
+
+    m_glyphs = &m_ownedGlyphs;
+    m_glyphBoundingBoxes = &m_ownedGlyphBoundingBoxes;
+    m_fontName = KICAD_FONT_NAME;
+    m_fontFileName = aFileName;
+    m_interChar = 0.0;
+    return true;
 }
 
 
@@ -202,7 +375,6 @@ VECTOR2I STROKE_FONT::GetTextAsGlyphs( BOX2I* aBBox, std::vector<std::unique_ptr
                                        TEXT_STYLE_FLAGS aTextStyle ) const
 {
     constexpr int    TAB_WIDTH = 4;
-    constexpr double INTER_CHAR = 0.2;
 
     VECTOR2I cursor( aPosition );
     VECTOR2D glyphSize( aSize );
@@ -273,7 +445,7 @@ VECTOR2I STROKE_FONT::GetTextAsGlyphs( BOX2I* aBBox, std::vector<std::unique_ptr
     if( aBBox )
     {
         aBBox->SetOrigin( aPosition );
-        aBBox->SetEnd( cursor.x - KiROUND( glyphSize.x * INTER_CHAR ), cursor.y - glyphSize.y );
+        aBBox->SetEnd( cursor.x - KiROUND( glyphSize.x * m_interChar ), cursor.y - glyphSize.y );
         aBBox->Normalize();
     }
 

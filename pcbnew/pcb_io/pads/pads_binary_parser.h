@@ -242,6 +242,7 @@ private:
                             const std::string& aRefDes ) const;
     void parsePadStacks();
     void parsePartDecals();
+    void parseDecalGraphics();
     void parseDecalNameTable();
     void parseDecalNameTableOld();
     void parsePartTypeTable();
