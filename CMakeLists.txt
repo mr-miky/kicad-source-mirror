@@ -1201,3 +1201,5 @@ if( APPLE )
 
     add_subdirectory( signing )
 endif()
+
+add_subdirectory(pads-dump)

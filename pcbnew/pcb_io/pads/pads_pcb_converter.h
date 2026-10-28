@@ -38,6 +38,11 @@ class SHAPE_ARC;
 class SHAPE_LINE_CHAIN;
 class ZONE;
 
+namespace KIFONT
+{
+class FONT;
+}
+
 /**
  * Builds KiCad board objects from the PADS_IO model structs.
  *
@@ -61,7 +66,32 @@ public:
 
     BOARD* GetBoard() const { return m_board; }
 
-    PADS_UNIT_CONVERTER& UnitConverter() { return m_unitConverter; }
+    KIFONT::FONT* GetPadsRomansimFont() const { return m_padsRomansimFont; }
+
+
+
+
+
+
+
+
+
+
+    /** Prepare and activate the PADS-provided document alternate stroke font. */
+    void PreparePadsRomansimFont();
+
+    /** Translate PADS Romansim semantic anchors into KiCad stroke-text metrics. */
+    VECTOR2I GetPadsRomansimAnchorCorrection( const wxString& aVJust, int aTextSize,
+                                               int aStrokeWidth, bool aMirrored ) const;
+    /** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+/** Prepare and activate the PADS-provided document alternate stroke font. */
+PADS_UNIT_CONVERTER& UnitConverter() { return m_unitConverter; }
 
     /**
      * Set the nanometers-per-file-unit factor used by the coordinate transform. This must
@@ -160,8 +190,9 @@ public:
     void ReportStatistics();
 
 private:
-    BOARD*    m_board;
+BOARD*    m_board;
     REPORTER* m_reporter;
+    KIFONT::FONT* m_padsRomansimFont = nullptr;
 
     PADS_UNIT_CONVERTER m_unitConverter;
     double              m_scaleFactor = 0.0;
