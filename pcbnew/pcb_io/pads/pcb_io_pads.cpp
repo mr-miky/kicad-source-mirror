@@ -21,16 +21,20 @@
 #include "pads_layer_mapper.h"
 #include "pads_pcb_shapes.h"
 
+#include <fmt/format.h>
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <fstream>
 #include <functional>
+#include <set>
 
 #include <board.h>
 #include <pcb_track.h>
 #include <footprint.h>
 #include <zone.h>
+#include <teardrop/teardrop.h>
+#include <memory>
 
 #include "pads_parser.h"
 #include <io/pads/pads_unit_converter.h>
@@ -1594,124 +1598,42 @@ void PCB_IO_PADS::loadTracksAndVias()
         }
     }
 
-    // First teardrop pass: recover only PADS -> KiCad ownership.
-    // Width/length/flags are intentionally left untouched for the next pass.
-    size_t tdPadAnchors = 0;
-    size_t tdViaAnchors = 0;
-    size_t tdUnmatched = 0;
-
-    for( const PADS_IO::ROUTE& route : routes )
+    // PADS/KiCad hybrid teardrop conversion v1.11.
+    // PADS owns the parameters per route end.  KiCad owns them per pad/via, so first
+    // recover every concrete connection and then decide whether an anchor is uniform.
+    struct IMPORTED_TD_KEY
     {
-        NETINFO_ITEM* net =
-                m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( route.net_name ) );
+        double width = 0.0;
+        double length = 0.0;
+        char   shape = 'D';
+        bool   adjustable = false;
 
-        if( !net )
-            continue;
-
-        for( const PADS_IO::TEARDROP& td : route.teardrops )
+        bool operator==( const IMPORTED_TD_KEY& aOther ) const
         {
-            PCB_LAYER_ID layer = getMappedLayer( td.layer );
-
-            if( !IsCopperLayer( layer ) )
-            {
-                ++tdUnmatched;
-                continue;
-            }
-
-            VECTOR2I pos( scaleCoord( td.x, true ), scaleCoord( td.y, false ) );
-            bool matched = false;
-
-            // Pad anchor.
-            for( FOOTPRINT* fp : m_loadBoard->Footprints() )
-            {
-                for( PAD* pad : fp->Pads() )
-                {
-                    if( pad->GetPosition() != pos
-                        || pad->GetNetCode() != net->GetNetCode()
-                        || !pad->IsOnLayer( layer ) )
-                    {
-                        continue;
-                    }
-
-                    // PADS teardrop ratio mapping v1.2
-                    // WID/LEN are percentages of the pad/via size.
-                    // A (optional FLAGS) is intentionally ignored for now.
-                    TEARDROP_PARAMETERS& tdParams = pad->GetTeardropParams();
-
-                    tdParams.m_Enabled = true;
-
-                    if( td.has_previous )
-                        tdParams.SetTeardropSizeRatio( td.previous_length / 100.0,
-                                                       td.previous_width / 100.0 );
-                    else if( td.has_next )
-                        tdParams.SetTeardropSizeRatio( td.next_length / 100.0,
-                                                       td.next_width / 100.0 );
-
-                    ++tdPadAnchors;
-                    matched = true;
-                    break;
-                }
-
-                if( matched )
-                    break;
-            }
-
-            if( matched )
-                continue;
-
-            // Via anchor.
-            for( PCB_TRACK* item : m_loadBoard->Tracks() )
-            {
-                if( item->Type() != PCB_VIA_T )
-                    continue;
-
-                PCB_VIA* via = static_cast<PCB_VIA*>( item );
-
-                if( via->GetPosition() != pos
-                    || via->GetNetCode() != net->GetNetCode()
-                    || !via->IsOnLayer( layer ) )
-                {
-                    continue;
-                }
-
-                TEARDROP_PARAMETERS& tdParams = via->GetTeardropParams();
-
-                tdParams.m_Enabled = true;
-
-                if( td.has_previous )
-                    tdParams.SetTeardropSizeRatio( td.previous_length / 100.0,
-                                                   td.previous_width / 100.0 );
-                else if( td.has_next )
-                    tdParams.SetTeardropSizeRatio( td.next_length / 100.0,
-                                                   td.next_width / 100.0 );
-
-                ++tdViaAnchors;
-                matched = true;
-                break;
-            }
-
-            if( !matched )
-                ++tdUnmatched;
+            // PADS Default shapes v1.16: compare shapes independently.
+            // Auto Adjust has no exact KiCad equivalent and is metadata only.
+            return width == aOther.width && length == aOther.length
+                   && shape == aOther.shape;
         }
-    }
+    };
 
-    if( m_reporter )
+    struct IMPORTED_TD_CONNECTION
     {
-        m_reporter->Report(
-                wxString::Format(
-                        _( "PADS teardrop anchors: %zu pad, %zu via, %zu unmatched; WID/LEN mapped as ratios" ),
-                        tdPadAnchors, tdViaAnchors, tdUnmatched ),
-                tdUnmatched ? RPT_SEVERITY_WARNING : RPT_SEVERITY_INFO );
-    }
+        PCB_TRACK*             source = nullptr;
+        BOARD_ITEM*            anchor = nullptr;
+        VECTOR2I               anchorPos;
+        PCB_LAYER_ID           layer = UNDEFINED_LAYER;
+        NETINFO_ITEM*          net = nullptr;
+        IMPORTED_TD_KEY        key;
+        std::string            originalSpec;
+        bool                   previous = false;
+        bool                   persistentAnchor = false;
+        bool                   trackNodeAnchor = false;
+    };
 
-    // PADS teardrop anchor preview v1.1
-    //
-    // Deliberately provisional geometry: this pass verifies only ownership and
-    // P/N direction. It does NOT map PADS WID/LEN/flags yet.
-    //
-    // The preview is a native KiCad TD_VIAPAD zone placed on the exact adjacent
-    // route segment selected by P (= previous) or N (= next).
-    size_t tdPreviewZones = 0;
+    std::vector<IMPORTED_TD_CONNECTION> importedConnections;
+    size_t tdUnmatched = 0;
+    size_t tdDefaultOmitted = 0;
 
     for( const PADS_IO::ROUTE& route : routes )
     {
@@ -1723,187 +1645,402 @@ void PCB_IO_PADS::loadTracksAndVias()
 
         for( const PADS_IO::TEARDROP& td : route.teardrops )
         {
-            PCB_LAYER_ID layer = getMappedLayer( td.layer );
-
-            if( !IsCopperLayer( layer ) )
-                continue;
-
             const VECTOR2I anchorPos( scaleCoord( td.x, true ), scaleCoord( td.y, false ) );
-            int anchorSize = 0;
 
-            for( FOOTPRINT* fp : m_loadBoard->Footprints() )
-            {
-                for( PAD* pad : fp->Pads() )
-                {
-                    if( pad->GetPosition() == anchorPos
-                        && pad->GetNetCode() == net->GetNetCode()
-                        && pad->IsOnLayer( layer ) )
-                    {
-                        VECTOR2I sz = pad->GetSize( layer );
-                        anchorSize = std::max( 1, std::min( sz.x, sz.y ) );
-                        break;
-                    }
-                }
-
-                if( anchorSize > 0 )
-                    break;
-            }
-
-            if( anchorSize == 0 )
-            {
-                for( PCB_TRACK* item : m_loadBoard->Tracks() )
-                {
-                    if( item->Type() != PCB_VIA_T )
-                        continue;
-
-                    PCB_VIA* via = static_cast<PCB_VIA*>( item );
-
-                    if( via->GetPosition() == anchorPos
-                        && via->GetNetCode() == net->GetNetCode()
-                        && via->IsOnLayer( layer ) )
-                    {
-                        anchorSize = via->GetWidth( layer );
-                        break;
-                    }
-                }
-            }
-
-            bool trackNodeAnchor = false;
-
-            // PADS teardrop track-node fallback v1.5.
-            //
-            // PADS can put TEARDROP P/N on a pure routing node, with no PAD/VIA
-            // at that coordinate.  In that case use the widest copper segment
-            // touching the node as the reference size.  This preserves the
-            // P/N-selected side while allowing track-to-track teardrops.
-            if( anchorSize <= 0 )
-            {
-                for( PCB_TRACK* item : m_loadBoard->Tracks() )
-                {
-                    if( item->Type() != PCB_TRACE_T
-                        || item->GetNetCode() != net->GetNetCode()
-                        || item->GetLayer() != layer )
-                    {
-                        continue;
-                    }
-
-                    if( item->GetStart() == anchorPos || item->GetEnd() == anchorPos )
-                        anchorSize = std::max( anchorSize, item->GetWidth() );
-                }
-
-                if( anchorSize > 0 )
-                    trackNodeAnchor = true;
-            }
-
-            if( anchorSize <= 0 )
-                continue;
-
-            auto emitPreview =
+            auto collectConnection =
                     [&]( bool aPrevious )
                     {
+                        if( !( aPrevious ? td.previous_connected : td.next_connected ) )
+                        {
+                            ++tdUnmatched;
+                            return;
+                        }
+
+                        PCB_LAYER_ID layer =
+                                getMappedLayer( aPrevious ? td.previous_layer : td.next_layer );
+
+                        if( !IsCopperLayer( layer ) )
+                        {
+                            ++tdUnmatched;
+                            return;
+                        }
+
+                        const auto& neighbour = aPrevious ? td.previous_point : td.next_point;
+                        VECTOR2I outside( scaleCoord( neighbour.x, true ),
+                                          scaleCoord( neighbour.y, false ) );
                         PCB_TRACK* source = nullptr;
-                        VECTOR2I outside;
 
                         for( PCB_TRACK* item : m_loadBoard->Tracks() )
                         {
                             if( item->Type() != PCB_TRACE_T
-                                || item->GetLayer() != layer
-                                || item->GetNetCode() != net->GetNetCode() )
+                                || item->GetNetCode() != net->GetNetCode()
+                                || item->GetLayer() != layer )
                             {
                                 continue;
                             }
 
-                            if( aPrevious && item->GetEnd() == anchorPos )
+                            if( ( item->GetStart() == anchorPos && item->GetEnd() == outside )
+                                || ( item->GetEnd() == anchorPos && item->GetStart() == outside ) )
                             {
                                 source = item;
-                                outside = item->GetStart();
-                                break;
-                            }
-
-                            if( !aPrevious && item->GetStart() == anchorPos )
-                            {
-                                source = item;
-                                outside = item->GetEnd();
                                 break;
                             }
                         }
 
                         if( !source )
+                        {
+                            ++tdUnmatched;
                             return;
+                        }
 
-                        VECTOR2D dir( static_cast<double>( outside.x - anchorPos.x ),
-                                      static_cast<double>( outside.y - anchorPos.y ) );
-                        double segLen = std::hypot( dir.x, dir.y );
+                        BOARD_ITEM* anchor = nullptr;
+                        bool persistentAnchor = false;
+                        bool trackNodeAnchor = false;
+                        int anchorSize = 0;
 
-                        if( segLen < 1.0 )
+                        for( FOOTPRINT* fp : m_loadBoard->Footprints() )
+                        {
+                            for( PAD* pad : fp->Pads() )
+                            {
+                                if( pad->GetPosition() == anchorPos
+                                    && pad->GetNetCode() == net->GetNetCode()
+                                    && pad->IsOnLayer( layer ) )
+                                {
+                                    anchor = pad;
+                                    persistentAnchor = true;
+                                    VECTOR2I sz = pad->GetSize( layer );
+                                    anchorSize = std::max( 1, std::min( sz.x, sz.y ) );
+                                    break;
+                                }
+                            }
+
+                            if( anchor )
+                                break;
+                        }
+
+                        if( !anchor )
+                        {
+                            for( PCB_TRACK* item : m_loadBoard->Tracks() )
+                            {
+                                if( item->Type() != PCB_VIA_T )
+                                    continue;
+
+                                PCB_VIA* via = static_cast<PCB_VIA*>( item );
+
+                                if( via->GetPosition() == anchorPos
+                                    && via->GetNetCode() == net->GetNetCode()
+                                    && via->IsOnLayer( layer ) )
+                                {
+                                    anchor = via;
+                                    persistentAnchor = true;
+                                    anchorSize = via->GetWidth( layer );
+                                    break;
+                                }
+                            }
+                        }
+
+                        if( !anchor )
+                        {
+                            for( PCB_TRACK* item : m_loadBoard->Tracks() )
+                            {
+                                if( item->Type() == PCB_TRACE_T
+                                    && item != source
+                                    && item->GetNetCode() == net->GetNetCode()
+                                    && item->GetLayer() == layer
+                                    && ( item->GetStart() == anchorPos
+                                         || item->GetEnd() == anchorPos )
+                                    && item->GetWidth() > anchorSize )
+                                {
+                                    anchor = item;
+                                    anchorSize = item->GetWidth();
+                                }
+                            }
+
+                            trackNodeAnchor = true;
+                        }
+
+                        if( !anchor || anchorSize <= 0 )
+                        {
+                            ++tdUnmatched;
                             return;
+                        }
 
-                        dir.x /= segLen;
-                        dir.y /= segLen;
+                        // PADS Default is a real teardrop on circular/oval pads and
+                        // vias, but the tested square/rectangular pads do not render it.
+                        // Test the copper shape on this layer, after finding the anchor.
+                        // Leave L/C independent of this Default-only rule.
+                        if( ( aPrevious ? td.previous_shape : td.next_shape ) == 'D' )
+                        {
+                            bool roundedAnchor = anchor->Type() == PCB_VIA_T;
 
-                        VECTOR2D norm( -dir.y, dir.x );
+                            if( anchor->Type() == PCB_PAD_T )
+                            {
+                                PAD* pad = static_cast<PAD*>( anchor );
+                                PAD_SHAPE padShape = pad->GetShape( layer );
+                                roundedAnchor = padShape == PAD_SHAPE::CIRCLE
+                                                || padShape == PAD_SHAPE::ROUNDRECT;
 
-                        // PADS teardrop preview ratios v1.3b:
-                        // WID and LEN are percentages of the pad/via anchor size.
-                        const double widthRatio =
-                                ( aPrevious ? td.previous_width : td.next_width ) / 100.0;
-                        const double lengthRatio =
-                                ( aPrevious ? td.previous_length : td.next_length ) / 100.0;
+                                // PADS Default oval cap rule v1.18. A stadium-shaped
+                                // pad has straight sides between its semicircular ends.
+                                // Rotate the route direction into the pad's local frame
+                                // (the same convention used by KiCad's oval geometry).
+                                if( padShape == PAD_SHAPE::OVAL )
+                                {
+                                    VECTOR2I direction = outside - pad->GetPosition();
+                                    RotatePoint( direction, pad->GetOrientation() );
+                                    VECTOR2I size = pad->GetSize( layer );
+                                    double dx = std::abs( static_cast<double>( direction.x ) );
+                                    double dy = std::abs( static_cast<double>( direction.y ) );
 
-                        const double tdWidth = anchorSize * widthRatio;
-                        const double tdLength = anchorSize * lengthRatio;
-                        const double wideHalf = tdWidth * 0.5;
-                        const double trackHalf = source->GetWidth() * 0.5;
+                                    if( size.x > size.y )
+                                    {
+                                        // At the horizontal side y = size.y/2, the
+                                        // end cap starts at x = (size.x-size.y)/2.
+                                        roundedAnchor = dx * size.y
+                                                        > dy * ( size.x - size.y );
+                                    }
+                                    else if( size.y > size.x )
+                                    {
+                                        roundedAnchor = dy * size.x
+                                                        > dx * ( size.y - size.x );
+                                    }
+                                    else
+                                    {
+                                        roundedAnchor = true;
+                                    }
+                                }
+                            }
 
-                        VECTOR2D c0( anchorPos.x, anchorPos.y );
-                        VECTOR2D c1( anchorPos.x + dir.x * std::min( segLen, tdLength ),
-                                      anchorPos.y + dir.y * std::min( segLen, tdLength ) );
+                            if( !roundedAnchor )
+                            {
+                                ++tdDefaultOmitted;
+                                return;
+                            }
+                        }
 
-                        SHAPE_LINE_CHAIN contour;
-                        contour.Append( KiROUND( c0.x + norm.x * wideHalf ),
-                                        KiROUND( c0.y + norm.y * wideHalf ) );
-                        contour.Append( KiROUND( c1.x + norm.x * trackHalf ),
-                                        KiROUND( c1.y + norm.y * trackHalf ) );
-                        contour.Append( KiROUND( c1.x - norm.x * trackHalf ),
-                                        KiROUND( c1.y - norm.y * trackHalf ) );
-                        contour.Append( KiROUND( c0.x - norm.x * wideHalf ),
-                                        KiROUND( c0.y - norm.y * wideHalf ) );
-                        contour.SetClosed( true );
-
-                        ZONE* zone = new ZONE( m_loadBoard );
-                        zone->SetNet( net );
-                        zone->SetLayer( layer );
-                        zone->Outline()->Append( contour );
-                        zone->SetFilledPolysList( layer, *zone->Outline() );
-                        zone->SetNeedRefill( false );
-                        zone->SetIsFilled( true );
-                        zone->SetLocalClearance( 0 );
-                        zone->SetMinThickness( 0 );
-                        zone->SetAssignedPriority( 600 );
-                        zone->SetTeardropAreaType(
-                                trackNodeAnchor ? TEARDROP_TYPE::TD_TRACKEND
-                                                : TEARDROP_TYPE::TD_VIAPAD );
-
-                        m_loadBoard->Add( zone );
-                        ++tdPreviewZones;
+                        IMPORTED_TD_CONNECTION connection;
+                        connection.source = source;
+                        connection.anchor = anchor;
+                        connection.anchorPos = anchorPos;
+                        connection.layer = layer;
+                        connection.net = net;
+                        connection.previous = aPrevious;
+                        connection.persistentAnchor = persistentAnchor;
+                        connection.trackNodeAnchor = trackNodeAnchor;
+                        connection.originalSpec = td.original_spec;
+                        connection.key.width = aPrevious ? td.previous_width : td.next_width;
+                        connection.key.length = aPrevious ? td.previous_length : td.next_length;
+                        connection.key.shape = aPrevious ? td.previous_shape : td.next_shape;
+                        connection.key.adjustable =
+                                aPrevious ? td.previous_adjustable : td.next_adjustable;
+                        importedConnections.push_back( std::move( connection ) );
                     };
 
             if( td.has_previous )
-                emitPreview( true );
+                collectConnection( true );
 
             if( td.has_next )
-                emitPreview( false );
+                collectConnection( false );
         }
+    }
+
+    std::map<BOARD_ITEM*, std::vector<size_t>> anchorConnections;
+
+    for( size_t i = 0; i < importedConnections.size(); ++i )
+    {
+        if( importedConnections[i].persistentAnchor )
+            anchorConnections[importedConnections[i].anchor].push_back( i );
+    }
+
+    auto makeParams =
+            []( const IMPORTED_TD_KEY& aKey )
+            {
+                TEARDROP_PARAMETERS params;
+                params.m_Enabled = true;
+                params.SetTeardropSizeRatio( aKey.length / 100.0, aKey.width / 100.0 );
+                params.m_CurvedEdges = aKey.shape == 'C';
+                params.SetTeardropMaxSize( 0, 0 );
+                params.m_WidthtoSizeFilterRatio = 1.0;
+                params.m_TdOnPadsInZones = true;
+                // PADS A is retained in metadata only. Use KiCad's normal
+                // short-segment setting independently of the original A flag.
+                params.m_AllowUseTwoTracks = true;
+                return params;
+            };
+
+    std::set<BOARD_ITEM*> nativeAnchors;
+    size_t tdNativePads = 0;
+    size_t tdNativeVias = 0;
+    size_t tdDivergentAnchors = 0;
+
+    for( const auto& [anchor, indices] : anchorConnections )
+    {
+        if( indices.empty() )
+            continue;
+
+        const IMPORTED_TD_KEY& first = importedConnections[indices.front()].key;
+        bool uniform = true;
+        std::set<PCB_TRACK*> specifiedTracks;
+
+        for( size_t index : indices )
+        {
+            const IMPORTED_TD_CONNECTION& connection = importedConnections[index];
+            uniform = uniform && connection.key == first;
+            specifiedTracks.insert( connection.source );
+        }
+
+        // Native pad/via parameters affect every connected trace.  Do not use them when
+        // PADS enabled the teardrop on only a subset of those traces.
+        std::set<PCB_TRACK*> eligibleTracks;
+        const IMPORTED_TD_CONNECTION& sample = importedConnections[indices.front()];
+
+        for( PCB_TRACK* item : m_loadBoard->Tracks() )
+        {
+            if( item->Type() != PCB_TRACE_T
+                || item->GetNetCode() != sample.net->GetNetCode()
+                || ( item->GetStart() != sample.anchorPos && item->GetEnd() != sample.anchorPos ) )
+            {
+                continue;
+            }
+
+            bool onAnchorLayer = false;
+
+            if( anchor->Type() == PCB_PAD_T )
+                onAnchorLayer = static_cast<PAD*>( anchor )->IsOnLayer( item->GetLayer() );
+            else if( anchor->Type() == PCB_VIA_T )
+                onAnchorLayer = static_cast<PCB_VIA*>( anchor )->IsOnLayer( item->GetLayer() );
+
+            if( onAnchorLayer )
+                eligibleTracks.insert( item );
+        }
+
+        uniform = uniform && specifiedTracks == eligibleTracks;
+
+        if( !uniform )
+        {
+            ++tdDivergentAnchors;
+            continue;
+        }
+
+        TEARDROP_PARAMETERS params = makeParams( first );
+
+        if( anchor->Type() == PCB_PAD_T )
+        {
+            static_cast<PAD*>( anchor )->GetTeardropParams() = params;
+            ++tdNativePads;
+        }
+        else
+        {
+            static_cast<PCB_VIA*>( anchor )->GetTeardropParams() = params;
+            ++tdNativeVias;
+        }
+
+        nativeAnchors.insert( anchor );
+    }
+
+    size_t tdNativeZones = 0;
+    size_t tdPerConnectionZones = 0;
+    size_t tdNativeSkipped = 0;
+    std::set<std::vector<int>> tdEmittedContours;
+    TEARDROP_MANAGER nativeTeardrops( m_loadBoard, nullptr );
+    nativeTeardrops.BuildTrackCaches();
+
+    for( const IMPORTED_TD_CONNECTION& connection : importedConnections )
+    {
+        TEARDROP_PARAMETERS params = makeParams( connection.key );
+        bool nativeAnchor = nativeAnchors.contains( connection.anchor );
+        const auto variant = connection.trackNodeAnchor
+                ? TEARDROP_MANAGER::TD_TYPE_TRACKEND
+                : TEARDROP_MANAGER::TD_TYPE_PADVIA;
+        std::unique_ptr<ZONE> generated( nativeTeardrops.BuildImportedTeardrop(
+                params, connection.source, connection.anchor, connection.anchorPos, variant ) );
+
+        if( !generated )
+        {
+            ++tdNativeSkipped;
+            continue;
+        }
+
+        const SHAPE_LINE_CHAIN& contour = generated->Outline()->COutline( 0 );
+        std::vector<int> contourKey = { connection.net->GetNetCode(),
+                                        static_cast<int>( connection.layer ) };
+
+        for( int i = 0; i < contour.PointCount(); ++i )
+        {
+            contourKey.push_back( contour.CPoint( i ).x );
+            contourKey.push_back( contour.CPoint( i ).y );
+        }
+
+        if( !tdEmittedContours.insert( contourKey ).second )
+            continue;
+
+        ZONE* zone = generated.get();
+
+        // PADS static incompatible teardrops v1.13.
+        // Preserve per-connection copper without exposing it to KiCad's native
+        // teardrop updater/remover. Use a normal zone's default area type rather
+        // than relying on the numeric value of the enum.
+        if( !nativeAnchor )
+        {
+            ZONE ordinaryZone( m_loadBoard );
+            zone->SetTeardropAreaType( ordinaryZone.GetTeardropAreaType() );
+
+            // Prevent the native updater from adding teardrops on this same anchor.
+            // The user can explicitly enable native parameters after deleting the
+            // imported copper if a shared pad/via configuration is desired.
+            if( connection.persistentAnchor )
+            {
+                if( connection.anchor->Type() == PCB_PAD_T )
+                    static_cast<PAD*>( connection.anchor )->GetTeardropParams().m_Enabled = false;
+                else if( connection.anchor->Type() == PCB_VIA_T )
+                    static_cast<PCB_VIA*>( connection.anchor )->GetTeardropParams().m_Enabled = false;
+            }
+        }
+        zone->SetCustomProperty( wxS( "PADS Storage" ),
+                                 nativeAnchor ? wxS( "KiCad native anchor" )
+                                              : wxS( "Per-connection" ) );
+        zone->SetCustomProperty( wxS( "PADS Side" ),
+                                 connection.previous ? wxS( "P" ) : wxS( "N" ) );
+        zone->SetCustomProperty( wxS( "PADS Width" ),
+                                 wxString::FromUTF8( fmt::format( "{}", connection.key.width ).c_str() ) );
+        zone->SetCustomProperty( wxS( "PADS Length" ),
+                                 wxString::FromUTF8( fmt::format( "{}", connection.key.length ).c_str() ) );
+        zone->SetCustomProperty( wxS( "PADS Shape" ),
+                                 wxString::Format( wxS( "%c" ), connection.key.shape ) );
+        zone->SetCustomProperty( wxS( "PADS Adjustable" ),
+                                 connection.key.adjustable ? wxS( "yes" ) : wxS( "no" ) );
+
+        if( !connection.originalSpec.empty() )
+        {
+            zone->SetCustomProperty(
+                    wxS( "PADS Original" ),
+                    wxString::FromUTF8( connection.originalSpec.c_str() ) );
+        }
+
+        zone->SetNeedRefill( false );
+        zone->SetAssignedPriority( 600 );
+        m_loadBoard->Add( generated.release() );
+
+        if( nativeAnchor )
+            ++tdNativeZones;
+        else
+            ++tdPerConnectionZones;
     }
 
     if( m_reporter )
     {
         m_reporter->Report(
                 wxString::Format(
-                        _( "PADS teardrop preview zones: %zu (pad/via + track-node)" ),
-                        tdPreviewZones ),
-                RPT_SEVERITY_INFO );
+                        _( "PADS hybrid teardrops: %zu native pad anchors, %zu native via anchors, "
+                           "%zu divergent anchors; %zu native zones, %zu per-connection zones, "
+                           "%zu unmatched/skipped; %zu Default ends omitted (v1.16 shapes)" ),
+                        tdNativePads, tdNativeVias, tdDivergentAnchors, tdNativeZones,
+                        tdPerConnectionZones, tdUnmatched + tdNativeSkipped,
+                        tdDefaultOmitted ),
+                ( tdUnmatched || tdNativeSkipped ) ? RPT_SEVERITY_WARNING : RPT_SEVERITY_INFO );
     }
+
+
 }
 
 
@@ -2120,6 +2257,13 @@ void PCB_IO_PADS::loadCopperShapes()
             outline.SetClosed( true );
             zone->Outline()->AddOutline( outline );
             zone->SetBorderDisplayStyle( ZONE_BORDER_DISPLAY_STYLE::DIAGONAL_EDGE, ZONE::GetDefaultHatchPitch(), true );
+
+            // PADS COPPER is already fixed copper, not an unfilled POUROUT.
+            // Cache its geometry as the initial KiCad fill so it appears on
+            // opening the board without recalculating it with KiCad's rules.
+            zone->SetFilledPolysList( layer, *zone->Outline() );
+            zone->SetIsFilled( true );
+            zone->SetNeedRefill( false );
 
             m_loadBoard->Add( zone );
         }

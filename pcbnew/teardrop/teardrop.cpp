@@ -55,6 +55,27 @@ TEARDROP_MANAGER::TEARDROP_MANAGER( BOARD* aBoard, TOOL_MANAGER* aToolManager ) 
 }
 
 
+
+// PADS native teardrop generator v1.10.
+ZONE* TEARDROP_MANAGER::BuildImportedTeardrop( const TEARDROP_PARAMETERS& aParams,
+                                             PCB_TRACK* aTrack, BOARD_ITEM* aAnchor,
+                                             const VECTOR2I& aAnchorPos,
+                                             TEARDROP_VARIANT aVariant ) const
+{
+    if( !aTrack || !aAnchor )
+        return nullptr;
+
+    std::vector<VECTOR2I> points;
+
+    if( !computeTeardropPolygon( aParams, points, aTrack, aTrack, aAnchor, aAnchorPos )
+        || points.size() < 3 )
+    {
+        return nullptr;
+    }
+
+    return createTeardrop( aVariant, points, aTrack, teardropUuid( aTrack, aAnchor, 0 ) );
+}
+
 KIID TEARDROP_MANAGER::teardropUuid( const PCB_TRACK* aTrack, const BOARD_ITEM* aCandidate,
                                      int aSlot )
 {
