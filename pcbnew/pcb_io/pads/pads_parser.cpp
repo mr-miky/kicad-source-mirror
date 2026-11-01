@@ -1912,6 +1912,11 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
     bool has_pending_arc_center = false;
     ARC_POINT pending_arc_center;
     std::string pending_arc_dir;
+    bool tdHasVertex = false;
+    POINT tdLastVertex = { 0, 0 };
+    int tdOutgoingLayer = 0;
+    size_t tdPending = 0;
+    bool tdHasPending = false;
 
     while( readLine( aStream, line ) )
     {
@@ -1926,6 +1931,8 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
                      in_track = false;
                  }
 
+                 tdHasVertex = false;
+                 tdHasPending = false;
                  prev_is_plane_connection = false;
                  has_pending_arc_center = false;
 
@@ -1970,6 +1977,8 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
                 in_track = false;
             }
 
+            tdHasVertex = false;
+            tdHasPending = false;
             prev_is_plane_connection = false;
 
             // Parse pin pairs from this line and add to current route
@@ -2077,67 +2086,75 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
                 continue;
             }
 
-            // Parse TEARDROP: TEARDROP [P width length [flags]] [N width length [flags]]
+            // PADS exact teardrop adjacency v1.8: flags are letter combinations,
+            // e.g. L, C, A, LA, CA. Preserve legacy numeric fields as well.
             if( token == "TEARDROP" )
             {
                 has_teardrop = true;
-                std::string td_token;
 
-                while( iss >> td_token )
+                // PADS original teardrop specification v1.9: retain the original
+                // numbers, letter combinations and spacing, not a reconstruction.
+                // Optional trailing route data is retained as source context.
+                const size_t specOffset = line.find( "TEARDROP" );
+                teardrop.original_spec = line.substr( specOffset );
+                std::string side;
+
+                while( true )
                 {
-                    if( td_token == "P" )
-                    {
-                        // P = Previous route segment at this vertex.
-                        teardrop.has_previous = true;
-                        iss >> teardrop.previous_width >> teardrop.previous_length;
+                    std::streampos sidePos = iss.tellg();
 
-                        std::streampos pos = iss.tellg();
-                        int td_flags = 0;
-
-                        if( iss >> td_flags )
-                            teardrop.previous_flags = td_flags;
-                        else
-                        {
-                            iss.clear();
-                            iss.seekg( pos );
-                        }
-                    }
-                    else if( td_token == "N" )
-                    {
-                        // N = Next route segment at this vertex.
-                        teardrop.has_next = true;
-                        iss >> teardrop.next_width >> teardrop.next_length;
-
-                        std::streampos pos = iss.tellg();
-                        int td_flags = 0;
-
-                        if( iss >> td_flags )
-                            teardrop.next_flags = td_flags;
-                        else
-                        {
-                            iss.clear();
-                            iss.seekg( pos );
-                        }
-                    }
-                    else
-                    {
-                        // Not a teardrop param, push back for further parsing
-                        // Since we can't push back easily, break and handle below
-                        if( td_token == "CW" || td_token == "CCW" )
-                            arc_dir = td_token;
-                        else if( td_token == "POWER" )
-                        {
-                            has_power = true;
-
-                            if( m_via_defs.count( td_token ) )
-                                via_name = td_token;
-                        }
-                        else if( td_token == "THERMAL" )
-                            ;
-                        else if( m_via_defs.count( td_token ) )
-                            via_name = td_token;
-
+                    if( !( iss >> side ) )
                         break;
+
+                    if( side != "P" && side != "N" )
+                    {
+                        iss.clear();
+                        iss.seekg( sidePos );
+                        break;
+                    }
+
+                    bool previous = side == "P";
+                    double& tdWidth = previous ? teardrop.previous_width : teardrop.next_width;
+                    double& tdLength = previous ? teardrop.previous_length : teardrop.next_length;
+                    char& shape = previous ? teardrop.previous_shape : teardrop.next_shape;
+                    bool& adjustable = previous ? teardrop.previous_adjustable : teardrop.next_adjustable;
+                    int& numeric = previous ? teardrop.previous_flags : teardrop.next_flags;
+
+                    if( !( iss >> tdWidth >> tdLength ) )
+                        break;
+
+                    ( previous ? teardrop.has_previous : teardrop.has_next ) = true;
+
+                    while( true )
+                    {
+                        std::streampos flagPos = iss.tellg();
+                        std::string flag;
+
+                        if( !( iss >> flag ) )
+                            break;
+
+                        if( !flag.empty() && flag.find_first_not_of( "LCA" ) == std::string::npos )
+                        {
+                            for( char ch : flag )
+                            {
+                                if( ch == 'L' || ch == 'C' )
+                                    shape = ch;
+                                else if( ch == 'A' )
+                                    adjustable = true;
+                            }
+                        }
+                        else if( !flag.empty()
+                                 && flag.find_first_not_of( "0123456789" ) == std::string::npos )
+                        {
+                            std::istringstream numericStream( flag );
+                            numericStream >> numeric;
+                        }
+                        else
+                        {
+                            iss.clear();
+                            iss.seekg( flagPos );
+                            break;
+                        }
                     }
                 }
 
@@ -2272,11 +2289,35 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
             current_route->vias.push_back( implicit_via );
         }
 
-        // Store teardrop if present
+        // Record the exact neighbouring vertices before splitting tracks by layer/width.
+        // The previous vertex's layer describes the outgoing physical segment.
+        // Route/pin-pair boundaries reset this state; arc centres never enter it.
+        const int tdIncomingLayer = tdHasVertex ? tdOutgoingLayer : 0;
+
+        if( tdHasPending && current_route )
+        {
+            TEARDROP& pending = current_route->teardrops[tdPending];
+            pending.next_point = { pt.x, pt.y };
+            pending.next_layer = tdIncomingLayer;
+            pending.next_connected = tdIncomingLayer > 0 && tdIncomingLayer != 65 && !pt.is_arc;
+        }
+
+        tdHasPending = false;
+
         if( has_teardrop && current_route )
         {
+            teardrop.previous_point = tdLastVertex;
+            teardrop.previous_layer = tdIncomingLayer;
+            teardrop.previous_connected = tdHasVertex && tdIncomingLayer > 0
+                                          && tdIncomingLayer != 65 && !pt.is_arc;
             current_route->teardrops.push_back( teardrop );
+            tdPending = current_route->teardrops.size() - 1;
+            tdHasPending = teardrop.has_next;
         }
+
+        tdLastVertex = { pt.x, pt.y };
+        tdOutgoingLayer = layer;
+        tdHasVertex = true;
 
         // Store jumper marker if present
         if( has_jumper && current_route )

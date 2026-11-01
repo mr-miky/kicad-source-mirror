@@ -2758,6 +2758,8 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
         int32_t  width = 0;
         uint32_t style = 0;
         uint32_t cellCount = 0;
+        uint32_t startTeardrop = 0;
+        uint32_t endTeardrop = 0;
     };
 
     size_t           objectBytes = routeObjects->physicalBytes;
@@ -2809,6 +2811,15 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
         object.width = static_cast<int32_t>( ringU32( ringStart, base + widthOffset ) ) * 4;
         object.style = ringU32( ringStart, base + ( legacyObjects ? 20 : 32 ) );
         object.cellCount = ringU32( ringStart, base + cellCountOffset );
+        // Binary teardrop endpoints v1.12. The final pair straddles the
+        // descriptor's logical ring boundary. Verified against ASCII exports.
+        // Older 36-byte dialects have not been validated for these fields.
+        if( !legacyObjects && m_version == 0x2026 )
+        {
+            object.startTeardrop = ringU32( ringStart, base + 44 );
+            object.endTeardrop = ringU32( ringStart, base + 48 );
+        }
+
         objects.push_back( object );
     }
 
@@ -2838,6 +2849,8 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
     {
         TRACK       track;
         std::string netName;
+        uint32_t startTeardrop = 0;
+        uint32_t endTeardrop = 0;
     };
 
     std::vector<DECODED_TRACK> decodedPieces;
@@ -2948,13 +2961,73 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
                                          object.cellCount, first.x, first.y, last.x, last.y ) );
         }
 
-        decodedPieces.push_back( { std::move( track ), m_nets[*netIndex].name } );
+        decodedPieces.push_back( { std::move( track ), m_nets[*netIndex].name,
+                                  object.startTeardrop, object.endTeardrop } );
     }
 
     for( DECODED_TRACK& decoded : decodedPieces )
     {
         ROUTE& route = aRoutes[decoded.netName];
         route.net_name = decoded.netName;
+        // Every routed-subpath end carries a parameter word; 0x80000 suppresses
+        // that end. Other high bits describe route state and are not enable bits.
+        auto addTeardrop = [&]( bool aStart, uint32_t aWord )
+        {
+            if( aWord == 0 || ( aWord & 0x00080000 ) != 0 )
+                return;
+
+            const TRACK& track = decoded.track;
+            if( track.points.size() < 2 )
+                return;
+
+            const auto& point = aStart ? track.points.front() : track.points.back();
+            const auto& neighbour = aStart ? track.points[1]
+                                          : track.points[track.points.size() - 2];
+            TEARDROP td;
+            td.x = point.x;
+            td.y = point.y;
+            td.layer = track.layer;
+            double length = aWord & 0x3FF;
+            double width = ( aWord >> 10 ) & 0x7F;
+            char shape = ( aWord & 0x40000 ) ? 'C' : ( aWord & 0x20000 ) ? 'L' : 'D';
+            bool adjustable = ( aWord & 0x100000 ) != 0;
+
+            if( length <= 0 || width <= 0 )
+                return;
+
+            if( aStart )
+            {
+                td.has_next = true;
+                td.next_connected = true;
+                td.next_point = { neighbour.x, neighbour.y };
+                td.next_layer = track.layer;
+                td.next_width = width;
+                td.next_length = length;
+                td.next_shape = shape;
+                td.next_adjustable = adjustable;
+            }
+            else
+            {
+                td.has_previous = true;
+                td.previous_connected = true;
+                td.previous_point = { neighbour.x, neighbour.y };
+                td.previous_layer = track.layer;
+                td.previous_width = width;
+                td.previous_length = length;
+                td.previous_shape = shape;
+                td.previous_adjustable = adjustable;
+            }
+
+            td.original_spec = fmt::format(
+                    "PADS binary 0x{:04X} TEARDROP {} {} {} {}{}; raw=0x{:08X}",
+                    m_version, aStart ? "N" : "P", width, length,
+                    shape == 'D' ? "" : shape == 'C' ? "C" : "L",
+                    adjustable ? "A" : "", aWord );
+            route.teardrops.push_back( std::move( td ) );
+        };
+
+        addTeardrop( true, decoded.startTeardrop );
+        addTeardrop( false, decoded.endTeardrop );
         route.tracks.push_back( std::move( decoded.track ) );
     }
 }
@@ -3664,6 +3737,51 @@ void BINARY_PARSER::parseDecalGraphics()
             }
 
             decal.items.push_back( std::move( item ) );
+        }
+    }
+
+    // PADS cloned decals can change padstacks without duplicating their graphic
+    // piece owners. Section-14 +76 then points back to the source decal index.
+    // Inherit only the drawn items; the clone keeps its own pads and terminals.
+    // Binary decal graphics aliases v1.17.
+    if( m_version >= 0x2025 )
+    {
+        const SDB_SECTION* headers = getSection( SECTION::DecalHeader );
+        constexpr size_t recordSize = 112;
+        constexpr size_t graphicOwnerOffset = 76;
+
+        if( !headers || headers->count != m_decalNameTable.size()
+            || static_cast<uint64_t>( headers->count ) * recordSize > headers->totalBytes )
+        {
+            THROW_IO_ERROR( "Invalid PADS decal graphics alias table" );
+        }
+
+        for( size_t index = 0; index < m_decalNameTable.size(); ++index )
+        {
+            const std::string& name = m_decalNameTable[index];
+
+            if( name.empty() )
+                continue;
+
+            auto target = m_decals.find( name );
+
+            if( target == m_decals.end() || !target->second.items.empty() )
+                continue;
+
+            SDB_RECORD header = m_sdb.RecordAt(
+                    headers->physicalOffset + static_cast<uint32_t>( index * recordSize ) );
+            int32_t sourceIndex = header.I32( graphicOwnerOffset );
+
+            if( sourceIndex < 0 || static_cast<size_t>( sourceIndex ) >= m_decalNameTable.size()
+                || static_cast<size_t>( sourceIndex ) == index )
+            {
+                continue;
+            }
+
+            auto source = m_decals.find( m_decalNameTable[static_cast<size_t>( sourceIndex )] );
+
+            if( source != m_decals.end() && !source->second.items.empty() )
+                target->second.items = source->second.items;
         }
     }
 }

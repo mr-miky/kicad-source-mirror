@@ -128,6 +128,16 @@ public:
 
     void BuildTrackCaches();
 
+    /**
+     * Build one imported teardrop with per-connection parameters, without GUI/commit.
+     * The caller owns the returned zone and adds it to the board. BuildTrackCaches()
+     * must have been called first. This uses native geometry, not the global updater.
+     * Returns nullptr when the native generator cannot construct this connection.
+     */
+    ZONE* BuildImportedTeardrop( const TEARDROP_PARAMETERS& aParams, PCB_TRACK* aTrack,
+                                BOARD_ITEM* aAnchor, const VECTOR2I& aAnchorPos,
+                                TEARDROP_VARIANT aVariant ) const;
+
 private:
     /**
      * @return true if the given aViaPad + aTrack is located inside a zone of the same netname
