@@ -228,6 +228,20 @@ struct DIFF_PAIR_DEF
 
 struct TEARDROP
 {
+    // PADS original teardrop specification v1.9 (verbatim ASCII suffix).
+    std::string original_spec;
+
+    // PADS exact teardrop adjacency v1.8: each side retains its route neighbour.
+    POINT previous_point = { 0, 0 };
+    POINT next_point = { 0, 0 };
+    int previous_layer = 0;
+    int next_layer = 0;
+    bool previous_connected = false;
+    bool next_connected = false;
+    char previous_shape = 'D'; // Default / Line / Curved
+    char next_shape = 'D';
+    bool previous_adjustable = false;
+    bool next_adjustable = false;
     // PADS stores teardrop metadata on a ROUTE vertex.
     // P/N select the Previous/Next segment adjacent to that vertex.
     double x = 0.0;
