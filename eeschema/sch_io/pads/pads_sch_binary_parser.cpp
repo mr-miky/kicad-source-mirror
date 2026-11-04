@@ -449,29 +449,40 @@ namespace
     }
 
 
-    // PADS justification is a bitfield where center wins: bit 2 centers and bit 0 right-aligns horizontally
+    // PADS nine-way text justification.  Valid codes are a sparse 3x3
+    // table, not contiguous vertical bands: 4 is center-bottom and 6 is center-top.
     MODEL_JUSTIFICATION horizontalJustification( uint16_t aValue )
     {
-        if( aValue & 0x0004 )
-            return MODEL_JUSTIFICATION::CENTER;
+        switch( aValue & 0x00FF )
+        {
+        case 1:
+        case 3:
+        case 9: return MODEL_JUSTIFICATION::RIGHT;
 
-        if( aValue & 0x0001 )
-            return MODEL_JUSTIFICATION::RIGHT;
+        case 4:
+        case 6:
+        case 12: return MODEL_JUSTIFICATION::CENTER;
 
-        return MODEL_JUSTIFICATION::LEFT;
+        default: return MODEL_JUSTIFICATION::LEFT;
+        }
     }
 
 
-    // Bit 3 centers and bit 1 top-aligns vertically; LEFT and RIGHT stand for top and bottom
+    // PADS nine-way vertical justification; LEFT and RIGHT map to KiCad TOP/BOTTOM.
     MODEL_JUSTIFICATION verticalJustification( uint16_t aValue )
     {
-        if( aValue & 0x0008 )
-            return MODEL_JUSTIFICATION::CENTER;
+        switch( aValue & 0x00FF )
+        {
+        case 2:
+        case 3:
+        case 6: return MODEL_JUSTIFICATION::LEFT;   // KiCad TOP mapping
 
-        if( aValue & 0x0002 )
-            return MODEL_JUSTIFICATION::LEFT;
+        case 8:
+        case 9:
+        case 12: return MODEL_JUSTIFICATION::CENTER;
 
-        return MODEL_JUSTIFICATION::RIGHT;
+        default: return MODEL_JUSTIFICATION::RIGHT; // KiCad BOTTOM mapping
+        }
     }
 
 
@@ -1687,7 +1698,9 @@ namespace
                 definitionPin.source = pinSource;
                 definitionPin.position = { decodeTerminalCoordinate( aCursor.U16At( terminalOffset + 2 ) ),
                                            decodeTerminalCoordinate( aCursor.U16At( terminalOffset + 4 ) ), pinSource };
-
+                // PADS terminal words 3-6 are text positions, not text dimensions.  The
+                // owning used-decal header carries pin-number and pin-name height/line-width pairs.
+                // Ordinary CAEDECAL terminals remain drawable; text visibility is independent.
                 definitionPin.presentation.source = pinSource;
                 definitionPin.presentation.visible = true;
                 SOURCE_PROVENANCE numberPresentationSource = source;
@@ -4842,16 +4855,19 @@ namespace
         aModel.settings.source = settingsSource;
 
         constexpr size_t PAGE_FIELD_OFFSET = 264;
-        constexpr size_t PAGE_FIELD_MAX_BYTES = 11;
+        constexpr size_t PAGE_FIELD_BYTES = 11;
         const size_t     pageFieldOffset = settingsOffset + PAGE_FIELD_OFFSET;
         size_t           pageFieldEnd = pageFieldOffset;
 
-        while( pageFieldEnd < pageFieldOffset + PAGE_FIELD_MAX_BYTES && aBytes[pageFieldEnd] != 0 )
+        while( pageFieldEnd < pageFieldOffset + PAGE_FIELD_BYTES && aBytes[pageFieldEnd] != 0 )
             ++pageFieldEnd;
 
         SOURCE_PROVENANCE pageSource = settingsSource;
         pageSource.absoluteOffset += PAGE_FIELD_OFFSET;
-        pageSource.length = pageFieldEnd - PAGE_FIELD_OFFSET;
+        pageSource.length = PAGE_FIELD_BYTES;
+
+        if( pageFieldEnd == pageFieldOffset + PAGE_FIELD_BYTES )
+            throwDecodeError( pageSource, wxS( "invalid design page-size field" ) );
 
         std::string pageField( aBytes.begin() + pageFieldOffset, aBytes.begin() + pageFieldEnd );
         std::string pageDesignator;
