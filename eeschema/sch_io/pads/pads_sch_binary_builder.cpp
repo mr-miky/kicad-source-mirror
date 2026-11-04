@@ -1029,7 +1029,7 @@ namespace
     }
 
 
-    void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource, uint16_t aMirrorFlags,
+    void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource,
                      std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
         SCH_FIELD* field = nullptr;
@@ -1055,25 +1055,15 @@ namespace
             THROW_IO_ERROR( FormatParserError( aSource.source, wxS( "could not stage symbol field" ) ) );
 
         field->SetText( aSource.value.text );
-        // PADS mirrored-Y field pre-compensation.  PADS stores the field offset in
-        // unmirrored CAEDECAL coordinates, while KiCad applies the symbol transform
-        // to fields.  This matches the established PADS ASCII importer behaviour.
-        SOURCE_POINT fieldPosition = aSource.position;
 
-        if( aMirrorFlags & 1 )
-            fieldPosition.x = -fieldPosition.x;
-
-        field->SetPosition( aSymbol->GetPosition() + localPoint( fieldPosition ) );
+        // Placement-field coordinates are local to the PADS CAEDECAL.  SCH_FIELD::SetPosition()
+        // accepts a sheet coordinate and converts it back through the parent symbol, so first
+        // transform the authored local offset into the placed symbol's sheet orientation.
+        VECTOR2I fieldOffset =
+                aSymbol->GetTransform().TransformCoordinate( localPoint( aSource.position ) );
+        field->SetPosition( aSymbol->GetPosition() + fieldOffset );
         field->SetTextAngle( EDA_ANGLE( aSource.angle, TENTHS_OF_A_DEGREE_T ) );
         MODEL_TEXT_PRESENTATION fieldPresentation = aSource.presentation;
-
-        if( aMirrorFlags & 1 )
-        {
-            if( fieldPresentation.horizontalJustification == MODEL_JUSTIFICATION::LEFT )
-                fieldPresentation.horizontalJustification = MODEL_JUSTIFICATION::RIGHT;
-            else if( fieldPresentation.horizontalJustification == MODEL_JUSTIFICATION::RIGHT )
-                fieldPresentation.horizontalJustification = MODEL_JUSTIFICATION::LEFT;
-        }
 
         // PADS stores a system-font field height as the Windows character-cell height,
         // whereas KiCad's text size behaves as the visual/em height.  Applying the raw
@@ -1156,7 +1146,7 @@ namespace
         symbol->AddHierarchicalReference( aPath.Path(), reference, unit );
 
         for( const MODEL_FIELD& field : aPlacement.fields )
-            applyField( symbol.get(), field, aPlacement.mirrorFlags, aDiagnostics );
+            applyField( symbol.get(), field, aDiagnostics );
 
         return symbol;
     }
