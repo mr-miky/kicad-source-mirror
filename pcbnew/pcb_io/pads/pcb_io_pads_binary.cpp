@@ -42,6 +42,12 @@
 
 #include <netinfo.h>
 #include <wx/log.h>
+#include <wx/app.h>
+#include <wx/checkbox.h>
+#include <wx/dialog.h>
+#include <wx/sizer.h>
+#include <wx/stattext.h>
+#include <wx/thread.h>
 #include <pad.h>
 #include <pcb_shape.h>
 #include <board_design_settings.h>
@@ -121,6 +127,52 @@ void PCB_IO_PADS_BINARY::loadBoard( const wxString& aFileName, BOARD& aBoard, bo
     if( m_progressReporter )
         m_progressReporter->SetNumPhases( 3 );
 
+    // PADS binary import requester v1.26.  Keep the old behaviour for CLI,
+    // automated tests and other callers without a graphical application.
+    m_importPadsTeardropMetadata = true;
+    m_generatePadsTeardropCopper = true;
+    m_importPadsRomansimFont = true;
+
+    if( wxTheApp && wxIsMainThread() )
+    {
+        if( wxWindow* parent = wxTheApp->GetTopWindow() )
+        {
+            wxDialog dialog( parent, wxID_ANY, _( "PADS Binary Import Options" ),
+                             wxDefaultPosition, wxDefaultSize,
+                             wxDEFAULT_DIALOG_STYLE | wxRESIZE_BORDER );
+            wxBoxSizer* mainSizer = new wxBoxSizer( wxVERTICAL );
+            wxStaticText* description = new wxStaticText(
+                    &dialog, wxID_ANY,
+                    _( "Choose how PADS teardrop information is imported." ) );
+            wxCheckBox* metadata = new wxCheckBox(
+                    &dialog, wxID_ANY, _( "Preserve PADS teardrop metadata on tracks" ) );
+            wxCheckBox* copper = new wxCheckBox(
+                    &dialog, wxID_ANY, _( "Generate teardrop copper during import" ) );
+            wxCheckBox* romansim = new wxCheckBox(
+                    &dialog, wxID_ANY, _( "Import PADS Romansim font" ) );
+
+            metadata->SetValue( m_importPadsTeardropMetadata );
+            copper->SetValue( m_generatePadsTeardropCopper );
+            romansim->SetValue( m_importPadsRomansimFont );
+            mainSizer->Add( description, 0, wxALL, 12 );
+            mainSizer->Add( metadata, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12 );
+            mainSizer->Add( copper, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12 );
+            mainSizer->Add( romansim, 0, wxLEFT | wxRIGHT | wxBOTTOM, 12 );
+
+            if( wxSizer* buttons = dialog.CreateSeparatedButtonSizer( wxOK | wxCANCEL ) )
+                mainSizer->Add( buttons, 0, wxEXPAND | wxALL, 12 );
+
+            dialog.SetSizerAndFit( mainSizer );
+
+            if( dialog.ShowModal() != wxID_OK )
+                THROW_IO_CANCELLED();
+
+            m_importPadsTeardropMetadata = metadata->GetValue();
+            m_generatePadsTeardropCopper = copper->GetValue();
+            m_importPadsRomansimFont = romansim->GetValue();
+        }
+    }
+
     PADS_IO::BINARY_PARSER parser;
 
     try
@@ -136,7 +188,8 @@ void PCB_IO_PADS_BINARY::loadBoard( const wxString& aFileName, BOARD& aBoard, bo
     m_parser = &parser;
     m_converter = std::make_unique<PADS_PCB_CONVERTER>( m_loadBoard, m_reporter );
     // Activate the document alternate stroke font before any PADS text is created.
-    m_converter->PreparePadsRomansimFont();
+    if( m_importPadsRomansimFont )
+        m_converter->PreparePadsRomansimFont();
 
     try
     {
@@ -1645,6 +1698,67 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
                             ++tdUnmatched;
                             return;
                         }
+
+                        if( m_importPadsTeardropMetadata )
+                        {
+                            // PADS binary per-track teardrop metadata v1.22.  Preserve
+                            // this before geometry/anchor filtering: a future plugin
+                            // must also see ends that this importer cannot render.
+                            // P/N is route adjacency; Start/End is the corresponding
+                            // endpoint of the actual KiCad segment.
+                            const bool metadataAtStart = source->GetStart() == anchorPos;
+                            const wxString metadataPrefix =
+                                    metadataAtStart ? wxS( "PADS Teardrop Start " )
+                                                    : wxS( "PADS Teardrop End " );
+                            const char metadataShape =
+                                    aPrevious ? td.previous_shape : td.next_shape;
+                            const bool metadataAdjustable =
+                                    aPrevious ? td.previous_adjustable : td.next_adjustable;
+                            const int metadataFlags =
+                                    aPrevious ? td.previous_flags : td.next_flags;
+                            const double metadataWidth =
+                                    aPrevious ? td.previous_width : td.next_width;
+                            const double metadataLength =
+                                    aPrevious ? td.previous_length : td.next_length;
+
+                            source->SetCustomProperty( wxS( "PADS Teardrop Metadata Version" ),
+                                                       wxS( "1" ) );
+                            source->SetCustomProperty( metadataPrefix + wxS( "Side" ),
+                                                       aPrevious ? wxS( "P" ) : wxS( "N" ) );
+                            source->SetCustomProperty(
+                                    metadataPrefix + wxS( "Anchor" ),
+                                    wxString::Format( wxS( "%lld,%lld" ),
+                                                      static_cast<long long>( anchorPos.x ),
+                                                      static_cast<long long>( anchorPos.y ) ) );
+                            source->SetCustomProperty(
+                                    metadataPrefix + wxS( "Width Ratio" ),
+                                    wxString::FromUTF8(
+                                            fmt::format( "{:.17g}", metadataWidth ).c_str() ) );
+                            source->SetCustomProperty(
+                                    metadataPrefix + wxS( "Length Ratio" ),
+                                    wxString::FromUTF8(
+                                            fmt::format( "{:.17g}", metadataLength ).c_str() ) );
+                            source->SetCustomProperty( metadataPrefix + wxS( "Shape" ),
+                                                       wxString::Format( wxS( "%c" ),
+                                                                         metadataShape ) );
+                            source->SetCustomProperty( metadataPrefix + wxS( "Auto Adjust" ),
+                                                       metadataAdjustable ? wxS( "1" )
+                                                                          : wxS( "0" ) );
+                            source->SetCustomProperty( metadataPrefix + wxS( "Flags" ),
+                                                       wxString::Format( wxS( "%d" ),
+                                                                         metadataFlags ) );
+
+                            if( !td.original_spec.empty() )
+                            {
+                                source->SetCustomProperty(
+                                        metadataPrefix + wxS( "Original" ),
+                                        wxString::FromUTF8( td.original_spec.c_str() ) );
+                            }
+
+                        }
+
+                        if( !m_generatePadsTeardropCopper )
+                            return;
 
                         BOARD_ITEM* anchor = nullptr;
                         bool persistentAnchor = false;

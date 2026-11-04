@@ -284,11 +284,74 @@ namespace
     }
 
 
+    KIFONT::FONT* resolvePadsPresentationFont( const MODEL_TEXT_PRESENTATION& aPresentation )
+    {
+        if( aPresentation.font.text.IsEmpty()
+            || aPresentation.font.text == wxS( "Default Font" ) )
+        {
+            return KIFONT::FONT::GetFont();
+        }
+
+        KIFONT::FONT* font = KIFONT::FONT::GetFont(
+                aPresentation.font.text, aPresentation.bold, aPresentation.italic );
+
+        // KiCad returns its stroke font when an outline family cannot be loaded.
+        // Fontconfig's compatible-family result is not guaranteed to be used here,
+        // so make the known Linux replacement for PADS Verdana explicit.
+        if( font && font->IsStroke()
+            && aPresentation.font.text.CmpNoCase( wxS( "Verdana" ) ) == 0 )
+        {
+            KIFONT::FONT* fallback = KIFONT::FONT::GetFont(
+                    wxS( "Noto Sans" ), aPresentation.bold, aPresentation.italic );
+
+            if( fallback && !fallback->IsStroke() )
+                font = fallback;
+        }
+
+        return font;
+    }
+
+
+    int64_t padsVisualTextHeight( const MODEL_TEXT_PRESENTATION& aPresentation )
+    {
+        if( aPresentation.height <= 0 )
+            return aPresentation.height;
+
+        KIFONT::FONT* font = resolvePadsPresentationFont( aPresentation );
+
+        if( !font || font->IsStroke() )
+            return aPresentation.height;
+
+        // PADS system-font height is a Windows character-cell height.  KiCad's
+        // outline text size is visual/em based; 75% matches the controlled
+        // 97/100 mil Verdana fixtures and is also required by worksheet text.
+        constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.75;
+        return std::max<int64_t>(
+                1, static_cast<int64_t>( std::llround(
+                           static_cast<double>( aPresentation.height )
+                           * PADS_SYSTEM_TEXT_HEIGHT_CORRECTION ) ) );
+    }
+
+
+    SPIN_STYLE padsLabelSpinStyle( const SOURCE_POINT& aTextOffset )
+    {
+        // Match the ASCII importer: the dominant NETNAMES offset axis and its
+        // sign describe which way the text reads away from the connection.
+        if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
+            return aTextOffset.x >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
+
+        return aTextOffset.y >= 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+    }
+
+
     void applyTextPresentation( EDA_TEXT* aText, const MODEL_TEXT_PRESENTATION& aPresentation, bool aVisible,
                                 std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
         if( aPresentation.height > 0 )
-            aText->SetTextSize( { toIU( aPresentation.height ), toIU( aPresentation.height ) } );
+        {
+            const int visualHeight = toIU( padsVisualTextHeight( aPresentation ) );
+            aText->SetTextSize( { visualHeight, visualHeight } );
+        }
 
         aText->SetHorizJustify( horizontalJustification( aPresentation.horizontalJustification ) );
         aText->SetVertJustify( verticalJustification( aPresentation.verticalJustification ) );
@@ -300,8 +363,7 @@ namespace
             aText->SetTextThickness( toIU( aPresentation.width ) );
 
         if( !aPresentation.font.text.IsEmpty() && aPresentation.font.text != wxS( "Default Font" ) )
-            aText->SetFont(
-                    KIFONT::FONT::GetFont( aPresentation.font.text, aPresentation.bold, aPresentation.italic ) );
+            aText->SetFont( resolvePadsPresentationFont( aPresentation ) );
 
         // PADS gives the rendered stroke; run it back through the bold factor once the face is
         // resolved, since only a stroke font applies that factor
@@ -616,6 +678,54 @@ namespace
     }
 
 
+    const wxString PADS_PIN_NUMBER_CALIBRATION =
+            wxS( "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-./[]" );
+    const wxString PADS_PIN_NAME_CALIBRATION =
+            wxS( "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_#~+-/[]" );
+
+
+    int fittedPinTextSize( const wxString& aCalibration, const MODEL_TEXT_PRESENTATION& aPresentation )
+    {
+        const int nominalSize = toIU( aPresentation.height );
+
+        if( nominalSize <= 0 || aPresentation.font.text.IsEmpty()
+            || aPresentation.font.text == wxS( "Default Font" ) )
+        {
+            return nominalSize;
+        }
+
+        KIFONT::FONT* sourceFont = KIFONT::FONT::GetFont(
+                aPresentation.font.text, aPresentation.bold, aPresentation.italic );
+        KIFONT::FONT* pinFont = KIFONT::FONT::GetFont();
+
+        if( !sourceFont || !pinFont )
+            return nominalSize;
+
+        const VECTOR2I nominal( nominalSize, nominalSize );
+        const int sourceThickness = aPresentation.width > 0 ? toIU( aPresentation.width ) : 0;
+        const KIFONT::METRICS& metrics = KIFONT::METRICS::Default();
+        const VECTOR2I sourceExtents = sourceFont->StringBoundaryLimits(
+                aCalibration, nominal, sourceThickness, aPresentation.bold, aPresentation.italic, metrics );
+        const VECTOR2I pinExtents = pinFont->StringBoundaryLimits(
+                aCalibration, nominal, 0, false, false, metrics );
+
+        if( sourceExtents.x <= 0 || sourceExtents.y <= 0 || pinExtents.x <= 0 || pinExtents.y <= 0 )
+            return nominalSize;
+
+        const double widthRatio = static_cast<double>( sourceExtents.x ) / pinExtents.x;
+        const double heightRatio = static_cast<double>( sourceExtents.y ) / pinExtents.y;
+
+        // PADS' declared system-font height is a character-cell measure.  A controlled
+        // 97 mil Verdana fixture renders correctly in KiCad at about 80.75% of the
+        // metric-only fit (2.2266/2.2325 mm -> approximately 1.8 mm).
+        constexpr double PADS_PIN_TEXT_HEIGHT_CORRECTION = 0.8075;
+        const double fitted = static_cast<double>( nominalSize )
+                              * std::min( widthRatio, heightRatio )
+                              * PADS_PIN_TEXT_HEIGHT_CORRECTION;
+        return std::max( 1, static_cast<int>( std::llround( fitted ) ) );
+    }
+
+
     std::unique_ptr<SCH_PIN> makePin( const MODEL_PIN_DEFINITION& aPin, LIB_SYMBOL* aParent )
     {
         auto pin = std::make_unique<SCH_PIN>( aParent );
@@ -628,10 +738,11 @@ namespace
         pin->SetShape( pinShape( aPin.graphicStyle ) );
         pin->SetVisible( aPin.presentation.visible );
 
-        // toIU already halves, the same as applyTextPresentation; a second /2 here made pin text
-        // half the size of every other imported string
-        pin->SetNameTextSize( toIU( aPin.namePresentation.height ) );
-        pin->SetNumberTextSize( toIU( aPin.numberPresentation.height ) );
+        // KiCad pins do not store a font face.  Fit their single scalar text size by comparing
+        // representative uppercase PADS text with KiCad's stroke font at the same nominal size.
+        pin->SetNameTextSize( fittedPinTextSize( PADS_PIN_NAME_CALIBRATION, aPin.namePresentation ) );
+        pin->SetNumberTextSize( fittedPinTextSize( PADS_PIN_NUMBER_CALIBRATION,
+                                                  aPin.numberPresentation ) );
 
         return pin;
     }
@@ -918,7 +1029,8 @@ namespace
     }
 
 
-    void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource, std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
+    void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource, uint16_t aMirrorFlags,
+                     std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
         SCH_FIELD* field = nullptr;
 
@@ -943,10 +1055,35 @@ namespace
             THROW_IO_ERROR( FormatParserError( aSource.source, wxS( "could not stage symbol field" ) ) );
 
         field->SetText( aSource.value.text );
-        field->SetPosition( aSymbol->GetPosition() + localPoint( aSource.position ) );
+        // PADS mirrored-Y field pre-compensation.  PADS stores the field offset in
+        // unmirrored CAEDECAL coordinates, while KiCad applies the symbol transform
+        // to fields.  This matches the established PADS ASCII importer behaviour.
+        SOURCE_POINT fieldPosition = aSource.position;
+
+        if( aMirrorFlags & 1 )
+            fieldPosition.x = -fieldPosition.x;
+
+        field->SetPosition( aSymbol->GetPosition() + localPoint( fieldPosition ) );
         field->SetTextAngle( EDA_ANGLE( aSource.angle, TENTHS_OF_A_DEGREE_T ) );
-        applyTextPresentation( field, aSource.presentation, aSource.visible && aSource.presentation.visible,
-                               aDiagnostics );
+        MODEL_TEXT_PRESENTATION fieldPresentation = aSource.presentation;
+
+        if( aMirrorFlags & 1 )
+        {
+            if( fieldPresentation.horizontalJustification == MODEL_JUSTIFICATION::LEFT )
+                fieldPresentation.horizontalJustification = MODEL_JUSTIFICATION::RIGHT;
+            else if( fieldPresentation.horizontalJustification == MODEL_JUSTIFICATION::RIGHT )
+                fieldPresentation.horizontalJustification = MODEL_JUSTIFICATION::LEFT;
+        }
+
+        // PADS stores a system-font field height as the Windows character-cell height,
+        // whereas KiCad's text size behaves as the visual/em height.  Applying the raw
+        // 100 mil value makes REF-DES and VALUE about one third too large.  Keep the
+        // parser's whole-mil -> half-mil conversion exact, and adapt only system-font
+        // symbol fields here.  Stroke-font fields and SCH_PIN fitting are unaffected.
+        // Centralized in applyTextPresentation(): fields, free text, symbol text
+        // and labels now share the same PADS outline-font height semantics.
+        applyTextPresentation( field, fieldPresentation,
+                               aSource.visible && fieldPresentation.visible, aDiagnostics );
     }
 
 
@@ -1019,7 +1156,7 @@ namespace
         symbol->AddHierarchicalReference( aPath.Path(), reference, unit );
 
         for( const MODEL_FIELD& field : aPlacement.fields )
-            applyField( symbol.get(), field, aDiagnostics );
+            applyField( symbol.get(), field, aPlacement.mirrorFlags, aDiagnostics );
 
         return symbol;
     }
@@ -1173,8 +1310,15 @@ namespace
                 if( graphic.angle != 0 )
                     output << ") (rotate " << static_cast<double>( graphic.angle ) / 10.0;
 
-                output << ") (font (size " << static_cast<double>( graphic.presentation.height ) * 0.0127 << ' '
-                       << static_cast<double>( graphic.presentation.height ) * 0.0127 << ')';
+                const int64_t worksheetVisualHeight = padsVisualTextHeight( graphic.presentation );
+                KIFONT::FONT* worksheetFont = resolvePadsPresentationFont( graphic.presentation );
+                output << ") (font";
+                
+                if( worksheetFont && !worksheetFont->IsStroke() )
+                    output << " (face \"" << quoteWorksheetText( worksheetFont->GetName() ) << "\")";
+                
+                output << " (size " << static_cast<double>( worksheetVisualHeight ) * 0.0127 << ' '
+                       << static_cast<double>( worksheetVisualHeight ) * 0.0127 << ')';
 
                 if( graphic.presentation.width > 0 )
                     output << " (linewidth " << static_cast<double>( graphic.presentation.width ) * 0.0127 << ')';
@@ -1931,6 +2075,18 @@ namespace
                 text->SetTextAngle( EDA_ANGLE( label.angle, TENTHS_OF_A_DEGREE_T ) );
                 applyTextPresentation( text, label.presentation, label.presentation.visible,
                                        aStaged.result.diagnostics );
+
+                // Normalize KiCad global-label justification after applying the PADS presentation.
+                // Prefer the authored NETNAMES text offset: rotation and mirror bits do
+                // not reliably encode the off-page reading direction.  SetSpinStyle()
+                // must run last because applyTextPresentation() changes angle/alignment.
+                if( auto* globalLabel = dynamic_cast<SCH_GLOBALLABEL*>( text ) )
+                {
+                    if( label.textOffset.x != 0 || label.textOffset.y != 0 )
+                        globalLabel->SetSpinStyle( padsLabelSpinStyle( label.textOffset ) );
+                    else
+                        globalLabel->SetSpinStyle( globalLabel->GetSpinStyle() );
+                }
             }
 
             aScreen->Append( item.get() );

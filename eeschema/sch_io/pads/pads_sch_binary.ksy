@@ -65,6 +65,9 @@ enums:
     0x43: c
     0x44: d
     0x45: e
+  schematic_font_mode:
+    0: stroke
+    1: system
 
 types:
   header_v12:
@@ -339,8 +342,15 @@ types:
       - id: text_width_mils
         type: u2
       - id: preserved_design_settings_2c
-        size: 220
-        doc: Exact fixed-offset design-settings bytes; controlled page and width diffs leave their semantics unproved, so importer disposition is PRESERVED.
+        size: 208
+        doc: Exact fixed-offset design-settings bytes preceding the proven font-mode word.
+      - id: font_mode
+        type: u4
+        enum: schematic_font_mode
+        doc: Controlled native save/re-export proves 0 is Stroke and 1 is System.
+      - id: preserved_design_settings_100
+        size: 8
+        doc: Exact fixed-offset design-settings bytes following the proven font-mode word.
       - id: page_size_storage
         type: page_size_slot
         size: 11
@@ -380,7 +390,7 @@ types:
         doc: The low byte is the Logic 9.0 justification code; paired vendor fields prove the high byte carries unrelated packed data. For free text, controlled crosshair fixtures prove low-nibble horizontal classes 0/2/8 left, 4/6/10/12/14 center, and the remaining codes right. All 16 codes use the same baseline anchor. Other controller-1 record classes use their own justification interpretation.
       - id: string_bytes_including_nul
         type: u2
-      - id: height_half_mil
+      - id: height_mils
         type: u2
       - id: predecessor_ordinal
         type: u2
@@ -1020,16 +1030,16 @@ types:
         type: u2
       - id: custom_field_count
         type: u2
-      - id: reference_height_half_mil
+      - id: reference_height_mils
         type: u2
-      - id: part_type_height_half_mil
+      - id: part_type_height_mils
         type: u2
       - id: preserved_text_size_properties
         size: 4
         doc: Exact placement text-size bytes; independent proven heights and widths are adjacent, so importer disposition is PRESERVED.
-      - id: reference_width_half_mil
+      - id: reference_width_mils
         type: u1
-      - id: part_type_width_half_mil
+      - id: part_type_width_mils
         type: u1
       - id: preserved_text_presentation
         size: 4
@@ -1105,9 +1115,9 @@ types:
       - id: component_attribute_index
         type: u2
         doc: Index within the placement's outer-controller component attribute slice; 0xffff is used by unnamed records.
-      - id: height_half_mil
+      - id: height_mils
         type: u2
-      - id: width_half_mil
+      - id: width_mils
         type: u1
       - id: display_flags
         type: u1
@@ -1339,22 +1349,26 @@ types:
       - id: preserved_decal_word_56
         type: u2
         doc: Exact used-decal presentation word; field geometry is proven by adjacent values, so importer disposition is PRESERVED.
-      - id: reference_height_half_mil
+      - id: reference_height_mils
         type: u2
-      - id: part_type_height_half_mil
+      - id: part_type_height_mils
         type: u2
-      - id: value_height_half_mil
+      - id: pin_number_height_mils
         type: u2
-      - id: wildcard_height_half_mil
+        doc: Pin-number text height from the CAEDECAL header.
+      - id: pin_name_height_mils
         type: u2
-      - id: reference_width_half_mil
+        doc: Pin-name text height from the CAEDECAL header.
+      - id: reference_width_mils
         type: u1
-      - id: part_type_width_half_mil
+      - id: part_type_width_mils
         type: u1
-      - id: value_width_half_mil
+      - id: pin_number_width_mils
         type: u1
-      - id: wildcard_width_half_mil
+        doc: Pin-number stroke width from the CAEDECAL header.
+      - id: pin_name_width_mils
         type: u1
+        doc: Pin-name stroke width from the CAEDECAL header.
       - id: definition_font_handles
         type: s2
         repeat: expr
@@ -1378,22 +1392,30 @@ types:
         type: s2
       - id: y_half_mil_divided_by_2
         type: s2
-      - id: pin_name_height_half_mil_divided_by_2
+      - id: pin_number_x_mils
         type: s2
-      - id: pin_name_width_half_mil_divided_by_2
+        doc: Pin-number X location relative to the terminal, stored at half the ASCII mil value.
+      - id: pin_number_y_mils
         type: s2
-      - id: pin_number_height_half_mil_divided_by_2
+        doc: Pin-number Y location relative to the terminal, stored at half the ASCII mil value.
+      - id: pin_name_x_mils
         type: s2
-      - id: pin_number_width_half_mil_divided_by_2
+        doc: Pin-name X location relative to the terminal, stored at half the ASCII mil value.
+      - id: pin_name_y_mils
         type: s2
-      - id: name_offset_x_half_mil_divided_by_2
+        doc: Pin-name Y location relative to the terminal, stored at half the ASCII mil value.
+      - id: pin_property_label_x_mils
         type: s2
-      - id: name_offset_y_half_mil_divided_by_2
+        doc: Pin-property label X location from the ASCII P-line.
+      - id: pin_property_label_y_mils
         type: s2
-      - id: number_offset_x_half_mil_divided_by_2
+        doc: Pin-property label Y location from the ASCII P-line.
+      - id: net_name_label_x_mils
         type: s2
-      - id: number_offset_y_half_mil_divided_by_2
+        doc: Net-name label X location from the ASCII P-line.
+      - id: net_name_label_y_mils
         type: s2
+        doc: Net-name label Y location from the ASCII P-line.
       - id: side_and_name_presentation_flags
         type: u2
         doc: >-
