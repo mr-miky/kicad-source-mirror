@@ -106,6 +106,11 @@ private:
     const PADS_IO::BINARY_PARSER*       m_parser = nullptr;
     std::unique_ptr<PADS_PCB_CONVERTER> m_converter;
     int                                 m_minObjectSize = 1000;
+
+    // Binary-PADS requester state, reset to the historical defaults per load.
+    bool m_importPadsTeardropMetadata = true;
+    bool m_generatePadsTeardropCopper = true;
+    bool m_importPadsRomansimFont = true;
     std::map<wxString, std::string>     m_pinToNetMap;   ///< "<refdes>.<pin>" to PADS net name
 
     // One footprint per parser part index, so loadClusterGroups() can resolve the
