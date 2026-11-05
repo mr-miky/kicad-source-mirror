@@ -338,11 +338,27 @@ namespace
     }
 
 
-    SPIN_STYLE padsLabelSpinStyle( const SOURCE_POINT& aTextOffset )
+    SPIN_STYLE padsLabelSpinStyle( const SOURCE_POINT& aPosition,
+                                         const SOURCE_POINT& aTextOffset,
+                                         const SOURCE_POINT* aAdjacentWirePoint )
     {
-        // NETNAMES stores the text/body offset from the electrical connection point.
-        // KiCad's spin style names the direction of the pointed connection end, so it
-        // is opposite to the direction in which the PADS label body extends.
+        if( aAdjacentWirePoint )
+        {
+            const int64_t deltaX = aAdjacentWirePoint->x - aPosition.x;
+            const int64_t deltaY = aAdjacentWirePoint->y - aPosition.y;
+
+            if( deltaX != 0 || deltaY != 0 )
+            {
+                if( std::abs( deltaX ) >= std::abs( deltaY ) )
+                    return deltaX < 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
+
+                // PADS page Y increases upwards; KiCad screen Y increases downwards.
+                return deltaY > 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+            }
+        }
+
+        // A zero-length or absent wire has no usable direction.  Fall back to the
+        // direction opposite to the NETNAMES body offset.
         if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
             return aTextOffset.x >= 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
 
@@ -764,6 +780,7 @@ namespace
     struct MODEL_INDEX
     {
         using POINT_KEY = std::tuple<uint32_t, int64_t, int64_t>;
+        using SHEET_POINT_KEY = std::tuple<uint32_t, int64_t, int64_t>;
 
         explicit MODEL_INDEX( const PADS_SCH_MODEL& aModel )
         {
@@ -792,6 +809,15 @@ namespace
                     endpointAdjacency[{ net.id.Value(), connection.vertices.front().x, connection.vertices.front().y }]
                             .push_back( connection.vertices[1] );
                     endpointAdjacency[{ net.id.Value(), connection.vertices.back().x, connection.vertices.back().y }]
+                            .push_back( connection.vertices[connection.vertices.size() - 2] );
+
+                    endpointAdjacencyBySheet[
+                            { net.sheet.id.Value(), connection.vertices.front().x,
+                              connection.vertices.front().y } ]
+                            .push_back( connection.vertices[1] );
+                    endpointAdjacencyBySheet[
+                            { net.sheet.id.Value(), connection.vertices.back().x,
+                              connection.vertices.back().y } ]
                             .push_back( connection.vertices[connection.vertices.size() - 2] );
                 }
             }
@@ -846,6 +872,7 @@ namespace
         std::map<SHEET_ID, std::vector<const MODEL_EMBEDDED_IMAGE*>> imagesBySheet;
         std::map<NET_ID, const MODEL_NET*>                           netsById;
         std::map<POINT_KEY, std::vector<SOURCE_POINT>>               endpointAdjacency;
+        std::map<SHEET_POINT_KEY, std::vector<SOURCE_POINT>>         endpointAdjacencyBySheet;
         std::map<SHEET_ID, std::set<std::pair<int64_t, int64_t>>>    connectedPinPointsBySheet;
 
         std::map<DEFINITION_ID, const MODEL_SYMBOL_DEFINITION*>                definitionsById;
@@ -2126,10 +2153,19 @@ namespace
                 // must run last because applyTextPresentation() changes angle/alignment.
                 if( auto* globalLabel = dynamic_cast<SCH_GLOBALLABEL*>( text ) )
                 {
-                    if( label.textOffset.x != 0 || label.textOffset.y != 0 )
-                        globalLabel->SetSpinStyle( padsLabelSpinStyle( label.textOffset ) );
-                    else
-                        globalLabel->SetSpinStyle( globalLabel->GetSpinStyle() );
+                    const SOURCE_POINT* adjacentWirePoint = nullptr;
+                    auto adjacency = aIndex.endpointAdjacencyBySheet.find(
+                            { aSourceSheet.id.Value(), label.position.x, label.position.y } );
+
+                    if( adjacency != aIndex.endpointAdjacencyBySheet.end()
+                        && !adjacency->second.empty() )
+                    {
+                        adjacentWirePoint = &adjacency->second.front();
+                    }
+
+                    globalLabel->SetSpinStyle(
+                            padsLabelSpinStyle( label.position, label.textOffset,
+                                                adjacentWirePoint ) );
                 }
             }
 
