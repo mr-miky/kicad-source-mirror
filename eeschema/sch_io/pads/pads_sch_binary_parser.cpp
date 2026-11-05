@@ -474,6 +474,7 @@ namespace
         case 9: return MODEL_JUSTIFICATION::RIGHT;
 
         case 4:
+        case 5:
         case 6:
         case 12: return MODEL_JUSTIFICATION::CENTER;
 
@@ -4316,6 +4317,73 @@ namespace
     }
 
 
+    void inheritDefaultSystemFont( MODEL_TEXT_PRESENTATION& aPresentation, const DESIGN_SETTINGS& aSettings )
+    {
+        if( aSettings.fontMode != MODEL_FONT_MODE::SYSTEM || aSettings.defaultSystemFont.text.IsEmpty() )
+            return;
+
+        if( aPresentation.font.text.IsEmpty()
+            || aPresentation.font.text == wxS( "Default Font" ) )
+        {
+            aPresentation.font = aSettings.defaultSystemFont;
+        }
+    }
+
+
+    void inheritDefaultSystemFonts( PADS_SCH_MODEL& aModel )
+    {
+        const DESIGN_SETTINGS& settings = aModel.settings;
+
+        const auto applyField = [&]( MODEL_FIELD& aField )
+        {
+            inheritDefaultSystemFont( aField.presentation, settings );
+        };
+
+        const auto applyGraphic = [&]( MODEL_GRAPHIC& aGraphic )
+        {
+            if( aGraphic.kind == MODEL_GRAPHIC_KIND::TEXT )
+                inheritDefaultSystemFont( aGraphic.presentation, settings );
+        };
+
+        for( MODEL_SHEET& sheet : aModel.sheets )
+        {
+            std::ranges::for_each( sheet.border, applyGraphic );
+            std::ranges::for_each( sheet.titleBlockFields, applyField );
+        }
+
+        for( MODEL_SYMBOL_DEFINITION& definition : aModel.definitions )
+        {
+            std::ranges::for_each( definition.graphics, applyGraphic );
+            std::ranges::for_each( definition.fields, applyField );
+
+            for( MODEL_PIN_DEFINITION& pin : definition.pins )
+            {
+                inheritDefaultSystemFont( pin.presentation, settings );
+                inheritDefaultSystemFont( pin.namePresentation, settings );
+                inheritDefaultSystemFont( pin.numberPresentation, settings );
+            }
+        }
+
+        for( MODEL_PART_TYPE& partType : aModel.partTypes )
+            std::ranges::for_each( partType.fields, applyField );
+
+        for( MODEL_PLACEMENT& placement : aModel.placements )
+            std::ranges::for_each( placement.fields, applyField );
+
+        for( MODEL_LABEL& label : aModel.labels )
+            inheritDefaultSystemFont( label.presentation, settings );
+
+        for( MODEL_TEXT& text : aModel.texts )
+            inheritDefaultSystemFont( text.presentation, settings );
+
+        for( MODEL_PAGE_GRAPHIC& graphic : aModel.graphics )
+            applyGraphic( graphic.graphic );
+
+        for( MODEL_WORKSHEET& worksheet : aModel.worksheets )
+            std::ranges::for_each( worksheet.graphics, applyGraphic );
+    }
+
+
     void assignFieldIds( PADS_SCH_MODEL& aModel )
     {
         auto assign = []( MODEL_FIELD& aField, FIELD_ID_DOMAIN aDomain, uint32_t aOwner, size_t aOrdinal )
@@ -5312,6 +5380,7 @@ PADS_SCH_MODEL PADS_SCH_BINARY_PARSER::Parse( const std::vector<uint8_t>& aBytes
     decodeSheets( aBytes, cursor, sdb, aSourceName, titleFields, model );
     decodeSheetBlocks( aBytes, cursor, sdb, aSourceName, model );
     decodeOleImages( aBytes, sdb, aSourceName, model );
+    inheritDefaultSystemFonts( model );
     assignFieldIds( model );
     model.ValidateOrThrow();
     return model;

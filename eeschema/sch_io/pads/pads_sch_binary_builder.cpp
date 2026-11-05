@@ -25,6 +25,7 @@
 #include <sch_junction.h>
 #include <sch_label.h>
 #include <sch_line.h>
+#include <sch_no_connect.h>
 #include <sch_pin.h>
 #include <sch_screen.h>
 #include <sch_shape.h>
@@ -312,7 +313,13 @@ namespace
     }
 
 
-    int64_t padsVisualTextHeight( const MODEL_TEXT_PRESENTATION& aPresentation )
+    constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.75;
+    constexpr double PADS_SYMBOL_LABEL_TEXT_HEIGHT_CORRECTION = 0.8075;
+
+
+    int64_t padsVisualTextHeight(
+            const MODEL_TEXT_PRESENTATION& aPresentation,
+            double aOutlineHeightCorrection = PADS_SYSTEM_TEXT_HEIGHT_CORRECTION )
     {
         if( aPresentation.height <= 0 )
             return aPresentation.height;
@@ -323,33 +330,51 @@ namespace
             return aPresentation.height;
 
         // PADS system-font height is a Windows character-cell height.  KiCad's
-        // outline text size is visual/em based; 75% matches the controlled
-        // 97/100 mil Verdana fixtures and is also required by worksheet text.
-        constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.75;
+        // outline text size is visual/em based; use the caller's calibrated visual ratio.
         return std::max<int64_t>(
                 1, static_cast<int64_t>( std::llround(
                            static_cast<double>( aPresentation.height )
-                           * PADS_SYSTEM_TEXT_HEIGHT_CORRECTION ) ) );
+                           * aOutlineHeightCorrection ) ) );
     }
 
 
-    SPIN_STYLE padsLabelSpinStyle( const SOURCE_POINT& aTextOffset )
+    SPIN_STYLE padsLabelSpinStyle( const SOURCE_POINT& aPosition,
+                                         const SOURCE_POINT& aTextOffset,
+                                         const SOURCE_POINT* aAdjacentWirePoint )
     {
-        // Match the ASCII importer: the dominant NETNAMES offset axis and its
-        // sign describe which way the text reads away from the connection.
-        if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
-            return aTextOffset.x >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
+        if( aAdjacentWirePoint )
+        {
+            const int64_t deltaX = aAdjacentWirePoint->x - aPosition.x;
+            const int64_t deltaY = aAdjacentWirePoint->y - aPosition.y;
 
-        return aTextOffset.y >= 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+            if( deltaX != 0 || deltaY != 0 )
+            {
+                if( std::abs( deltaX ) >= std::abs( deltaY ) )
+                    return deltaX < 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
+
+                // PADS page Y increases upwards; KiCad screen Y increases downwards.
+                return deltaY > 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+            }
+        }
+
+        // A zero-length or absent wire has no usable direction.  Fall back to the
+        // direction opposite to the NETNAMES body offset.
+        if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
+            return aTextOffset.x >= 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
+
+        return aTextOffset.y >= 0 ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP;
     }
 
 
-    void applyTextPresentation( EDA_TEXT* aText, const MODEL_TEXT_PRESENTATION& aPresentation, bool aVisible,
-                                std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
+    void applyTextPresentation(
+            EDA_TEXT* aText, const MODEL_TEXT_PRESENTATION& aPresentation, bool aVisible,
+            std::vector<PARSER_DIAGNOSTIC>& aDiagnostics,
+            double aOutlineHeightCorrection = PADS_SYSTEM_TEXT_HEIGHT_CORRECTION )
     {
         if( aPresentation.height > 0 )
         {
-            const int visualHeight = toIU( padsVisualTextHeight( aPresentation ) );
+            const int visualHeight =
+                    toIU( padsVisualTextHeight( aPresentation, aOutlineHeightCorrection ) );
             aText->SetTextSize( { visualHeight, visualHeight } );
         }
 
@@ -666,12 +691,16 @@ namespace
         if( SCH_FIELD* value = symbol->GetField( FIELD_T::VALUE ) )
         {
             value->SetText( aLabel.text.text );
-            SOURCE_POINT textPosition = aLabel.position;
-            textPosition.x += aLabel.textOffset.x;
-            textPosition.y += aLabel.textOffset.y;
-            value->SetPosition( pagePoint( textPosition, aPageHeight ) );
+
+            // PADS stores the label offset in local symbol coordinates.  Transform it
+            // through the generated power symbol so ground and rotated power variants
+            // keep the authored text position.
+            VECTOR2I textOffset =
+                    symbol->GetTransform().TransformCoordinate( localPoint( aLabel.textOffset ) );
+            value->SetPosition( symbol->GetPosition() + textOffset );
             value->SetTextAngle( EDA_ANGLE( aLabel.angle, TENTHS_OF_A_DEGREE_T ) );
-            applyTextPresentation( value, aLabel.presentation, aLabel.presentation.visible, aDiagnostics );
+            applyTextPresentation( value, aLabel.presentation, aLabel.presentation.visible,
+                                   aDiagnostics, PADS_SYMBOL_LABEL_TEXT_HEIGHT_CORRECTION );
         }
 
         return symbol;
@@ -751,6 +780,7 @@ namespace
     struct MODEL_INDEX
     {
         using POINT_KEY = std::tuple<uint32_t, int64_t, int64_t>;
+        using SHEET_POINT_KEY = std::tuple<uint32_t, int64_t, int64_t>;
 
         explicit MODEL_INDEX( const PADS_SCH_MODEL& aModel )
         {
@@ -764,12 +794,30 @@ namespace
 
                 for( const MODEL_CONNECTION& connection : net.connections )
                 {
+                    for( const MODEL_CONNECTION_ENDPOINT& endpoint : connection.endpoints )
+                    {
+                        if( endpoint.kind == MODEL_ENDPOINT_KIND::PIN )
+                        {
+                            connectedPinPointsBySheet[net.sheet.id].insert(
+                                    { endpoint.point.x, endpoint.point.y } );
+                        }
+                    }
+
                     if( connection.vertices.size() < 2 )
                         continue;
 
                     endpointAdjacency[{ net.id.Value(), connection.vertices.front().x, connection.vertices.front().y }]
                             .push_back( connection.vertices[1] );
                     endpointAdjacency[{ net.id.Value(), connection.vertices.back().x, connection.vertices.back().y }]
+                            .push_back( connection.vertices[connection.vertices.size() - 2] );
+
+                    endpointAdjacencyBySheet[
+                            { net.sheet.id.Value(), connection.vertices.front().x,
+                              connection.vertices.front().y } ]
+                            .push_back( connection.vertices[1] );
+                    endpointAdjacencyBySheet[
+                            { net.sheet.id.Value(), connection.vertices.back().x,
+                              connection.vertices.back().y } ]
                             .push_back( connection.vertices[connection.vertices.size() - 2] );
                 }
             }
@@ -824,6 +872,8 @@ namespace
         std::map<SHEET_ID, std::vector<const MODEL_EMBEDDED_IMAGE*>> imagesBySheet;
         std::map<NET_ID, const MODEL_NET*>                           netsById;
         std::map<POINT_KEY, std::vector<SOURCE_POINT>>               endpointAdjacency;
+        std::map<SHEET_POINT_KEY, std::vector<SOURCE_POINT>>         endpointAdjacencyBySheet;
+        std::map<SHEET_ID, std::set<std::pair<int64_t, int64_t>>>    connectedPinPointsBySheet;
 
         std::map<DEFINITION_ID, const MODEL_SYMBOL_DEFINITION*>                definitionsById;
         std::map<PART_TYPE_ID, const MODEL_PART_TYPE*>                         partTypesById;
@@ -1029,7 +1079,7 @@ namespace
     }
 
 
-    void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource, uint16_t aMirrorFlags,
+    void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource,
                      std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
         SCH_FIELD* field = nullptr;
@@ -1055,25 +1105,15 @@ namespace
             THROW_IO_ERROR( FormatParserError( aSource.source, wxS( "could not stage symbol field" ) ) );
 
         field->SetText( aSource.value.text );
-        // PADS mirrored-Y field pre-compensation.  PADS stores the field offset in
-        // unmirrored CAEDECAL coordinates, while KiCad applies the symbol transform
-        // to fields.  This matches the established PADS ASCII importer behaviour.
-        SOURCE_POINT fieldPosition = aSource.position;
 
-        if( aMirrorFlags & 1 )
-            fieldPosition.x = -fieldPosition.x;
-
-        field->SetPosition( aSymbol->GetPosition() + localPoint( fieldPosition ) );
+        // Placement-field coordinates are local to the PADS CAEDECAL.  SCH_FIELD::SetPosition()
+        // accepts a sheet coordinate and converts it back through the parent symbol, so first
+        // transform the authored local offset into the placed symbol's sheet orientation.
+        VECTOR2I fieldOffset =
+                aSymbol->GetTransform().TransformCoordinate( localPoint( aSource.position ) );
+        field->SetPosition( aSymbol->GetPosition() + fieldOffset );
         field->SetTextAngle( EDA_ANGLE( aSource.angle, TENTHS_OF_A_DEGREE_T ) );
         MODEL_TEXT_PRESENTATION fieldPresentation = aSource.presentation;
-
-        if( aMirrorFlags & 1 )
-        {
-            if( fieldPresentation.horizontalJustification == MODEL_JUSTIFICATION::LEFT )
-                fieldPresentation.horizontalJustification = MODEL_JUSTIFICATION::RIGHT;
-            else if( fieldPresentation.horizontalJustification == MODEL_JUSTIFICATION::RIGHT )
-                fieldPresentation.horizontalJustification = MODEL_JUSTIFICATION::LEFT;
-        }
 
         // PADS stores a system-font field height as the Windows character-cell height,
         // whereas KiCad's text size behaves as the visual/em height.  Applying the raw
@@ -1156,7 +1196,7 @@ namespace
         symbol->AddHierarchicalReference( aPath.Path(), reference, unit );
 
         for( const MODEL_FIELD& field : aPlacement.fields )
-            applyField( symbol.get(), field, aPlacement.mirrorFlags, aDiagnostics );
+            applyField( symbol.get(), field, aDiagnostics );
 
         return symbol;
     }
@@ -1834,12 +1874,43 @@ namespace
         applyTitleBlock( aScreen, aSourceSheet );
         const int pageHeight = page.GetHeightIU( schIUScale.IU_PER_MILS );
 
+        std::set<std::pair<int, int>> connectedPinPoints;
+        auto sourceConnected = aIndex.connectedPinPointsBySheet.find( aSourceSheet.id );
+
+        if( sourceConnected != aIndex.connectedPinPointsBySheet.end() )
+        {
+            for( const auto& [x, y] : sourceConnected->second )
+            {
+                VECTOR2I point( toIU( x ), pageHeight - toIU( y ) );
+                connectedPinPoints.insert( { point.x, point.y } );
+            }
+        }
+
+        std::set<std::pair<int, int>> noConnectPoints;
+
         for( const MODEL_PLACEMENT* placement : MODEL_INDEX::ForSheet( aIndex.placementsBySheet, aSourceSheet.id ) )
         {
             std::unique_ptr<SCH_SYMBOL> symbol =
                     makeSymbol( aStaged.librarySymbolVariants, aIndex, *placement, aPath, pageHeight,
                                 aStaged.result.diagnostics );
             aScreen->Append( symbol.get() );
+
+            // PADS treats an otherwise unreferenced pin as intentionally unconnected.
+            // KiCad requires an explicit marker for the same ERC meaning.
+            for( const SCH_PIN* pin : symbol->GetPins( &aPath ) )
+            {
+                const VECTOR2I position = pin->GetPosition();
+                const auto     key = std::make_pair( position.x, position.y );
+
+                if( pin->IsVisible() && !connectedPinPoints.contains( key )
+                    && noConnectPoints.insert( key ).second )
+                {
+                    auto noConnect = std::make_unique<SCH_NO_CONNECT>( position );
+                    aScreen->Append( noConnect.get() );
+                    noConnect.release();
+                }
+            }
+
             symbol.release();
             ++aStaged.result.counts.symbols;
         }
@@ -2082,10 +2153,19 @@ namespace
                 // must run last because applyTextPresentation() changes angle/alignment.
                 if( auto* globalLabel = dynamic_cast<SCH_GLOBALLABEL*>( text ) )
                 {
-                    if( label.textOffset.x != 0 || label.textOffset.y != 0 )
-                        globalLabel->SetSpinStyle( padsLabelSpinStyle( label.textOffset ) );
-                    else
-                        globalLabel->SetSpinStyle( globalLabel->GetSpinStyle() );
+                    const SOURCE_POINT* adjacentWirePoint = nullptr;
+                    auto adjacency = aIndex.endpointAdjacencyBySheet.find(
+                            { aSourceSheet.id.Value(), label.position.x, label.position.y } );
+
+                    if( adjacency != aIndex.endpointAdjacencyBySheet.end()
+                        && !adjacency->second.empty() )
+                    {
+                        adjacentWirePoint = &adjacency->second.front();
+                    }
+
+                    globalLabel->SetSpinStyle(
+                            padsLabelSpinStyle( label.position, label.textOffset,
+                                                adjacentWirePoint ) );
                 }
             }
 
