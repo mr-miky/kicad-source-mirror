@@ -474,6 +474,7 @@ namespace
         case 9: return MODEL_JUSTIFICATION::RIGHT;
 
         case 4:
+        case 5:
         case 6:
         case 12: return MODEL_JUSTIFICATION::CENTER;
 

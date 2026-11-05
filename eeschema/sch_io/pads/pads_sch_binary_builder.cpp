@@ -25,6 +25,7 @@
 #include <sch_junction.h>
 #include <sch_label.h>
 #include <sch_line.h>
+#include <sch_no_connect.h>
 #include <sch_pin.h>
 #include <sch_screen.h>
 #include <sch_shape.h>
@@ -312,7 +313,13 @@ namespace
     }
 
 
-    int64_t padsVisualTextHeight( const MODEL_TEXT_PRESENTATION& aPresentation )
+    constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.75;
+    constexpr double PADS_SYMBOL_LABEL_TEXT_HEIGHT_CORRECTION = 0.8075;
+
+
+    int64_t padsVisualTextHeight(
+            const MODEL_TEXT_PRESENTATION& aPresentation,
+            double aOutlineHeightCorrection = PADS_SYSTEM_TEXT_HEIGHT_CORRECTION )
     {
         if( aPresentation.height <= 0 )
             return aPresentation.height;
@@ -323,33 +330,35 @@ namespace
             return aPresentation.height;
 
         // PADS system-font height is a Windows character-cell height.  KiCad's
-        // outline text size is visual/em based; 75% matches the controlled
-        // 97/100 mil Verdana fixtures and is also required by worksheet text.
-        constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.75;
+        // outline text size is visual/em based; use the caller's calibrated visual ratio.
         return std::max<int64_t>(
                 1, static_cast<int64_t>( std::llround(
                            static_cast<double>( aPresentation.height )
-                           * PADS_SYSTEM_TEXT_HEIGHT_CORRECTION ) ) );
+                           * aOutlineHeightCorrection ) ) );
     }
 
 
     SPIN_STYLE padsLabelSpinStyle( const SOURCE_POINT& aTextOffset )
     {
-        // Match the ASCII importer: the dominant NETNAMES offset axis and its
-        // sign describe which way the text reads away from the connection.
+        // NETNAMES stores the text/body offset from the electrical connection point.
+        // KiCad's spin style names the direction of the pointed connection end, so it
+        // is opposite to the direction in which the PADS label body extends.
         if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
-            return aTextOffset.x >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
+            return aTextOffset.x >= 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
 
-        return aTextOffset.y >= 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+        return aTextOffset.y >= 0 ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP;
     }
 
 
-    void applyTextPresentation( EDA_TEXT* aText, const MODEL_TEXT_PRESENTATION& aPresentation, bool aVisible,
-                                std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
+    void applyTextPresentation(
+            EDA_TEXT* aText, const MODEL_TEXT_PRESENTATION& aPresentation, bool aVisible,
+            std::vector<PARSER_DIAGNOSTIC>& aDiagnostics,
+            double aOutlineHeightCorrection = PADS_SYSTEM_TEXT_HEIGHT_CORRECTION )
     {
         if( aPresentation.height > 0 )
         {
-            const int visualHeight = toIU( padsVisualTextHeight( aPresentation ) );
+            const int visualHeight =
+                    toIU( padsVisualTextHeight( aPresentation, aOutlineHeightCorrection ) );
             aText->SetTextSize( { visualHeight, visualHeight } );
         }
 
@@ -666,12 +675,16 @@ namespace
         if( SCH_FIELD* value = symbol->GetField( FIELD_T::VALUE ) )
         {
             value->SetText( aLabel.text.text );
-            SOURCE_POINT textPosition = aLabel.position;
-            textPosition.x += aLabel.textOffset.x;
-            textPosition.y += aLabel.textOffset.y;
-            value->SetPosition( pagePoint( textPosition, aPageHeight ) );
+
+            // PADS stores the label offset in local symbol coordinates.  Transform it
+            // through the generated power symbol so ground and rotated power variants
+            // keep the authored text position.
+            VECTOR2I textOffset =
+                    symbol->GetTransform().TransformCoordinate( localPoint( aLabel.textOffset ) );
+            value->SetPosition( symbol->GetPosition() + textOffset );
             value->SetTextAngle( EDA_ANGLE( aLabel.angle, TENTHS_OF_A_DEGREE_T ) );
-            applyTextPresentation( value, aLabel.presentation, aLabel.presentation.visible, aDiagnostics );
+            applyTextPresentation( value, aLabel.presentation, aLabel.presentation.visible,
+                                   aDiagnostics, PADS_SYMBOL_LABEL_TEXT_HEIGHT_CORRECTION );
         }
 
         return symbol;
@@ -764,6 +777,15 @@ namespace
 
                 for( const MODEL_CONNECTION& connection : net.connections )
                 {
+                    for( const MODEL_CONNECTION_ENDPOINT& endpoint : connection.endpoints )
+                    {
+                        if( endpoint.kind == MODEL_ENDPOINT_KIND::PIN )
+                        {
+                            connectedPinPointsBySheet[net.sheet.id].insert(
+                                    { endpoint.point.x, endpoint.point.y } );
+                        }
+                    }
+
                     if( connection.vertices.size() < 2 )
                         continue;
 
@@ -824,6 +846,7 @@ namespace
         std::map<SHEET_ID, std::vector<const MODEL_EMBEDDED_IMAGE*>> imagesBySheet;
         std::map<NET_ID, const MODEL_NET*>                           netsById;
         std::map<POINT_KEY, std::vector<SOURCE_POINT>>               endpointAdjacency;
+        std::map<SHEET_ID, std::set<std::pair<int64_t, int64_t>>>    connectedPinPointsBySheet;
 
         std::map<DEFINITION_ID, const MODEL_SYMBOL_DEFINITION*>                definitionsById;
         std::map<PART_TYPE_ID, const MODEL_PART_TYPE*>                         partTypesById;
@@ -1824,12 +1847,43 @@ namespace
         applyTitleBlock( aScreen, aSourceSheet );
         const int pageHeight = page.GetHeightIU( schIUScale.IU_PER_MILS );
 
+        std::set<std::pair<int, int>> connectedPinPoints;
+        auto sourceConnected = aIndex.connectedPinPointsBySheet.find( aSourceSheet.id );
+
+        if( sourceConnected != aIndex.connectedPinPointsBySheet.end() )
+        {
+            for( const auto& [x, y] : sourceConnected->second )
+            {
+                VECTOR2I point( toIU( x ), pageHeight - toIU( y ) );
+                connectedPinPoints.insert( { point.x, point.y } );
+            }
+        }
+
+        std::set<std::pair<int, int>> noConnectPoints;
+
         for( const MODEL_PLACEMENT* placement : MODEL_INDEX::ForSheet( aIndex.placementsBySheet, aSourceSheet.id ) )
         {
             std::unique_ptr<SCH_SYMBOL> symbol =
                     makeSymbol( aStaged.librarySymbolVariants, aIndex, *placement, aPath, pageHeight,
                                 aStaged.result.diagnostics );
             aScreen->Append( symbol.get() );
+
+            // PADS treats an otherwise unreferenced pin as intentionally unconnected.
+            // KiCad requires an explicit marker for the same ERC meaning.
+            for( const SCH_PIN* pin : symbol->GetPins( &aPath ) )
+            {
+                const VECTOR2I position = pin->GetPosition();
+                const auto     key = std::make_pair( position.x, position.y );
+
+                if( pin->IsVisible() && !connectedPinPoints.contains( key )
+                    && noConnectPoints.insert( key ).second )
+                {
+                    auto noConnect = std::make_unique<SCH_NO_CONNECT>( position );
+                    aScreen->Append( noConnect.get() );
+                    noConnect.release();
+                }
+            }
+
             symbol.release();
             ++aStaged.result.counts.symbols;
         }
