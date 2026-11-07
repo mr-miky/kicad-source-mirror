@@ -355,6 +355,26 @@ void DecodeJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
     }
 }
 
+void DecodeNineWayJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
+                                 GR_TEXT_V_ALIGN_T& aVJustify )
+{
+    // PADS nine-way justification is a bit field. Horizontal center overrides
+    // the left/right selector, and vertical middle overrides bottom/top.
+    if( aJustification & 0x4 )
+        aHJustify = GR_TEXT_H_ALIGN_CENTER;
+    else if( aJustification & 0x1 )
+        aHJustify = GR_TEXT_H_ALIGN_RIGHT;
+    else
+        aHJustify = GR_TEXT_H_ALIGN_LEFT;
+
+    if( aJustification & 0x8 )
+        aVJustify = GR_TEXT_V_ALIGN_CENTER;
+    else if( aJustification & 0x2 )
+        aVJustify = GR_TEXT_V_ALIGN_TOP;
+    else
+        aVJustify = GR_TEXT_V_ALIGN_BOTTOM;
+}
+
 
 int PadsScaleCoord( double aVal, bool aIsX, double aOriginX, double aOriginY, double aScaleFactor )
 {

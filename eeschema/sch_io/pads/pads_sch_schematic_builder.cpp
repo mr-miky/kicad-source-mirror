@@ -235,6 +235,35 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
             if( label )
             {
+                // Apply the presentation authored by PADS *NETNAMES* to the
+                // off-page/global label.  Keep this independent of the orientation lookup
+                // above so it remains robust if that code changes.
+                auto presentationIt = aNetNameLabels.find( placement.anchorRef );
+
+                if( presentationIt != aNetNameLabels.end() )
+                {
+                    const NETNAME_LABEL& nn = presentationIt->second;
+
+                    if( nn.height > 0 )
+                    {
+                        int nominalSize = schIUScale.MilsToIU( nn.height );
+                        int textHeight = KiROUND(
+                                nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
+                        int textWidth = KiROUND(
+                                nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
+                        label->SetTextSize( VECTOR2I( textWidth, textHeight ) );
+                    }
+
+                    if( nn.width_pct > 0 )
+                        label->SetTextThickness( schIUScale.MilsToIU( nn.width_pct ) );
+
+                    label->SetBold( nn.bold );
+                    label->SetItalic( nn.italic );
+
+                    if( !nn.font_face.empty() )
+                        label->SetFontProp( wxString::FromUTF8( nn.font_face ) );
+                }
+
                 label->SetFlags( IS_NEW );
                 aScreen->Append( label );
                 labelCount++;
@@ -470,6 +499,94 @@ bool PADS_SCH_SCHEMATIC_BUILDER::IsBusSignal( const std::string& aName )
 }
 
 
+namespace
+{
+struct PADS_FIELD_FONT
+{
+    wxString face;
+    bool     bold = false;
+    bool     italic = false;
+};
+
+
+static PADS_FIELD_FONT resolvePadsAsciiFieldFont( const PART_ATTRIBUTE& aAttr,
+                                                   const PARAMETERS&     aParams )
+{
+    std::string fontInfo = aAttr.font_name;
+
+    // In System font mode PADS' "Default Font" means the document default,
+    // e.g. DEFAULT FONT "Regular Verdana".
+    if( fontInfo == "Default Font" )
+    {
+        std::string mode = aParams.font_mode;
+        std::transform( mode.begin(), mode.end(), mode.begin(),
+                        []( unsigned char c ) { return static_cast<char>( std::tolower( c ) ); } );
+
+        if( mode == "system" && !aParams.default_font.empty() )
+            fontInfo = aParams.default_font;
+    }
+
+    PADS_FIELD_FONT result;
+
+    if( fontInfo.empty() || fontInfo == "Default Font" )
+        return result;
+
+    size_t      split = fontInfo.find( ' ' );
+    std::string first = split == std::string::npos ? fontInfo : fontInfo.substr( 0, split );
+    bool        styleToken = first.find( "Regular" ) != std::string::npos
+                          || first.find( "Bold" ) != std::string::npos
+                          || first.find( "Italic" ) != std::string::npos
+                          || first.find( "Underline" ) != std::string::npos;
+
+    if( styleToken )
+    {
+        result.bold = first.find( "Bold" ) != std::string::npos;
+        result.italic = first.find( "Italic" ) != std::string::npos;
+
+        if( split != std::string::npos )
+        {
+            size_t faceStart = fontInfo.find_first_not_of( ' ', split );
+
+            if( faceStart != std::string::npos )
+                result.face = wxString::FromUTF8( fontInfo.substr( faceStart ) );
+        }
+    }
+    else
+    {
+        // Be permissive with files that store only the face name.
+        result.face = wxString::FromUTF8( fontInfo );
+    }
+
+    return result;
+}
+
+
+static void applyPadsAsciiFieldFont( SCH_FIELD& aField, const PART_ATTRIBUTE& aAttr,
+                                     const PARAMETERS& aParams )
+{
+    const PADS_FIELD_FONT font = resolvePadsAsciiFieldFont( aAttr, aParams );
+
+    if( font.face.IsEmpty() )
+        return;
+
+    aField.SetFontProp( font.face );
+    aField.SetBold( font.bold );
+    aField.SetItalic( font.italic );
+
+    if( aAttr.height > 0 )
+    {
+        // Match the binary importer: PADS system-font height is a character-cell
+        // height. KiCad's outline-font size is the visual/em height. Controlled
+        // 100 mil fixtures (e.g. Q1 REF-DES/PART-TYPE) match at 75 mil.
+        constexpr double PADS_SYSTEM_FIELD_HEIGHT_CORRECTION = 0.75;
+        int visualSize = KiROUND( schIUScale.MilsToIU( aAttr.height )
+                                  * PADS_SYSTEM_FIELD_HEIGHT_CORRECTION );
+        aField.SetTextSize( VECTOR2I( visualSize, visualSize ) );
+    }
+}
+} // namespace
+
+
 void PADS_SCH_SCHEMATIC_BUILDER::ApplyPartAttributes( SCH_SYMBOL*           aSymbol,
                                                       const PART_PLACEMENT& aPlacement )
 {
@@ -495,20 +612,88 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyPartAttributes( SCH_SYMBOL*           aSym
         aSymbol->SetRef( &m_schematic->CurrentSheet(), wxString::FromUTF8( ref ) );
     }
 
-    // Value field is always the PARTTYPE name. Parametric values like VALUE1
-    // flow through CreateCustomFields as user-defined fields.
-    if( !aPlacement.part_type.empty() )
-        aSymbol->SetValueFieldText( wxString::FromUTF8( aPlacement.part_type ) );
+    PADS_ATTRIBUTE_MAPPER mapper;
+
+    // PADS PART-TYPE and Value are distinct fields.  A normal symbol gets an
+    // empty KiCad Value unless PADS carries an explicit Value attribute.
+    // Power symbols are finalized later from their net name and are left alone
+    // here.
+    if( aPlacement.power_net_name.empty() )
+    {
+        bool hasValueOverride = false;
+        aSymbol->SetValueFieldText( wxEmptyString );
+
+        for( const PART_ATTRIBUTE& attr : aPlacement.attributes )
+        {
+            if( mapper.IsValueField( attr.name ) && !attr.value.empty() )
+            {
+                aSymbol->SetValueFieldText( wxString::FromUTF8( attr.value ) );
+                hasValueOverride = true;
+                break;
+            }
+        }
+
+        // Some PADS files carry a Value attribute without a displayed field
+        // record.  Preserve the value even when there is no presentation entry.
+        if( !hasValueOverride )
+        {
+            for( const auto& [name, value] : aPlacement.attr_overrides )
+            {
+                if( mapper.IsValueField( name ) && !value.empty() )
+                {
+                    aSymbol->SetValueFieldText( wxString::FromUTF8( value ) );
+                    break;
+                }
+            }
+        }
+
+        if( !aPlacement.part_type.empty() )
+        {
+            wxString   fieldName = wxString::FromUTF8( PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
+            SCH_FIELD* field = aSymbol->GetField( fieldName );
+
+            if( !field )
+            {
+                SCH_FIELD newField( aSymbol, FIELD_T::USER, fieldName );
+                newField.SetVisible( false );
+                aSymbol->GetFields().push_back( newField );
+                field = aSymbol->GetField( fieldName );
+            }
+
+            if( field )
+                field->SetText( wxString::FromUTF8( aPlacement.part_type ) );
+        }
+    }
 
     // Look for PCB DECAL attribute to set footprint
+    bool hasFootprint = false;
+
     for( const PART_ATTRIBUTE& attr : aPlacement.attributes )
     {
-        if( attr.name == "PCB DECAL" || attr.name == "PCB_DECAL" || attr.name == "FOOTPRINT" )
+        if( mapper.IsFootprintField( attr.name ) && !attr.value.empty() )
         {
-            if( !attr.value.empty() )
-                aSymbol->SetFootprintFieldText( wxString::FromUTF8( attr.value ) );
-
+            aSymbol->SetFootprintFieldText( wxString::FromUTF8( attr.value ) );
+            hasFootprint = true;
             break;
+        }
+    }
+
+    // PCB DECAL is commonly present only in the component attribute values,
+    // without a displayed placement-field record.  In that case it lives in
+    // attr_overrides rather than attributes.
+    if( !hasFootprint )
+    {
+        for( const auto& [name, value] : aPlacement.attr_overrides )
+        {
+            if( mapper.IsFootprintField( name ) && !value.empty() )
+            {
+                aSymbol->SetFootprintFieldText( wxString::FromUTF8( value ) );
+
+                if( SCH_FIELD* footprint = aSymbol->GetField( FIELD_T::FOOTPRINT ) )
+                    footprint->SetVisible( false );
+
+                break;
+            }
         }
     }
 
@@ -535,6 +720,11 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
             field = aSymbol->GetField( FIELD_T::REFERENCE );
             isRefOrValue = true;
         }
+        else if( mapper.IsPartTypeField( attr.name ) )
+        {
+            field = aSymbol->GetField( wxString::FromUTF8( PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE ) );
+            isRefOrValue = true;
+        }
         else if( mapper.IsValueField( attr.name ) )
         {
             field = aSymbol->GetField( FIELD_T::VALUE );
@@ -548,9 +738,12 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
         if( field )
         {
             bool isRef = mapper.IsReferenceField( attr.name );
+            bool isPartType = mapper.IsPartTypeField( attr.name );
 
             if( isRef )
-                field->SetVisible( true );
+                field->SetVisible( attr.visible && ( aPlacement.item_visibility_flags & 0x01 ) == 0 );
+            else if( isPartType )
+                field->SetVisible( attr.visible && ( aPlacement.item_visibility_flags & 0x02 ) == 0 );
             else
                 field->SetVisible( isRefOrValue ? attr.visible : false );
 
@@ -589,7 +782,7 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
             // alignment authored in PADS instead of forcing center.
             GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
             GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
-            PADS_COMMON::DecodeJustification( attr.justification, hJustify, vJustify );
+            PADS_COMMON::DecodeNineWayJustification( attr.justification, hJustify, vJustify );
 
             // KiCad applies the symbol transform to field justification. Mirrored-Y
             // symbols flip horizontal alignment, so pre-compensate to keep the rendered
@@ -599,6 +792,7 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
 
             field->SetHorizJustify( hJustify );
             field->SetVertJustify( vJustify );
+            applyPadsAsciiFieldFont( *field, attr, m_params );
         }
     }
 }
@@ -630,6 +824,54 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
         return true;
     };
 
+    auto applyPresentation = [&]( SCH_FIELD& aField, const PART_ATTRIBUTE& aAttr )
+    {
+        aField.SetVisible( aAttr.visible );
+
+        // PADS field positions are authored in CAEDECAL-local coordinates.
+        // Match the pre-compensation used by Reference/Value for mirrored-Y
+        // symbols before SCH_FIELD converts the sheet position back through
+        // the parent symbol transform.
+        int fx = toKiCadUnits( aAttr.position.x );
+
+        if( aPlacement.mirror_flags & 1 )
+            fx = -fx;
+
+        VECTOR2I fieldPos( fx, -toKiCadUnits( aAttr.position.y ) );
+        aField.SetPosition( aSymbol->GetPosition() + fieldPos );
+
+        if( aAttr.rotation != 0.0 )
+            aField.SetTextAngleDegrees( aAttr.rotation );
+
+        // Use the same PADS -> KiCad text calibration as Reference/Value.
+        // Full-format attributes provide height; simplified records only
+        // provide size, so keep size as the fallback.
+        int nominalSize = aAttr.height > 0 ? aAttr.height : KiROUND( aAttr.size );
+
+        if( nominalSize > 0 )
+        {
+            int scaledH = KiROUND( schIUScale.MilsToIU( nominalSize )
+                                   * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
+            int scaledW = KiROUND( schIUScale.MilsToIU( nominalSize )
+                                   * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
+            aField.SetTextSize( VECTOR2I( scaledW, scaledH ) );
+        }
+
+        if( aAttr.width > 0 )
+            aField.SetTextThickness( schIUScale.MilsToIU( aAttr.width ) );
+
+        GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
+        GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+        PADS_COMMON::DecodeJustification( aAttr.justification, hJustify, vJustify );
+
+        if( aPlacement.mirror_flags & 1 )
+            hJustify = GetFlippedAlignment( hJustify );
+
+        aField.SetHorizJustify( hJustify );
+        aField.SetVertJustify( vJustify );
+        applyPadsAsciiFieldFont( aField, aAttr, m_params );
+    };
+
     std::set<std::string> processedNames;
 
     for( const PART_ATTRIBUTE& attr : aPlacement.attributes )
@@ -659,7 +901,7 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
         {
             // Update existing field value and settings
             existingField->SetText( wxString::FromUTF8( attr.value ) );
-            existingField->SetVisible( false );
+            applyPresentation( *existingField, attr );
         }
         else
         {
@@ -667,24 +909,7 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
             SCH_FIELD newField( aSymbol, FIELD_T::USER, wxString::FromUTF8( fieldName ) );
 
             newField.SetText( wxString::FromUTF8( attr.value ) );
-            newField.SetVisible( false );
-
-            // Apply position offset from attribute
-            VECTOR2I fieldPos( toKiCadUnits( attr.position.x ), -toKiCadUnits( attr.position.y ) );
-            newField.SetPosition( aSymbol->GetPosition() + fieldPos );
-
-            // Apply rotation if specified
-            if( attr.rotation != 0.0 )
-            {
-                newField.SetTextAngleDegrees( attr.rotation );
-            }
-
-            // Apply text size if specified
-            if( attr.size > 0.0 )
-            {
-                int textSize = toKiCadUnits( attr.size );
-                newField.SetTextSize( VECTOR2I( textSize, textSize ) );
-            }
+            applyPresentation( newField, attr );
 
             aSymbol->GetFields().push_back( newField );
             fieldsCreated++;
