@@ -164,6 +164,7 @@ std::vector<VECTOR2I> PADS_SCH_SCHEMATIC_BUILDER::findJunctionPoints( const std:
 
 int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& aSignals, SCH_SCREEN* aScreen,
                                                  const std::set<std::string>& aSignalOpcIds,
+                                                 const std::map<std::string, OFF_PAGE_CONNECTOR>& aOffPageConnectors,
                                                  const std::set<std::string>& aSkipSignals,
                                                  const std::map<std::string, NETNAME_LABEL>& aNetNameLabels )
 {
@@ -181,8 +182,8 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
             continue;
 
         // Collect label placements from OPC wire endpoints. Each OPC produces one label.
-        // The anchor ref (@@@O..) is retained so the authoritative *NETNAMES* orientation
-        // can be looked up; the wire direction is used only when no entry exists.
+        // The anchor ref (@@@O..) is retained so the transform authored on the
+        // *OFFPAGE REFS* object can be looked up. Wire direction is only a fallback.
         struct PLACEMENT
         {
             VECTOR2I    labelPos;
@@ -222,14 +223,15 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
         for( const PLACEMENT& placement : opcPlacements )
         {
-            // Prefer the orientation authored in the PADS *NETNAMES* section. The wire
-            // direction is unreliable for off-page connectors whose stub wire is
-            // zero-length, so it is only used when no NETNAMES entry matches.
-            auto nnIt = aNetNameLabels.find( placement.anchorRef );
+            // Orientation belongs to the off-page object itself.  *NETNAMES* describes
+            // the text presentation/offset and can be moved independently, so it must
+            // not determine the connector direction.  Keep wire direction as a robust
+            // fallback for malformed/legacy records with a non-cardinal rotation.
+            SPIN_STYLE orient = computeLabelOrientation( placement.labelPos, placement.adjPos );
+            auto       opcIt = aOffPageConnectors.find( placement.anchorRef );
 
-            SPIN_STYLE orient = ( nnIt != aNetNameLabels.end() ) ? SpinFromNetNameLabel( nnIt->second )
-                                                                 : computeLabelOrientation( placement.labelPos,
-                                                                                            placement.adjPos );
+            if( opcIt != aOffPageConnectors.end() )
+                orient = SpinFromOffPageConnector( opcIt->second, orient );
 
             SCH_GLOBALLABEL* label = CreateNetLabel( signal, placement.labelPos, orient );
 
@@ -275,20 +277,34 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 }
 
 
-SPIN_STYLE PADS_SCH_SCHEMATIC_BUILDER::SpinFromNetNameLabel( const NETNAME_LABEL& aLabel )
+SPIN_STYLE PADS_SCH_SCHEMATIC_BUILDER::SpinFromOffPageConnector(
+        const OFF_PAGE_CONNECTOR& aConnector, SPIN_STYLE aFallback )
 {
-    // PADS net labels are drawn at an offset from the anchor (connection) point. The text
-    // reads away from the connection, so the sign of the dominant offset axis maps directly
-    // to the KiCad spin style. The observed files do not encode the axis reliably in the
-    // rotation field, so the larger offset component selects the axis. PADS uses a Y-up
-    // coordinate system, so a positive Y offset places the text above the anchor.
-    int dx = aLabel.x_offset;
-    int dy = aLabel.y_offset;
+    // Binary PADS stores the same transform as angle + two mirror bits.  Apply
+    // the identical transform here.  The unrotated, unmirrored $OSR_SYMS body
+    // lies to the left of its electrical anchor.
+    int angle = aConnector.rotation % 360;
 
-    if( std::abs( dx ) >= std::abs( dy ) )
-        return ( dx >= 0 ) ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
+    if( angle < 0 )
+        angle += 360;
 
-    return ( dy >= 0 ) ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+    if( angle != 0 && angle != 90 && angle != 180 && angle != 270 )
+        return aFallback;
+
+    if( aConnector.flags2 & 1 )
+        angle = ( 180 - angle + 360 ) % 360;
+
+    if( aConnector.flags2 & 2 )
+        angle = ( -angle + 360 ) % 360;
+
+    switch( angle )
+    {
+    case 0:   return SPIN_STYLE::LEFT;
+    case 90:  return SPIN_STYLE::BOTTOM;
+    case 180: return SPIN_STYLE::RIGHT;
+    case 270: return SPIN_STYLE::UP;
+    default:  return aFallback;
+    }
 }
 
 

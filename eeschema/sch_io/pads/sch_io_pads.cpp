@@ -30,6 +30,7 @@
 #include <sch_junction.h>
 #include <sch_label.h>
 #include <sch_line.h>
+#include <sch_no_connect.h>
 #include <sch_pin.h>
 #include <sch_screen.h>
 #include <sch_shape.h>
@@ -195,6 +196,110 @@ static std::string stripGateSuffix( const std::string& aRef )
     }
 
     return aRef;
+}
+
+
+struct PADS_ASCII_NETNAME_FONT
+{
+    wxString face;
+    bool     bold = false;
+    bool     italic = false;
+};
+
+
+static PADS_ASCII_NETNAME_FONT resolvePadsAsciiNetNameFont( const PADS_SCH::NETNAME_LABEL& aLabel,
+                                                             const PADS_SCH::PARAMETERS& aParams )
+{
+    std::string fontInfo = aLabel.font_name;
+
+    // In System font mode, PADS' "Default Font" means the document default
+    // (for example DEFAULT FONT "Regular Verdana").
+    if( fontInfo == "Default Font"
+        && wxString::FromUTF8( aParams.font_mode ).CmpNoCase( wxS( "System" ) ) == 0
+        && !aParams.default_font.empty() )
+    {
+        fontInfo = aParams.default_font;
+    }
+
+    PADS_ASCII_NETNAME_FONT result;
+
+    if( fontInfo.empty() || fontInfo == "Default Font" )
+    {
+        result.bold = aLabel.bold;
+        result.italic = aLabel.italic;
+        return result;
+    }
+
+    size_t      split = fontInfo.find( ' ' );
+    std::string first = split == std::string::npos ? fontInfo : fontInfo.substr( 0, split );
+    bool        styleToken = first.find( "Regular" ) != std::string::npos
+                          || first.find( "Bold" ) != std::string::npos
+                          || first.find( "Italic" ) != std::string::npos
+                          || first.find( "Underline" ) != std::string::npos;
+
+    if( styleToken )
+    {
+        result.bold = first.find( "Bold" ) != std::string::npos;
+        result.italic = first.find( "Italic" ) != std::string::npos;
+
+        if( split != std::string::npos )
+        {
+            size_t faceStart = fontInfo.find_first_not_of( ' ', split );
+
+            if( faceStart != std::string::npos )
+                result.face = wxString::FromUTF8( fontInfo.substr( faceStart ) );
+        }
+    }
+    else
+    {
+        // Be permissive with files that store only a face name.
+        result.face = wxString::FromUTF8( fontInfo );
+        result.bold = aLabel.bold;
+        result.italic = aLabel.italic;
+    }
+
+    return result;
+}
+
+
+static void applyPadsAsciiPowerNetNamePresentation( SCH_FIELD& aField,
+                                                     const PADS_SCH::NETNAME_LABEL& aLabel,
+                                                     const PADS_SCH::PARAMETERS& aParams )
+{
+    const PADS_ASCII_NETNAME_FONT font = resolvePadsAsciiNetNameFont( aLabel, aParams );
+
+    if( !font.face.IsEmpty() )
+        aField.SetFontProp( font.face );
+
+    aField.SetBold( font.bold );
+    aField.SetItalic( font.italic );
+
+    if( aLabel.height > 0 )
+    {
+        if( !font.face.IsEmpty() )
+        {
+            // PADS system-font height is a Windows character-cell height.  Match
+            // the already validated symbol-field conversion: 100 mil -> 75 mil
+            // visual height in KiCad, i.e. 1.905 mm for the current Verdana fixture.
+            constexpr double PADS_SYSTEM_FIELD_HEIGHT_CORRECTION = 0.75;
+            int visualSize = KiROUND( schIUScale.MilsToIU( aLabel.height )
+                                      * PADS_SYSTEM_FIELD_HEIGHT_CORRECTION );
+            aField.SetTextSize( VECTOR2I( visualSize, visualSize ) );
+        }
+        else
+        {
+            // Stroke-font fallback keeps the established ASCII importer scaling.
+            int nominalSize = schIUScale.MilsToIU( aLabel.height );
+            int textHeight = KiROUND(
+                    nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
+            int textWidth = KiROUND(
+                    nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
+            aField.SetTextSize( VECTOR2I( textWidth, textHeight ) );
+        }
+    }
+
+    if( aLabel.width_pct > 0 )
+        aField.SetTextThickness( schIUScale.MilsToIU( aLabel.width_pct ) );
 }
 
 
@@ -1082,8 +1187,8 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
         signalOpcIds.insert( "@@@O" + std::to_string( opc.id ) );
     }
 
-    // Map each off-page anchor (@@@O..) to its *NETNAMES* entry. PADS authors the label
-    // side there, which is the authoritative orientation when the stub wire is degenerate.
+    // Map each off-page anchor (@@@O..) to its *NETNAMES* presentation.  Orientation
+    // comes from the *OFFPAGE REFS* transform; NETNAMES is only text presentation/offset.
     std::map<std::string, PADS_SCH::NETNAME_LABEL> netNameLabels;
 
     for( const PADS_SCH::NETNAME_LABEL& nn : parser.GetNetNameLabels() )
@@ -1201,6 +1306,85 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
             }
         }
 
+        // V25: Match the binary importer no-connect semantics.
+        // PADS treats every otherwise unreferenced visible pin as intentionally
+        // unconnected. KiCad needs an explicit SCH_NO_CONNECT for the same ERC
+        // meaning. Track both authored endpoint coordinates and ref.pin identity:
+        // the latter also covers connector pins that the ASCII importer bridges
+        // to their wire endpoint with matching local labels.
+        std::set<std::pair<int, int>>                 connectedPinPoints;
+        std::set<std::pair<std::string, std::string>> connectedPinRefs;
+
+        auto collectConnectedEndpoint = [&]( const std::string& aEndpoint,
+                                             const PADS_SCH::POINT& aPoint )
+        {
+            if( aEndpoint.empty() || aEndpoint.rfind( "@@@", 0 ) == 0 )
+                return;
+
+            const size_t dotPos = aEndpoint.rfind( '.' );
+
+            if( dotPos == std::string::npos || dotPos == 0 || dotPos + 1 >= aEndpoint.size() )
+                return;
+
+            const std::string ref = aEndpoint.substr( 0, dotPos );
+            const std::string pin = aEndpoint.substr( dotPos + 1 );
+
+            connectedPinRefs.insert( { ref, pin } );
+            connectedPinRefs.insert( { stripGateSuffix( ref ), pin } );
+
+            VECTOR2I point( schIUScale.MilsToIU( KiROUND( aPoint.x ) ),
+                            pageHeightIU - schIUScale.MilsToIU( KiROUND( aPoint.y ) ) );
+            connectedPinPoints.insert( { point.x, point.y } );
+        };
+
+        for( const PADS_SCH::SCH_SIGNAL& signal : sheetSignals )
+        {
+            for( const PADS_SCH::WIRE_SEGMENT& wire : signal.wires )
+            {
+                if( wire.vertices.empty() )
+                    continue;
+
+                if( !wire.endpoint_a.empty() )
+                    collectConnectedEndpoint( wire.endpoint_a, wire.vertices.front() );
+
+                if( !wire.endpoint_b.empty() )
+                    collectConnectedEndpoint( wire.endpoint_b, wire.vertices.back() );
+            }
+        }
+
+        std::set<std::pair<int, int>> noConnectPoints;
+        std::vector<VECTOR2I>         pendingNoConnects;
+
+        for( SCH_ITEM* item : ctx.screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+            wxString    refText = symbol->GetRef( &ctx.path, false );
+            std::string symbolRef = refText.ToStdString();
+            std::string normalizedSymbolRef = stripGateSuffix( symbolRef );
+
+            for( const SCH_PIN* pin : symbol->GetPins( &ctx.path ) )
+            {
+                if( !pin->IsVisible() )
+                    continue;
+
+                const VECTOR2I position = pin->GetPosition();
+                const auto     pointKey = std::make_pair( position.x, position.y );
+                const std::string pinNumber = pin->GetNumber().ToStdString();
+
+                bool connectedByRef = connectedPinRefs.contains( { symbolRef, pinNumber } )
+                                      || connectedPinRefs.contains( { normalizedSymbolRef, pinNumber } );
+
+                if( connectedPinPoints.contains( pointKey ) || connectedByRef )
+                    continue;
+
+                if( noConnectPoints.insert( pointKey ).second )
+                    pendingNoConnects.push_back( position );
+            }
+        }
+
+        for( const VECTOR2I& position : pendingNoConnects )
+            ctx.screen->Append( new SCH_NO_CONNECT( position ) );
+
         // Create junctions from TIEDOTS for this sheet
         for( const PADS_SCH::TIED_DOT& dot : parser.GetTiedDots() )
         {
@@ -1214,8 +1398,24 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
             ctx.screen->Append( junction );
         }
 
-        // Create net labels, skipping power nets that get dedicated symbols
-        schBuilder.CreateNetLabels( sheetSignals, ctx.screen, signalOpcIds, powerSignalNames, netNameLabels );
+        // Build a per-sheet map so repeated @@@O ordinals on different sheets cannot
+        // cross-contaminate orientation.
+        std::map<std::string, PADS_SCH::OFF_PAGE_CONNECTOR> sheetOffPageConnectors;
+
+        for( const PADS_SCH::OFF_PAGE_CONNECTOR& opc : parser.GetOffPageConnectors() )
+        {
+            if( opc.source_sheet != sheetNum || opc.signal_name.empty()
+                || powerSignalNames.count( opc.signal_name ) )
+            {
+                continue;
+            }
+
+            sheetOffPageConnectors.emplace( "@@@O" + std::to_string( opc.id ), opc );
+        }
+
+        // Create net labels, skipping power nets that get dedicated symbols.
+        schBuilder.CreateNetLabels( sheetSignals, ctx.screen, signalOpcIds, sheetOffPageConnectors,
+                                    powerSignalNames, netNameLabels );
 
         // Place off-page connectors: power/ground types become SCH_SYMBOL with
         // KiCad standard power graphics; signal types become SCH_GLOBALLABEL.
@@ -1295,18 +1495,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                         value->SetPosition( symbol->GetPosition() + textOffset );
                         value->SetCanAutoplace( false );
 
-                        if( nn.height > 0 )
-                        {
-                            int nominalSize = schIUScale.MilsToIU( nn.height );
-                            int textHeight = KiROUND(
-                                    nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
-                            int textWidth = KiROUND(
-                                    nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
-                            value->SetTextSize( VECTOR2I( textWidth, textHeight ) );
-                        }
-
-                        if( nn.width_pct > 0 )
-                            value->SetTextThickness( schIUScale.MilsToIU( nn.width_pct ) );
+                        applyPadsAsciiPowerNetNamePresentation( *value, nn, params );
 
                         GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
                         GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;

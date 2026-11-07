@@ -63,31 +63,33 @@ public:
     /**
      * Create net labels for named signals.
      *
-     * For signals with OPC endpoints, one label is created per OPC connection point with
-     * orientation derived from the adjacent wire direction. Signals without OPC endpoints
-     * fall back to a single label at a dangling wire end.
+     * For signals with OPC endpoints, one label is created per OPC connection point.
+     * Orientation comes from the transform stored on the matching *OFFPAGE REFS* object;
+     * adjacent wire direction is retained only as a fallback for malformed transforms.
      *
      * @param aSignals Vector of parsed signal definitions.
      * @param aScreen Target screen to add labels to.
      * @param aSignalOpcIds Set of OPC reference strings (e.g. "@@@O48") for signal OPCs.
+     * @param aOffPageConnectors Per-sheet OPC definitions keyed by @@@O reference.
      * @param aSkipSignals Signal names to skip (e.g. power nets handled elsewhere).
-     * @param aNetNameLabels is a list of net name labels to create.
+     * @param aNetNameLabels NETNAMES presentation records keyed by @@@O reference.
      * @return Number of labels created.
      */
     int CreateNetLabels( const std::vector<SCH_SIGNAL>& aSignals, SCH_SCREEN* aScreen,
                          const std::set<std::string>& aSignalOpcIds,
+                         const std::map<std::string, OFF_PAGE_CONNECTOR>& aOffPageConnectors,
                          const std::set<std::string>& aSkipSignals = {},
                          const std::map<std::string, NETNAME_LABEL>& aNetNameLabels = {} );
 
     /**
-     * Map a PADS *NETNAMES* label entry to a KiCad global-label spin style.
+     * Map the transform stored on a PADS *OFFPAGE REFS* object to KiCad spin.
      *
-     * PADS encodes the label side via the offset of the text from the anchor
-     * point. The dominant offset axis and its sign tell which way the text
-     * reads away from the connection, which is exactly what the spin style
-     * controls.
+     * The connector transform, not the movable *NETNAMES* text offset, defines
+     * which side of the electrical anchor the off-page body occupies.  flags2
+     * carries the same two mirror bits as the binary off-page record.
      */
-    static SPIN_STYLE SpinFromNetNameLabel( const NETNAME_LABEL& aLabel );
+    static SPIN_STYLE SpinFromOffPageConnector( const OFF_PAGE_CONNECTOR& aConnector,
+                                                SPIN_STYLE aFallback );
 
     /**
      * Create a net label. PADS signals are global, so labels are SCH_GLOBALLABEL to avoid
