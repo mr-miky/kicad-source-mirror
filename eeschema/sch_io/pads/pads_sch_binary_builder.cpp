@@ -35,6 +35,7 @@
 #include <sch_text.h>
 #include <schematic.h>
 #include <schematic_settings.h>
+#include <io/pads/pads_attribute_mapper.h>
 #include <sch_io/ole_image.h>
 #include <sch_io/pads/pads_sch_symbol_builder.h>
 #include <stroke_params.h>
@@ -1093,9 +1094,22 @@ namespace
 
         if( aSource.name.text.CmpNoCase( wxS( "REF-DES" ) ) == 0 )
             field = aSymbol->GetField( FIELD_T::REFERENCE );
-        else if( aSource.name.text.CmpNoCase( wxS( "PART-TYPE" ) ) == 0
-                 || aSource.name.text.CmpNoCase( wxS( "VALUE" ) ) == 0 )
+        else if( aSource.name.text.CmpNoCase( wxS( "PART-TYPE" ) ) == 0 )
+        {
+            const wxString fieldName = wxString::FromUTF8( PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
+            field = aSymbol->GetField( fieldName );
+
+            if( !field )
+            {
+                SCH_FIELD newField( aSymbol, FIELD_T::USER, fieldName );
+                aSymbol->AddField( newField );
+                field = aSymbol->GetField( fieldName );
+            }
+        }
+        else if( aSource.name.text.CmpNoCase( wxS( "VALUE" ) ) == 0 )
+        {
             field = aSymbol->GetField( FIELD_T::VALUE );
+        }
         else
         {
             field = aSymbol->GetField( aSource.name.text );
@@ -1201,6 +1215,11 @@ namespace
         symbol->SetUnit( unit );
         symbol->SetRef( &aPath, reference );
         symbol->AddHierarchicalReference( aPath.Path(), reference, unit );
+
+        // PART-TYPE is an inline placement field.  Value, when present, is a
+        // separate component attribute/custom field.  Do not use PART-TYPE as
+        // a fallback for an absent Value.
+        symbol->SetValueFieldText( wxEmptyString, &aPath );
 
         for( const MODEL_FIELD& field : aPlacement.fields )
             applyField( symbol.get(), field, aDiagnostics );

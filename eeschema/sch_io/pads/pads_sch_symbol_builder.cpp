@@ -777,6 +777,7 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
 enum class POWER_STYLE
 {
     GROUND_BARS,   // three descending horizontal bars, body below the pin
+    ANALOG_GROUND, // open triangular analog-ground symbol, body below the pin
     FILLED_BAR,    // one thick filled bar, body below the pin
     FILLED_ARROW,  // filled triangle, body above the pin
     OPEN_ARROW,    // two open arrow strokes, body below the pin
@@ -786,7 +787,10 @@ enum class POWER_STYLE
 
 static POWER_STYLE powerStyleFromName( const std::string& aUpperName )
 {
-    if( aUpperName == "GND" || aUpperName == "GNDA" || aUpperName == "GNDPWR" || aUpperName == "EARTH"
+    if( aUpperName == "GNDA" )
+        return POWER_STYLE::ANALOG_GROUND;
+
+    if( aUpperName == "GND" || aUpperName == "GNDPWR" || aUpperName == "EARTH"
         || aUpperName == "CHASSIS" )
     {
         return POWER_STYLE::GROUND_BARS;
@@ -835,10 +839,15 @@ static void addPowerPin( LIB_SYMBOL* aSymbol, const std::string& aKiCadName, PIN
 
 LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildKiCadPowerSymbol( const std::string& aKiCadName )
 {
-    // Convert mm coordinates from KiCad power symbol library to internal units
+    // Convert source units to KiCad internal units.
     auto mm = [&]( double v )
     {
         return schIUScale.mmToIU( v );
+    };
+
+    auto mil = [&]( int v )
+    {
+        return schIUScale.MilsToIU( v );
     };
 
     LIB_SYMBOL* sym = new LIB_SYMBOL( wxString::FromUTF8( aKiCadName ) );
@@ -857,18 +866,28 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildKiCadPowerSymbol( const std::string& a
     switch( powerStyleFromName( upper ) )
     {
     case POWER_STYLE::GROUND_BARS:
-    {
-        const std::array<std::tuple<double, double, double>, 3> bars{ std::tuple{ -1.27, 1.27, -1.27 },
-                                                                      std::tuple{ -0.762, 0.762, -1.778 },
-                                                                      std::tuple{ -0.254, 0.254, -2.286 } };
-
-        for( const auto& [x1, x2, y] : bars )
-            addPolyline( sym, { VECTOR2I( mm( x1 ), mm( y ) ), VECTOR2I( mm( x2 ), mm( y ) ) } );
-
-        addPolyline( sym, { VECTOR2I( 0, 0 ), VECTOR2I( 0, mm( -1.27 ) ) } );
+        // Convert the PADS CAEDECAL from local Y-up to KiCad local Y-down.
+        // Source PADS GND: 100 mil stem, bars at -100/-160/-220 mil.
+        addPolyline( sym, { VECTOR2I( 0, 0 ), VECTOR2I( 0, mil( 100 ) ) }, mil( 5 ) );
+        addPolyline( sym, { VECTOR2I( mil( -100 ), mil( 100 ) ),
+                            VECTOR2I( mil( 100 ), mil( 100 ) ) }, mil( 5 ) );
+        addPolyline( sym, { VECTOR2I( mil( -60 ), mil( 160 ) ),
+                            VECTOR2I( mil( 60 ), mil( 160 ) ) }, mil( 5 ) );
+        addPolyline( sym, { VECTOR2I( mil( -20 ), mil( 220 ) ),
+                            VECTOR2I( mil( 20 ), mil( 220 ) ) }, mil( 5 ) );
         addPowerPin( sym, aKiCadName, PIN_ORIENTATION::PIN_DOWN );
         break;
-    }
+
+    case POWER_STYLE::ANALOG_GROUND:
+        // Convert the PADS AGND CAEDECAL from local Y-up to KiCad local Y-down.
+        addPolyline( sym, { VECTOR2I( 0, 0 ),
+                            VECTOR2I( 0, mil( 50 ) ),
+                            VECTOR2I( mil( -100 ), mil( 50 ) ),
+                            VECTOR2I( 0, mil( 200 ) ),
+                            VECTOR2I( mil( 100 ), mil( 50 ) ),
+                            VECTOR2I( 0, mil( 50 ) ) }, mil( 5 ) );
+        addPowerPin( sym, aKiCadName, PIN_ORIENTATION::PIN_DOWN );
+        break;
 
     case POWER_STYLE::FILLED_BAR:
     {
@@ -888,13 +907,15 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildKiCadPowerSymbol( const std::string& a
 
     case POWER_STYLE::FILLED_ARROW:
     {
-        SCH_SHAPE* tri = addPolyline( sym, { VECTOR2I( mm( 0.762 ), mm( 1.27 ) ),
-                                             VECTOR2I( mm( -0.762 ), mm( 1.27 ) ),
-                                             VECTOR2I( mm( 0 ), mm( 2.54 ) ),
-                                             VECTOR2I( mm( 0.762 ), mm( 1.27 ) ) } );
+        // Convert the PADS +5V CAEDECAL from local Y-up to KiCad local Y-down.
+        addPolyline( sym, { VECTOR2I( 0, 0 ), VECTOR2I( 0, mil( -200 ) ) }, mil( 5 ) );
+
+        SCH_SHAPE* tri = addPolyline( sym, { VECTOR2I( 0, mil( -200 ) ),
+                                             VECTOR2I( mil( -50 ), mil( -100 ) ),
+                                             VECTOR2I( mil( 50 ), mil( -100 ) ),
+                                             VECTOR2I( 0, mil( -200 ) ) }, mil( 5 ) );
         tri->SetFillMode( FILL_T::FILLED_SHAPE );
 
-        addPolyline( sym, { VECTOR2I( mm( 0 ), mm( 0 ) ), VECTOR2I( mm( 0 ), mm( 1.27 ) ) } );
         addPowerPin( sym, aKiCadName, PIN_ORIENTATION::PIN_UP );
         break;
     }
@@ -952,6 +973,9 @@ std::string PADS_SCH_SYMBOL_BUILDER::GetPowerStyleFromVariant( const std::string
 
     if( isGround )
     {
+        if( upper == "AGND" )
+            return "GNDA";
+
         if( upper.find( "CH" ) != std::string::npos )
             return "Chassis";
 
@@ -959,7 +983,7 @@ std::string PADS_SCH_SYMBOL_BUILDER::GetPowerStyleFromVariant( const std::string
     }
 
     if( isPositive )
-        return "VCC";
+        return "PWR_TRIANGLE";
 
     return "VEE";
 }
@@ -1103,7 +1127,7 @@ std::optional<LIB_ID> PADS_SCH_SYMBOL_BUILDER::GetKiCadPowerSymbolId( const std:
     };
 
     static const PowerMapping mappings[] = {
-        { "GND", "GND" },         { "AGND", "GND" },  { "DGND", "GNDD" }, { "PGND", "GNDPWR" }, { "EARTH", "Earth" },
+        { "GND", "GND" },         { "AGND", "GNDA" }, { "DGND", "GNDD" }, { "PGND", "GNDPWR" }, { "EARTH", "Earth" },
         { "CHASSIS", "Chassis" }, { "VSS", "VSS" },   { "0V", "GND" },    { "VCC", "VCC" },     { "VDD", "VDD" },
         { "VEE", "VEE" },         { "VPP", "VPP" },   { "VBAT", "VBAT" }, { "VBUS", "VBUS" },   { "V+", "VCC" },
         { "V-", "VEE" },          { "+5V", "+5V" },   { "-5V", "-5V" },   { "+3V3", "+3V3" },   { "+3.3V", "+3V3" },

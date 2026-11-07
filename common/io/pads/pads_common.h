@@ -137,6 +137,22 @@ void DecodeJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
                           GR_TEXT_V_ALIGN_T& aVJustify );
 
 /**
+ * Decode the PADS sparse nine-way justification used by symbol fields,
+ * placement fields and net-name labels.
+ *
+ * The low bits encode the anchor:
+ *   0/1/4  = bottom left/right/center
+ *   2/3/6  = top left/right/center
+ *   8/9/12 = middle left/right/center
+ *
+ * This is the same nine-way presentation encoding decoded by the binary
+ * schematic importer.  PADS free text uses a different encoding and must
+ * continue to use its own decoder.
+ */
+void DecodeNineWayJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
+                                 GR_TEXT_V_ALIGN_T& aVJustify );
+
+/**
  * Map a PADS board coordinate to a KiCad internal coordinate.
  *
  * Subtracts the per-axis design origin (scaled by @p aScaleFactor), applies the PADS-Y-up to

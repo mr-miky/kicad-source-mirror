@@ -293,6 +293,7 @@ struct PART_PLACEMENT
     int         num_pins = 0;
     int         gate_index = 0;
     int         pin_origin_code = 0;
+    int         item_visibility_flags = 0;
     std::string font1;
     std::string font2;
 
@@ -449,6 +450,10 @@ struct NETNAME_LABEL
     int         height = 0;
     int         width_pct = 0;
     std::string font_name;
+    std::string font_face;
+    bool        bold = false;
+    bool        italic = false;
+    bool        underline = false;
 };
 
 

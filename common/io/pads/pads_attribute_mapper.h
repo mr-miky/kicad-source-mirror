@@ -24,8 +24,8 @@
 #include <string>
 
 /**
- * Maps PADS attribute names to KiCad field names and identifies which attributes
- * are standard KiCad fields (Reference, Value, Footprint) versus custom fields.
+ * Maps PADS attribute names to KiCad field names and identifies fields that
+ * require special handling during import.
  */
 class PADS_ATTRIBUTE_MAPPER
 {
@@ -39,14 +39,16 @@ public:
     std::string GetKiCadFieldName( const std::string& aPadsAttr ) const;
 
     /**
-     * Check if a PADS attribute maps to a standard KiCad field (Reference, Value,
-     * or Footprint).
+     * Check if a PADS attribute is handled specially rather than as a generic
+     * user field.
      */
     bool IsStandardField( const std::string& aPadsAttr ) const;
 
     bool IsReferenceField( const std::string& aPadsAttr ) const;
 
     bool IsValueField( const std::string& aPadsAttr ) const;
+
+    bool IsPartTypeField( const std::string& aPadsAttr ) const;
 
     bool IsFootprintField( const std::string& aPadsAttr ) const;
 
@@ -59,6 +61,7 @@ public:
 
     static constexpr const char* FIELD_REFERENCE = "Reference";
     static constexpr const char* FIELD_VALUE = "Value";
+    static constexpr const char* FIELD_PART_TYPE = "Part Type";
     static constexpr const char* FIELD_FOOTPRINT = "Footprint";
     static constexpr const char* FIELD_DATASHEET = "Datasheet";
     static constexpr const char* FIELD_MPN = "MPN";

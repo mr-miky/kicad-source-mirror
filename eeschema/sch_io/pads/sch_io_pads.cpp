@@ -837,6 +837,17 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                     instanceSymbol->SetGlobalPower();
             }
 
+            // The last field of a normal PADS placement header is the same
+            // item-visibility bitfield decoded by the binary importer:
+            //   0x08 = pin names hidden, 0x10 = pin numbers hidden.
+            // Apply it to the per-placement LIB_SYMBOL clone rather than using
+            // PARTTYPE-name heuristics.
+            if( instanceSymbol && !isPower )
+            {
+                instanceSymbol->SetShowPinNames( ( part.item_visibility_flags & 0x08 ) == 0 );
+                instanceSymbol->SetShowPinNumbers( ( part.item_visibility_flags & 0x10 ) == 0 );
+            }
+
             applySignalPinOverrides( instanceSymbol, part );
 
             symbol->SetLibSymbol( instanceSymbol );
@@ -887,7 +898,6 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
             {
                 symbol->SetUnit( 1 );
             }
-
             // Assign deterministic UUID so PCB cross-probe can match footprints
             // to symbols. Only the primary gate (index 0) or the first connector
             // pin gets the deterministic UUID since one footprint maps to one
@@ -962,7 +972,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                                 // applied by ApplyFieldSettings.
                                 GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
                                 GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
-                                PADS_COMMON::DecodeJustification( attr.justification, hJustify, vJustify );
+                                PADS_COMMON::DecodeNineWayJustification( attr.justification, hJustify, vJustify );
 
                                 if( part.mirror_flags & 1 )
                                     hJustify = GetFlippedAlignment( hJustify );
@@ -1269,6 +1279,50 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
 
                     symbol->GetField( FIELD_T::VALUE )->SetText( netName );
                     symbol->GetField( FIELD_T::VALUE )->SetVisible( true );
+
+                    auto nnIt = netNameLabels.find( "@@@O" + std::to_string( opc.id ) );
+
+                    if( nnIt != netNameLabels.end() )
+                    {
+                        const PADS_SCH::NETNAME_LABEL& nn = nnIt->second;
+                        SCH_FIELD*                     value = symbol->GetField( FIELD_T::VALUE );
+
+                        // NETNAMES offsets are authored in PADS page coordinates.  They must not
+                        // inherit the artificial rotation used to orient the generated power body.
+                        VECTOR2I textOffset( schIUScale.MilsToIU( nn.x_offset ),
+                                            -schIUScale.MilsToIU( nn.y_offset ) );
+
+                        value->SetPosition( symbol->GetPosition() + textOffset );
+                        value->SetCanAutoplace( false );
+
+                        if( nn.height > 0 )
+                        {
+                            int nominalSize = schIUScale.MilsToIU( nn.height );
+                            int textHeight = KiROUND(
+                                    nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
+                            int textWidth = KiROUND(
+                                    nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
+                            value->SetTextSize( VECTOR2I( textWidth, textHeight ) );
+                        }
+
+                        if( nn.width_pct > 0 )
+                            value->SetTextThickness( schIUScale.MilsToIU( nn.width_pct ) );
+
+                        GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
+                        GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+
+                        // PADS schematic attribute/net-name justification uses bit-coded
+                        // values where 4 is the special bottom-center case.
+                        if( nn.justification == 4 )
+                            hJustify = GR_TEXT_H_ALIGN_CENTER;
+                        else
+                            PADS_COMMON::DecodeJustification( nn.justification, hJustify, vJustify );
+
+                        // Preserve the authored PADS justification after the parent symbol
+                        // transform (for example a ground body rotated by 180 degrees).
+                        value->SetEffectiveHorizJustify( hJustify );
+                        value->SetEffectiveVertJustify( vJustify );
+                    }
 
                     wxString pwrRef = wxString::Format( wxT( "#PWR%04d" ), pwrIndex++ );
                     symbol->SetRef( &ctx.path, pwrRef );

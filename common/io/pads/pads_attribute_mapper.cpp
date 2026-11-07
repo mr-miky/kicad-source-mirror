@@ -31,11 +31,12 @@ PADS_ATTRIBUTE_MAPPER::PADS_ATTRIBUTE_MAPPER()
     m_standardMappings["refdes"] = FIELD_REFERENCE;
     m_standardMappings["reference"] = FIELD_REFERENCE;
 
-    m_standardMappings["part type"] = FIELD_VALUE;
-    m_standardMappings["part-type"] = FIELD_VALUE;
-    m_standardMappings["parttype"] = FIELD_VALUE;
+    m_standardMappings["part type"] = FIELD_PART_TYPE;
+    m_standardMappings["part-type"] = FIELD_PART_TYPE;
+    m_standardMappings["parttype"] = FIELD_PART_TYPE;
+    m_standardMappings["part_type"] = FIELD_PART_TYPE;
+
     m_standardMappings["value"] = FIELD_VALUE;
-    m_standardMappings["part_type"] = FIELD_VALUE;
 
     m_standardMappings["pcb decal"] = FIELD_FOOTPRINT;
     m_standardMappings["pcb_decal"] = FIELD_FOOTPRINT;
@@ -98,7 +99,8 @@ std::string PADS_ATTRIBUTE_MAPPER::GetKiCadFieldName( const std::string& aPadsAt
 
 bool PADS_ATTRIBUTE_MAPPER::IsStandardField( const std::string& aPadsAttr ) const
 {
-    return IsReferenceField( aPadsAttr ) || IsValueField( aPadsAttr ) || IsFootprintField( aPadsAttr );
+    return IsReferenceField( aPadsAttr ) || IsValueField( aPadsAttr ) || IsPartTypeField( aPadsAttr )
+           || IsFootprintField( aPadsAttr );
 }
 
 
@@ -113,6 +115,13 @@ bool PADS_ATTRIBUTE_MAPPER::IsValueField( const std::string& aPadsAttr ) const
 {
     std::string fieldName = GetKiCadFieldName( aPadsAttr );
     return fieldName == FIELD_VALUE;
+}
+
+
+bool PADS_ATTRIBUTE_MAPPER::IsPartTypeField( const std::string& aPadsAttr ) const
+{
+    std::string fieldName = GetKiCadFieldName( aPadsAttr );
+    return fieldName == FIELD_PART_TYPE;
 }
 
 

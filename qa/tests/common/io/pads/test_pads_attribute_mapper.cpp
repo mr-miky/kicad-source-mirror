@@ -54,21 +54,28 @@ BOOST_AUTO_TEST_CASE( ReferenceFieldMapping )
 }
 
 
-BOOST_AUTO_TEST_CASE( ValueFieldMapping )
+BOOST_AUTO_TEST_CASE( ValueAndPartTypeFieldMapping )
 {
     PADS_ATTRIBUTE_MAPPER mapper;
 
-    // Various PADS value/part type formats
-    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "Part Type" ), PADS_ATTRIBUTE_MAPPER::FIELD_VALUE );
-    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "PART TYPE" ), PADS_ATTRIBUTE_MAPPER::FIELD_VALUE );
-    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "PartType" ), PADS_ATTRIBUTE_MAPPER::FIELD_VALUE );
+    // PART-TYPE is distinct from the component Value in PADS.
+    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "Part Type" ), PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
+    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "PART TYPE" ), PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
+    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "PartType" ), PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
+    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "Part_Type" ), PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
     BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "VALUE" ), PADS_ATTRIBUTE_MAPPER::FIELD_VALUE );
-    BOOST_CHECK_EQUAL( mapper.GetKiCadFieldName( "Part_Type" ), PADS_ATTRIBUTE_MAPPER::FIELD_VALUE );
 
-    // Verify IsValueField
-    BOOST_CHECK( mapper.IsValueField( "Part Type" ) );
+    BOOST_CHECK( mapper.IsPartTypeField( "Part Type" ) );
+    BOOST_CHECK( mapper.IsPartTypeField( "part-type" ) );
+    BOOST_CHECK( !mapper.IsPartTypeField( "Value" ) );
+
+    BOOST_CHECK( !mapper.IsValueField( "Part Type" ) );
     BOOST_CHECK( mapper.IsValueField( "value" ) );
     BOOST_CHECK( !mapper.IsValueField( "Ref.Des." ) );
+
+    // Both are handled specially and must not become generic user attributes.
+    BOOST_CHECK( mapper.IsStandardField( "Part Type" ) );
+    BOOST_CHECK( mapper.IsStandardField( "Value" ) );
 }
 
 
@@ -231,6 +238,7 @@ BOOST_AUTO_TEST_CASE( FieldConstants )
     // Verify the field constants have expected values
     BOOST_CHECK_EQUAL( std::string( PADS_ATTRIBUTE_MAPPER::FIELD_REFERENCE ), "Reference" );
     BOOST_CHECK_EQUAL( std::string( PADS_ATTRIBUTE_MAPPER::FIELD_VALUE ), "Value" );
+    BOOST_CHECK_EQUAL( std::string( PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE ), "Part Type" );
     BOOST_CHECK_EQUAL( std::string( PADS_ATTRIBUTE_MAPPER::FIELD_FOOTPRINT ), "Footprint" );
     BOOST_CHECK_EQUAL( std::string( PADS_ATTRIBUTE_MAPPER::FIELD_DATASHEET ), "Datasheet" );
     BOOST_CHECK_EQUAL( std::string( PADS_ATTRIBUTE_MAPPER::FIELD_MPN ), "MPN" );

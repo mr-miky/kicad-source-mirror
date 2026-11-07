@@ -1798,16 +1798,17 @@ size_t PADS_SCH_PARSER::parsePartPlacement( const std::vector<std::string>& aLin
     else
     {
         int numAttrs = 0, numDisplayedValues = 0, numPins = 0, unused1 = 0, gateIdx = 0;
-        int unused2 = 0;
+        int itemVisibilityFlags = 0;
 
         if( iss >> aPart.h1 >> aPart.w1 >> aPart.h2 >> aPart.w2 >> numAttrs >> numDisplayedValues >> numPins >> unused1
-            >> gateIdx >> unused2 )
+            >> gateIdx >> itemVisibilityFlags )
         {
             aPart.num_attrs = numAttrs;
             aPart.num_displayed_values = numDisplayedValues;
             aPart.num_pins = numPins;
             aPart.gate_index = gateIdx;
             aPart.gate_number = gateIdx + 1;
+            aPart.item_visibility_flags = itemVisibilityFlags;
         }
         else
         {
@@ -2501,13 +2502,13 @@ size_t PADS_SCH_PARSER::parseSectionNETNAMES( const std::vector<std::string>& aL
             return i - 1;
 
         // Fields: net_name anchor_ref x_offset y_offset rotation justification f3 f4 f5 f6 f7
-        //         height width_pct "font_name"
+        //         line_width height "fontinfo"
         NETNAME_LABEL label;
         std::istringstream iss( line );
 
         iss >> label.net_name >> label.anchor_ref >> label.x_offset >> label.y_offset >> label.rotation
-                >> label.justification >> label.f3 >> label.f4 >> label.f5 >> label.f6 >> label.f7 >> label.height
-                >> label.width_pct;
+                >> label.justification >> label.f3 >> label.f4 >> label.f5 >> label.f6 >> label.f7
+                >> label.width_pct >> label.height;
 
         std::string rest;
         std::getline( iss, rest );
@@ -2519,6 +2520,30 @@ size_t PADS_SCH_PARSER::parseSectionNETNAMES( const std::vector<std::string>& aL
 
             if( qEnd != std::string::npos )
                 label.font_name = rest.substr( qStart + 1, qEnd - qStart - 1 );
+        }
+
+        // PADS fontinfo is "<style> <face>".  The style starts with
+        // Regular or Bold and may add Italic and/or Underline separated by commas.
+        // Underline is retained for fidelity even though KiCad schematic text does not
+        // currently expose an underline presentation for labels.
+        if( !label.font_name.empty() && label.font_name != "Default Font" )
+        {
+            size_t      styleEnd = label.font_name.find( ' ' );
+            std::string style = styleEnd == std::string::npos
+                                      ? label.font_name
+                                      : label.font_name.substr( 0, styleEnd );
+
+            label.bold = style.find( "Bold" ) != std::string::npos;
+            label.italic = style.find( "Italic" ) != std::string::npos;
+            label.underline = style.find( "Underline" ) != std::string::npos;
+
+            if( styleEnd != std::string::npos )
+            {
+                size_t faceStart = label.font_name.find_first_not_of( ' ', styleEnd );
+
+                if( faceStart != std::string::npos )
+                    label.font_face = label.font_name.substr( faceStart );
+            }
         }
 
         m_netNameLabels.push_back( label );
