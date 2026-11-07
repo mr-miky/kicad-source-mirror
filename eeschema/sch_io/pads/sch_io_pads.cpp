@@ -60,6 +60,77 @@
 
 
 /**
+ * Parse a PADS per-instance signal-pin override name.
+ *
+ * PADS stores signal-pin defaults in the PARTTYPE as, for example:
+ *
+ *     SIGPIN 8 GND
+ *     SIGPIN 16 +5V
+ *
+ * An individual part instance may override those defaults with attributes such
+ * as "SIGPIN8" GNDA or "SIGPIN16" +3V3.  The suffix is the physical pin
+ * number, not an attribute ordinal.
+ */
+static bool parseSignalPinOverrideName( const std::string& aName, std::string& aPinNumber )
+{
+    constexpr char prefix[] = "SIGPIN";
+    constexpr size_t prefixLen = sizeof( prefix ) - 1;
+
+    if( aName.size() <= prefixLen || aName.compare( 0, prefixLen, prefix ) != 0 )
+        return false;
+
+    for( size_t i = prefixLen; i < aName.size(); ++i )
+    {
+        if( !std::isdigit( static_cast<unsigned char>( aName[i] ) ) )
+            return false;
+    }
+
+    aPinNumber = aName.substr( prefixLen );
+    return true;
+}
+
+
+/**
+ * Apply PADS SIGPIN<n> instance overrides to the private LIB_SYMBOL copy used
+ * by a schematic symbol instance.
+ *
+ * Hidden signal pins are created from the PARTTYPE defaults before the
+ * instance is cloned.  Renaming them here preserves the PARTTYPE default for
+ * every instance that has no override while allowing one instance to bind the
+ * physical pin to a different power/global net.
+ */
+static void applySignalPinOverrides( LIB_SYMBOL* aSymbol, const PADS_SCH::PART_PLACEMENT& aPart )
+{
+    if( !aSymbol )
+        return;
+
+    for( const auto& [name, value] : aPart.attr_overrides )
+    {
+        std::string pinNumber;
+
+        if( value.empty() || !parseSignalPinOverrideName( name, pinNumber ) )
+            continue;
+
+        const wxString wantedPin = wxString::FromUTF8( pinNumber );
+
+        for( SCH_ITEM& item : aSymbol->GetDrawItems() )
+        {
+            if( item.Type() != SCH_PIN_T )
+                continue;
+
+            SCH_PIN& pin = static_cast<SCH_PIN&>( item );
+
+            if( pin.GetNumber() == wantedPin )
+            {
+                pin.SetName( wxString::FromUTF8( value ) );
+                break;
+            }
+        }
+    }
+}
+
+
+/**
  * Extract the numeric connector pin suffix from a reference designator.
  * For "J12-15" returns "15", for "J12-1" returns "1".
  * Returns empty string if no numeric suffix is found.
@@ -765,6 +836,8 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                 if( isPower )
                     instanceSymbol->SetGlobalPower();
             }
+
+            applySignalPinOverrides( instanceSymbol, part );
 
             symbol->SetLibSymbol( instanceSymbol );
             symbol->SetPosition( VECTOR2I( schIUScale.MilsToIU( KiROUND( part.position.x ) ),
