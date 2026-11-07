@@ -613,12 +613,34 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
     int fieldsCreated = 0;
     PADS_ATTRIBUTE_MAPPER mapper;
 
+    auto isSignalPinOverride = []( const std::string& aName )
+    {
+        constexpr char prefix[] = "SIGPIN";
+        constexpr size_t prefixLen = sizeof( prefix ) - 1;
+
+        if( aName.size() <= prefixLen || aName.compare( 0, prefixLen, prefix ) != 0 )
+            return false;
+
+        for( size_t i = prefixLen; i < aName.size(); ++i )
+        {
+            if( !std::isdigit( static_cast<unsigned char>( aName[i] ) ) )
+                return false;
+        }
+
+        return true;
+    };
+
     std::set<std::string> processedNames;
 
     for( const PART_ATTRIBUTE& attr : aPlacement.attributes )
     {
         // Skip standard fields that are handled by ApplyPartAttributes
         if( mapper.IsStandardField( attr.name ) )
+            continue;
+
+        // PADS SIGPIN<n> attributes are per-instance signal-pin net overrides,
+        // not user-visible component properties.
+        if( isSignalPinOverride( attr.name ) )
             continue;
 
         // Skip empty attributes
@@ -672,7 +694,8 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
     // Create fields from attr_overrides that weren't in the attributes vector
     for( const auto& [name, value] : aPlacement.attr_overrides )
     {
-        if( value.empty() || processedNames.count( name ) || mapper.IsStandardField( name ) )
+        if( value.empty() || processedNames.count( name ) || mapper.IsStandardField( name )
+                || isSignalPinOverride( name ) )
             continue;
 
         std::string fieldName = mapper.GetKiCadFieldName( name );

@@ -342,6 +342,18 @@ namespace
                                          const SOURCE_POINT& aTextOffset,
                                          const SOURCE_POINT* aAdjacentWirePoint )
     {
+        // Match the ASCII importer: NETNAMES stores the text/body offset from
+        // the electrical anchor and is the authoritative orientation when present.
+        if( aTextOffset.x != 0 || aTextOffset.y != 0 )
+        {
+            if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
+                return aTextOffset.x >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
+
+            return aTextOffset.y >= 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+        }
+
+        // Fall back to the adjacent wire only when NETNAMES has no usable offset.
+        // The label body extends away from the wire.
         if( aAdjacentWirePoint )
         {
             const int64_t deltaX = aAdjacentWirePoint->x - aPosition.x;
@@ -350,19 +362,14 @@ namespace
             if( deltaX != 0 || deltaY != 0 )
             {
                 if( std::abs( deltaX ) >= std::abs( deltaY ) )
-                    return deltaX < 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
+                    return deltaX < 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
 
                 // PADS page Y increases upwards; KiCad screen Y increases downwards.
-                return deltaY > 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+                return deltaY > 0 ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP;
             }
         }
 
-        // A zero-length or absent wire has no usable direction.  Fall back to the
-        // direction opposite to the NETNAMES body offset.
-        if( std::abs( aTextOffset.x ) >= std::abs( aTextOffset.y ) )
-            return aTextOffset.x >= 0 ? SPIN_STYLE::LEFT : SPIN_STYLE::RIGHT;
-
-        return aTextOffset.y >= 0 ? SPIN_STYLE::BOTTOM : SPIN_STYLE::UP;
+        return SPIN_STYLE::RIGHT;
     }
 
 
