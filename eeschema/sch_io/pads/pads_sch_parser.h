@@ -152,7 +152,9 @@ struct SYMBOL_PIN
     bool        inverted = false;
     bool        clock = false;
 
-    int         side = 0;
+    // PADS T-line xym field: bit 0 mirrors terminal geometry in X, bit 1 in Y.
+    // This is a local terminal transform, not a symbol-side enumeration.
+    int         xym = 0;
     int         pn_h = 0;
     int         pn_w = 0;
     int         pn_angle = 0;
@@ -162,6 +164,14 @@ struct SYMBOL_PIN
     int         pl_angle = 0;
     int         pl_just = 0;
     std::string pin_decal_name;
+
+    // Stem geometry resolved from the referenced pin CAEDECAL.  Keep the authored
+    // vector/stroke so the builder can derive orientation from geometry and overlay
+    // the original PADS terminal stroke on the electrical KiCad SCH_PIN.
+    POINT       pin_decal_vector;
+    double      pin_decal_line_width = 0.0;
+    int         pin_decal_line_style = 255;
+    bool        pin_decal_geometry_resolved = false;
 
     POINT       pn_offset;
     int         pn_off_angle = 0;
@@ -438,6 +448,7 @@ struct NETNAME_LABEL
 {
     std::string net_name;
     std::string anchor_ref;
+    int         sheet_number = 1;
     int         x_offset = 0;
     int         y_offset = 0;
     int         rotation = 0;

@@ -43,6 +43,12 @@
 namespace PADS_SCH
 {
 
+// Forward declaration: pin-name rendering in GetOrCreatePartTypeSymbol() uses the
+// same terminal-local PADS angle/xym transform as createPin(), whose implementation
+// is intentionally kept later with the rest of the pin builder helpers.
+static POINT transformPadsTerminalVector( const POINT& aVector, double aAngle, int aXym );
+
+
 PADS_SCH_SYMBOL_BUILDER::PADS_SCH_SYMBOL_BUILDER( const PARAMETERS& aParams ) :
         m_params( aParams )
 {
@@ -164,13 +170,10 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildMultiUnitSymbol( const PARTTYPE_DEF&  
 
         for( const SYMBOL_PIN& pin : pins )
         {
-            SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK );
+            SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK, unit );
 
             if( schPin )
-            {
-                schPin->SetUnit( unit );
                 libSymbol->AddDrawItem( schPin );
-            }
         }
 
         // Add embedded text labels for this unit
@@ -236,12 +239,127 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::GetOrCreatePartTypeSymbol( const PARTTYPE_D
     std::vector<SYMBOL_PIN> pins = applyGateOverrides( aSymbolDef.pins, gate );
     bool                    mapDiodeAK = isDiodeAKPinSet( pins );
 
+    // KiCad cannot place each native pin name at an arbitrary per-pin offset.
+    // PADS can: the T-line stores pnm(x,y), rotation and justification relative
+    // to each terminal.  Use authored PADS placement when every named pin in
+    // this symbol uses a vertical pin decal; this covers DIO-V conservatively
+    // without changing the rendering of ordinary symbols.
+    bool usePadsPinNamePlacement = false;
+    bool haveNamedPins = false;
+    bool allNamedPinsUseVerticalDecal = true;
+
+    for( const SYMBOL_PIN& pin : pins )
+    {
+        if( pin.name.empty() )
+            continue;
+
+        haveNamedPins = true;
+
+        if( pin.pin_decal_name.find( "VRT" ) == std::string::npos )
+            allNamedPinsUseVerticalDecal = false;
+    }
+
+    usePadsPinNamePlacement = haveNamedPins && allNamedPinsUseVerticalDecal;
+
     for( const SYMBOL_PIN& pin : pins )
     {
         SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK );
 
         if( schPin )
             libSymbol->AddDrawItem( schPin );
+    }
+
+    if( usePadsPinNamePlacement )
+    {
+        // NOTE: The logical pin name remains stored in SCH_PIN for connectivity/ERC.
+        // Only its graphical rendering is duplicated here as SCH_TEXT because PADS supports
+        // an independent per-pin name position while KiCad's native pin renderer does not.
+        // These SCH_TEXT objects deliberately belong to the LIB_SYMBOL, so they move, rotate
+        // and mirror together with the component instance.  Do NOT replace them with SCH_LABEL:
+        // a schematic label would remain anchored to the sheet when the symbol is moved.
+        //
+        // PADS terminal T-line fields are:
+        //   ... pnx pny pnrtn pnjust pnmx pnmy pnmrtn pnmjust pindecal
+        // The parser currently stores pnmx/pnmy in pl_h/pl_w.  They are offsets
+        // from the terminal anchor, not text dimensions.
+        for( const SYMBOL_PIN& pin : pins )
+        {
+            if( pin.name.empty() )
+                continue;
+
+            // pnmx/pnmy are terminal-local coordinates.  Use the same angle/xym
+            // transform as the electrical pin-decal stem so the graphical name stays
+            // on the authored side of the terminal for every orientation.
+            POINT pinNameOffset;
+            pinNameOffset.x = pin.pl_h;
+            pinNameOffset.y = pin.pl_w;
+            pinNameOffset = transformPadsTerminalVector( pinNameOffset, pin.rotation, pin.xym );
+
+            VECTOR2I namePos( toKiCadUnits( pin.position.x + pinNameOffset.x ),
+                              -toKiCadUnits( pin.position.y + pinNameOffset.y ) );
+
+            SCH_TEXT* pinName = new SCH_TEXT( namePos, wxString::FromUTF8( pin.name ), LAYER_DEVICE );
+
+            if( aSymbolDef.h2 > 0 )
+            {
+                int nominalSize = toKiCadUnits( aSymbolDef.h2 );
+                int textHeight = static_cast<int>(
+                        nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
+                int textWidth = static_cast<int>(
+                        nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
+                pinName->SetTextSize( VECTOR2I( textWidth, textHeight ) );
+            }
+
+            if( aSymbolDef.w2 > 0 )
+                pinName->SetTextThickness( toKiCadUnits( aSymbolDef.w2 ) );
+
+            if( pin.pl_angle != 0 )
+                pinName->SetTextAngleDegrees( pin.pl_angle );
+
+            int pinNameJustification = pin.pl_just;
+            int pinNameAngle = ( pin.pl_angle % 360 + 360 ) % 360;
+
+            // PADS swaps justification axis bits for text rotated 90/270 degrees.
+            if( pinNameAngle == 90 || pinNameAngle == 270 )
+            {
+                int bit0 = pinNameJustification & 0x1;
+                int bit1 = pinNameJustification & 0x2;
+                pinNameJustification &= ~0x3;
+
+                if( bit0 )
+                    pinNameJustification |= 0x2;
+
+                if( bit1 )
+                    pinNameJustification |= 0x1;
+            }
+
+            GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
+            GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+            PADS_COMMON::DecodeNineWayJustification( pinNameJustification, hJustify, vJustify );
+
+            // xym mirrors the authored pin-name anchor and its justification together.
+            // This preserves PADS presentation semantics without changing source geometry.
+            if( pin.xym & 0x1 )
+            {
+                if( hJustify == GR_TEXT_H_ALIGN_LEFT )
+                    hJustify = GR_TEXT_H_ALIGN_RIGHT;
+                else if( hJustify == GR_TEXT_H_ALIGN_RIGHT )
+                    hJustify = GR_TEXT_H_ALIGN_LEFT;
+            }
+
+            if( pin.xym & 0x2 )
+            {
+                if( vJustify == GR_TEXT_V_ALIGN_TOP )
+                    vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+                else if( vJustify == GR_TEXT_V_ALIGN_BOTTOM )
+                    vJustify = GR_TEXT_V_ALIGN_TOP;
+            }
+
+            pinName->SetHorizJustify( hJustify );
+            pinName->SetVertJustify( vJustify );
+
+            libSymbol->AddDrawItem( pinName );
+        }
     }
 
     for( const SYMBOL_TEXT& text : aSymbolDef.texts )
@@ -266,7 +384,7 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::GetOrCreatePartTypeSymbol( const PARTTYPE_D
     // multi-pin connector placement (no per-pin reference suffix) still routes here,
     // so force pin numbers on for connector part types.
     libSymbol->SetShowPinNumbers( hasPinNames || aPartType.is_connector );
-    libSymbol->SetShowPinNames( hasPinNames );
+    libSymbol->SetShowPinNames( hasPinNames && !usePadsPinNamePlacement );
 
     m_symbolCache[cacheKey] = std::unique_ptr<LIB_SYMBOL>( libSymbol );
 
@@ -379,13 +497,10 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildMultiUnitConnectorSymbol( const PARTTY
                     pin.name = ptPinIt->second->pin_name;
             }
 
-            SCH_PIN* schPin = createPin( pin, libSymbol );
+            SCH_PIN* schPin = createPin( pin, libSymbol, false, unit );
 
             if( schPin )
-            {
-                schPin->SetUnit( unit );
                 libSymbol->AddDrawItem( schPin );
-            }
         }
 
         for( const SYMBOL_TEXT& text : aSymbolDef.texts )
@@ -689,7 +804,50 @@ bool PADS_SCH_SYMBOL_BUILDER::isDiodeAKPinSet( const std::vector<SYMBOL_PIN>& aP
 }
 
 
-SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent, bool aMapDiodeAK )
+// Apply the PADS terminal-local transform in the order authored by the format:
+// terminal rotation first, then xym mirror bits.  The final PADS->KiCad Y inversion
+// is deliberately performed only when converting to VECTOR2I.  Keeping this in one
+// place prevents CAP/DIO/resistor-specific orientation heuristics.
+static POINT transformPadsTerminalVector( const POINT& aVector, double aAngle, int aXym )
+{
+    double radians = aAngle * M_PI / 180.0;
+    double c = std::cos( radians );
+    double s = std::sin( radians );
+
+    POINT result;
+    result.x = aVector.x * c - aVector.y * s;
+    result.y = aVector.x * s + aVector.y * c;
+
+    if( aXym & 0x1 )
+        result.x = -result.x;
+
+    if( aXym & 0x2 )
+        result.y = -result.y;
+
+    return result;
+}
+
+
+static POINT padsTerminalStemVector( const SYMBOL_PIN& aPin )
+{
+    if( aPin.pin_decal_geometry_resolved )
+        return transformPadsTerminalVector( aPin.pin_decal_vector, aPin.rotation, aPin.xym );
+
+    // Compatibility fallback for malformed/incomplete libraries where the referenced
+    // pin CAEDECAL was not available.  Normal imports use the resolved geometry above.
+    POINT fallback;
+
+    if( aPin.pin_decal_name.find( "VRT" ) != std::string::npos )
+        fallback.y = -aPin.length;
+    else
+        fallback.x = aPin.length;
+
+    return transformPadsTerminalVector( fallback, aPin.rotation, aPin.xym );
+}
+
+
+SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent,
+                                             bool aMapDiodeAK, int aUnit )
 {
     SCH_PIN* pin = new SCH_PIN( aParent );
 
@@ -716,37 +874,28 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
 
     // Set pin length
     int length = toKiCadUnits( aPin.length );
+
+    // PADS PINB is authored as a 140 mil stem followed by a 50 mil diameter
+    // inversion bubble (total reach 190 mil from the electrical connection point).
+    // KiCad's INVERTED pin renderer includes the bubble inside SCH_PIN::GetLength():
+    // with a 50 mil decorator, a 190 mil pin therefore leaves exactly 140 mil of
+    // straight line before the bubble, matching the PADS PINB geometry.
+    if( aPin.pin_decal_name == "PINB" )
+        length += toKiCadUnits( 50.0 );
+
     pin->SetLength( length );
 
-    // Determine pin orientation from the T-line angle and side fields.
-    // The angle indicates pin text rotation (0=horizontal, 90=vertical) while
-    // the side field indicates which edge of the symbol body the pin is on.
-    // Pin decal names containing "VRT" indicate perpendicular pins.
+    // Derive orientation from the actual pin-decal stem after the PADS terminal
+    // rotation/xym transform.  Do not infer it from decal names or special-case symbols.
+    POINT stemVector = padsTerminalStemVector( aPin );
+    double kicadDx = stemVector.x;
+    double kicadDy = -stemVector.y; // PADS schematic Y-up -> KiCad Y-down
     PIN_ORIENTATION orientation = PIN_ORIENTATION::PIN_RIGHT;
-    bool            isVerticalDecal = ( aPin.pin_decal_name.find( "VRT" ) != std::string::npos );
-    int             angle = static_cast<int>( aPin.rotation ) % 360;
 
-    if( isVerticalDecal )
-    {
-        orientation = ( aPin.side == 2 ) ? PIN_ORIENTATION::PIN_UP : PIN_ORIENTATION::PIN_DOWN;
-    }
-    else if( angle >= 45 && angle < 135 )
-    {
-        // Sides 0,1 (horizontal edges) point up; sides 2,3 (vertical edges) point down
-        orientation = ( aPin.side >= 2 ) ? PIN_ORIENTATION::PIN_DOWN : PIN_ORIENTATION::PIN_UP;
-    }
-    else if( angle >= 225 && angle < 315 )
-    {
-        orientation = ( aPin.side >= 2 ) ? PIN_ORIENTATION::PIN_UP : PIN_ORIENTATION::PIN_DOWN;
-    }
-    else if( angle >= 135 && angle < 225 )
-    {
-        orientation = ( aPin.side & 1 ) ? PIN_ORIENTATION::PIN_RIGHT : PIN_ORIENTATION::PIN_LEFT;
-    }
+    if( std::abs( kicadDx ) >= std::abs( kicadDy ) )
+        orientation = kicadDx >= 0.0 ? PIN_ORIENTATION::PIN_RIGHT : PIN_ORIENTATION::PIN_LEFT;
     else
-    {
-        orientation = ( aPin.side & 1 ) ? PIN_ORIENTATION::PIN_LEFT : PIN_ORIENTATION::PIN_RIGHT;
-    }
+        orientation = kicadDy >= 0.0 ? PIN_ORIENTATION::PIN_DOWN : PIN_ORIENTATION::PIN_UP;
 
     pin->SetOrientation( orientation );
 
@@ -767,6 +916,39 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
     int pinTextSize = schIUScale.MilsToIU( 50 );
     pin->SetNumberTextSize( pinTextSize );
     pin->SetNameTextSize( pinTextSize );
+
+    if( aUnit != 0 )
+        pin->SetUnit( aUnit );
+
+    // SCH_PIN owns the electrical connection but KiCad does not preserve the authored
+    // PADS pin-decal stroke width.  Overlay only the resolved terminal stem as symbol
+    // graphics.  It is local to the LIB_SYMBOL (and to the same unit), so it follows
+    // move/rotate/mirror operations and never creates an independent schematic object.
+    if( aPin.pin_decal_geometry_resolved )
+    {
+        VECTOR2I stemEnd( pos.x + toKiCadUnits( stemVector.x ),
+                          pos.y - toKiCadUnits( stemVector.y ) );
+
+        if( stemEnd != pos )
+        {
+            SCH_SHAPE* stem = new SCH_SHAPE( SHAPE_T::POLY, LAYER_DEVICE );
+            stem->AddPoint( pos );
+            stem->AddPoint( stemEnd );
+
+            int stemWidth = toKiCadUnits( aPin.pin_decal_line_width );
+
+            if( stemWidth == 0 )
+                stemWidth = toKiCadUnits( m_params.line_width );
+
+            stem->SetStroke( STROKE_PARAMS(
+                    stemWidth, PADS_COMMON::PadsLineStyleToKiCad( aPin.pin_decal_line_style ) ) );
+
+            if( aUnit != 0 )
+                stem->SetUnit( aUnit );
+
+            aParent->AddDrawItem( stem );
+        }
+    }
 
     return pin;
 }
@@ -837,7 +1019,8 @@ static void addPowerPin( LIB_SYMBOL* aSymbol, const std::string& aKiCadName, PIN
 }
 
 
-LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildKiCadPowerSymbol( const std::string& aKiCadName )
+LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildKiCadPowerSymbol( const std::string& aKiCadName,
+                                                                    const std::string& aPadsDecalName )
 {
     // Convert source units to KiCad internal units.
     auto mm = [&]( double v )
@@ -907,13 +1090,31 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildKiCadPowerSymbol( const std::string& a
 
     case POWER_STYLE::FILLED_ARROW:
     {
-        // Convert the PADS +5V CAEDECAL from local Y-up to KiCad local Y-down.
-        addPolyline( sym, { VECTOR2I( 0, 0 ), VECTOR2I( 0, mil( -200 ) ) }, mil( 5 ) );
+        // PADS positive-supply decals do not all have the same height.  The old
+        // importer used the +5V geometry (200 mil) for every filled-arrow supply,
+        // which left +3V3/+12V/+5VA net names 100 mil too far from the body.
+        int tipMils = 200;
+        int baseMils = 100;
 
-        SCH_SHAPE* tri = addPolyline( sym, { VECTOR2I( 0, mil( -200 ) ),
-                                             VECTOR2I( mil( -50 ), mil( -100 ) ),
-                                             VECTOR2I( mil( 50 ), mil( -100 ) ),
-                                             VECTOR2I( 0, mil( -200 ) ) }, mil( 5 ) );
+        std::string padsDecal = aPadsDecalName;
+        std::transform( padsDecal.begin(), padsDecal.end(), padsDecal.begin(),
+                        []( unsigned char c )
+                        {
+                            return std::toupper( c );
+                        } );
+
+        if( padsDecal == "+3V3" || padsDecal == "+12V" || padsDecal == "+5VA" )
+        {
+            tipMils = 300;
+            baseMils = 150;
+        }
+
+        addPolyline( sym, { VECTOR2I( 0, 0 ), VECTOR2I( 0, mil( -tipMils ) ) }, mil( 5 ) );
+
+        SCH_SHAPE* tri = addPolyline( sym, { VECTOR2I( 0, mil( -tipMils ) ),
+                                             VECTOR2I( mil( -50 ), mil( -baseMils ) ),
+                                             VECTOR2I( mil( 50 ), mil( -baseMils ) ),
+                                             VECTOR2I( 0, mil( -tipMils ) ) }, mil( 5 ) );
         tri->SetFillMode( FILL_T::FILLED_SHAPE );
 
         addPowerPin( sym, aKiCadName, PIN_ORIENTATION::PIN_UP );

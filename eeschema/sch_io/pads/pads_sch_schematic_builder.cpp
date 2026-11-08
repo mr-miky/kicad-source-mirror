@@ -37,6 +37,8 @@
 
 #include <advanced_config.h>
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -223,25 +225,22 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
         for( const PLACEMENT& placement : opcPlacements )
         {
-            // Orientation belongs to the off-page object itself.  *NETNAMES* describes
-            // the text presentation/offset and can be moved independently, so it must
-            // not determine the connector direction.  Keep wire direction as a robust
-            // fallback for malformed/legacy records with a non-cardinal rotation.
+            // Match the binary importer: PADS *NETNAMES* stores the visible off-page
+            // text/body displacement from the electrical anchor and therefore gives the
+            // reading direction.  Use adjacent wire direction only when that offset is zero.
             SPIN_STYLE orient = computeLabelOrientation( placement.labelPos, placement.adjPos );
             auto       opcIt = aOffPageConnectors.find( placement.anchorRef );
+            auto       presentationIt = aNetNameLabels.find( placement.anchorRef );
 
-            if( opcIt != aOffPageConnectors.end() )
-                orient = SpinFromOffPageConnector( opcIt->second, orient );
+            if( opcIt != aOffPageConnectors.end() && presentationIt != aNetNameLabels.end() )
+                orient = SpinFromNetNameOffset( presentationIt->second, orient );
 
             SCH_GLOBALLABEL* label = CreateNetLabel( signal, placement.labelPos, orient );
 
             if( label )
             {
                 // Apply the presentation authored by PADS *NETNAMES* to the
-                // off-page/global label.  Keep this independent of the orientation lookup
-                // above so it remains robust if that code changes.
-                auto presentationIt = aNetNameLabels.find( placement.anchorRef );
-
+                // off-page/global label.
                 if( presentationIt != aNetNameLabels.end() )
                 {
                     const NETNAME_LABEL& nn = presentationIt->second;
@@ -277,34 +276,18 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 }
 
 
-SPIN_STYLE PADS_SCH_SCHEMATIC_BUILDER::SpinFromOffPageConnector(
-        const OFF_PAGE_CONNECTOR& aConnector, SPIN_STYLE aFallback )
+SPIN_STYLE PADS_SCH_SCHEMATIC_BUILDER::SpinFromNetNameOffset(
+        const NETNAME_LABEL& aLabel, SPIN_STYLE aFallback )
 {
-    // Binary PADS stores the same transform as angle + two mirror bits.  Apply
-    // the identical transform here.  The unrotated, unmirrored $OSR_SYMS body
-    // lies to the left of its electrical anchor.
-    int angle = aConnector.rotation % 360;
-
-    if( angle < 0 )
-        angle += 360;
-
-    if( angle != 0 && angle != 90 && angle != 180 && angle != 270 )
+    if( aLabel.x_offset == 0 && aLabel.y_offset == 0 )
         return aFallback;
 
-    if( aConnector.flags2 & 1 )
-        angle = ( 180 - angle + 360 ) % 360;
+    if( std::abs( aLabel.x_offset ) >= std::abs( aLabel.y_offset ) )
+        return aLabel.x_offset >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
 
-    if( aConnector.flags2 & 2 )
-        angle = ( -angle + 360 ) % 360;
-
-    switch( angle )
-    {
-    case 0:   return SPIN_STYLE::LEFT;
-    case 90:  return SPIN_STYLE::BOTTOM;
-    case 180: return SPIN_STYLE::RIGHT;
-    case 270: return SPIN_STYLE::UP;
-    default:  return aFallback;
-    }
+    // PADS page Y increases upwards.  This is the authored body/text displacement,
+    // so positive Y means the label body is above the electrical anchor.
+    return aLabel.y_offset >= 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
 }
 
 
@@ -630,37 +613,50 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyPartAttributes( SCH_SYMBOL*           aSym
 
     PADS_ATTRIBUTE_MAPPER mapper;
 
-    // PADS PART-TYPE and Value are distinct fields.  A normal symbol gets an
-    // empty KiCad Value unless PADS carries an explicit Value attribute.
-    // Power symbols are finalized later from their net name and are left alone
-    // here.
+    // PADS PART-TYPE and Value are distinct fields.  The displayed Value field
+    // and the per-instance Value attribute are also distinct: the latter can exist
+    // without any presentation record.  In that case preserve the text, but keep the
+    // KiCad Value hidden just like PADS/binary import.  When both exist, the instance
+    // attribute is authoritative and the displayed record supplies presentation only.
     if( aPlacement.power_net_name.empty() )
     {
-        bool hasValueOverride = false;
+        bool        hasValuePresentation = false;
+        std::string valueText;
+
         aSymbol->SetValueFieldText( wxEmptyString );
 
         for( const PART_ATTRIBUTE& attr : aPlacement.attributes )
         {
-            if( mapper.IsValueField( attr.name ) && !attr.value.empty() )
+            if( mapper.IsValueField( attr.name ) )
             {
-                aSymbol->SetValueFieldText( wxString::FromUTF8( attr.value ) );
-                hasValueOverride = true;
+                hasValuePresentation = true;
+
+                if( !attr.value.empty() )
+                    valueText = attr.value;
+
                 break;
             }
         }
 
-        // Some PADS files carry a Value attribute without a displayed field
-        // record.  Preserve the value even when there is no presentation entry.
-        if( !hasValueOverride )
+        // Per-instance attributes override the displayed/default value text.  This also
+        // covers values that have no displayed field record at all (for example U1/U2 in
+        // the real multi-sheet fixture).
+        for( const auto& [name, value] : aPlacement.attr_overrides )
         {
-            for( const auto& [name, value] : aPlacement.attr_overrides )
+            if( mapper.IsValueField( name ) && !value.empty() )
             {
-                if( mapper.IsValueField( name ) && !value.empty() )
-                {
-                    aSymbol->SetValueFieldText( wxString::FromUTF8( value ) );
-                    break;
-                }
+                valueText = value;
+                break;
             }
+        }
+
+        if( !valueText.empty() )
+            aSymbol->SetValueFieldText( wxString::FromUTF8( valueText ) );
+
+        if( !hasValuePresentation )
+        {
+            if( SCH_FIELD* valueField = aSymbol->GetField( FIELD_T::VALUE ) )
+                valueField->SetVisible( false );
         }
 
         if( !aPlacement.part_type.empty() )
@@ -763,16 +759,35 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
             else
                 field->SetVisible( isRefOrValue ? attr.visible : false );
 
-            // PADS field positions are in CAEDECAL coordinates (pre-mirror).
-            // KiCad applies the symbol transform to field positions, so
-            // pre-compensate X for mirrored-Y symbols.
-            int fx = toKiCadUnits( attr.position.x );
+            // Placement-field coordinates are local to the PADS CAEDECAL.  Match the
+            // binary importer and transform the authored local offset through the placed
+            // KiCad symbol, including both rotation and mirror state.
+            VECTOR2I localOffset( toKiCadUnits( attr.position.x ),
+                                  -toKiCadUnits( attr.position.y ) );
+            VECTOR2I fieldOffset = aSymbol->GetTransform().TransformCoordinate( localOffset );
 
-            if( aPlacement.mirror_flags & 1 )
-                fx = -fx;
+            if( ( aPlacement.reference == "Y1" || aPlacement.reference == "Y2" )
+                && mapper.IsValueField( attr.name ) )
+            {
+                const VECTOR2I symbolPos = aSymbol->GetPosition();
+                const VECTOR2I finalPos = symbolPos + fieldOffset;
 
-            VECTOR2I fieldPos( fx, -toKiCadUnits( attr.position.y ) );
-            field->SetPosition( aSymbol->GetPosition() + fieldPos );
+                std::fprintf( stderr,
+                              "PADS-DIAG BUILDER ref=%s value=%s "
+                              "partPads=(%.0f,%.0f) partRot=%.0f mirror=%d "
+                              "raw=(%.0f,%.0f) fieldRot=%.0f just=%d "
+                              "localIU=(%d,%d) transformedIU=(%d,%d) "
+                              "symbolIU=(%d,%d) setIU=(%d,%d)\n",
+                              aPlacement.reference.c_str(), attr.value.c_str(),
+                              aPlacement.position.x, aPlacement.position.y,
+                              aPlacement.rotation, aPlacement.mirror_flags,
+                              attr.position.x, attr.position.y, attr.rotation,
+                              attr.justification, localOffset.x, localOffset.y,
+                              fieldOffset.x, fieldOffset.y, symbolPos.x, symbolPos.y,
+                              finalPos.x, finalPos.y );
+            }
+
+            field->SetPosition( aSymbol->GetPosition() + fieldOffset );
 
             if( attr.rotation != 0.0 )
                 field->SetTextAngleDegrees( attr.rotation );
@@ -798,16 +813,29 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
             // alignment authored in PADS instead of forcing center.
             GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
             GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
-            PADS_COMMON::DecodeNineWayJustification( attr.justification, hJustify, vJustify );
-
-            // KiCad applies the symbol transform to field justification. Mirrored-Y
-            // symbols flip horizontal alignment, so pre-compensate to keep the rendered
-            // alignment matching PADS.
-            if( aPlacement.mirror_flags & 1 )
-                hJustify = GetFlippedAlignment( hJustify );
+            PADS_COMMON::DecodeNineWayJustification( attr.justification, hJustify, vJustify,
+                                                        attr.rotation );
 
             field->SetHorizJustify( hJustify );
             field->SetVertJustify( vJustify );
+
+            if( ( aPlacement.reference == "Y1" || aPlacement.reference == "Y2" )
+                && mapper.IsValueField( attr.name ) )
+            {
+                const char* hName = hJustify == GR_TEXT_H_ALIGN_CENTER ? "CENTER"
+                                  : hJustify == GR_TEXT_H_ALIGN_RIGHT ? "RIGHT" : "LEFT";
+                const char* vName = vJustify == GR_TEXT_V_ALIGN_CENTER ? "CENTER"
+                                  : vJustify == GR_TEXT_V_ALIGN_TOP ? "TOP" : "BOTTOM";
+                const VECTOR2I actualPos = field->GetPosition();
+
+                std::fprintf( stderr,
+                              "PADS-DIAG FINAL ref=%s field=%s actualIU=(%d,%d) "
+                              "fieldRot=%.0f justRaw=%d h=%s v=%s visible=%d\n",
+                              aPlacement.reference.c_str(), attr.name.c_str(),
+                              actualPos.x, actualPos.y, attr.rotation, attr.justification,
+                              hName, vName, field->IsVisible() ? 1 : 0 );
+            }
+
             applyPadsAsciiFieldFont( *field, attr, m_params );
         }
     }
@@ -844,17 +872,12 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
     {
         aField.SetVisible( aAttr.visible );
 
-        // PADS field positions are authored in CAEDECAL-local coordinates.
-        // Match the pre-compensation used by Reference/Value for mirrored-Y
-        // symbols before SCH_FIELD converts the sheet position back through
-        // the parent symbol transform.
-        int fx = toKiCadUnits( aAttr.position.x );
-
-        if( aPlacement.mirror_flags & 1 )
-            fx = -fx;
-
-        VECTOR2I fieldPos( fx, -toKiCadUnits( aAttr.position.y ) );
-        aField.SetPosition( aSymbol->GetPosition() + fieldPos );
+        // Keep custom fields in the same CAEDECAL-local coordinate system as the
+        // standard fields, then transform through the placed symbol.
+        VECTOR2I localOffset( toKiCadUnits( aAttr.position.x ),
+                              -toKiCadUnits( aAttr.position.y ) );
+        VECTOR2I fieldOffset = aSymbol->GetTransform().TransformCoordinate( localOffset );
+        aField.SetPosition( aSymbol->GetPosition() + fieldOffset );
 
         if( aAttr.rotation != 0.0 )
             aField.SetTextAngleDegrees( aAttr.rotation );
@@ -879,9 +902,6 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
         GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
         GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
         PADS_COMMON::DecodeJustification( aAttr.justification, hJustify, vJustify );
-
-        if( aPlacement.mirror_flags & 1 )
-            hJustify = GetFlippedAlignment( hJustify );
 
         aField.SetHorizJustify( hJustify );
         aField.SetVertJustify( vJustify );
