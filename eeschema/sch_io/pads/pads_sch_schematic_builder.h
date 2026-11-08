@@ -64,8 +64,8 @@ public:
      * Create net labels for named signals.
      *
      * For signals with OPC endpoints, one label is created per OPC connection point.
-     * Orientation comes from the transform stored on the matching *OFFPAGE REFS* object;
-     * adjacent wire direction is retained only as a fallback for malformed transforms.
+     * Orientation follows the authored *NETNAMES* text/body offset, matching the binary
+     * importer. Adjacent wire direction is retained as the fallback for a zero offset.
      *
      * @param aSignals Vector of parsed signal definitions.
      * @param aScreen Target screen to add labels to.
@@ -82,14 +82,12 @@ public:
                          const std::map<std::string, NETNAME_LABEL>& aNetNameLabels = {} );
 
     /**
-     * Map the transform stored on a PADS *OFFPAGE REFS* object to KiCad spin.
+     * Map the PADS *NETNAMES* text/body offset to KiCad spin.
      *
-     * The connector transform, not the movable *NETNAMES* text offset, defines
-     * which side of the electrical anchor the off-page body occupies.  flags2
-     * carries the same two mirror bits as the binary off-page record.
+     * A zero offset carries no direction information, so keep the wire-derived fallback.
      */
-    static SPIN_STYLE SpinFromOffPageConnector( const OFF_PAGE_CONNECTOR& aConnector,
-                                                SPIN_STYLE aFallback );
+    static SPIN_STYLE SpinFromNetNameOffset( const NETNAME_LABEL& aLabel,
+                                             SPIN_STYLE aFallback );
 
     /**
      * Create a net label. PADS signals are global, so labels are SCH_GLOBALLABEL to avoid

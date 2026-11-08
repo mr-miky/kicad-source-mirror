@@ -23,6 +23,8 @@
 #include <ki_exception.h>
 #include <reporter.h>
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -871,14 +873,29 @@ size_t PADS_SCH_PARSER::parseSectionCAEDECAL( const std::vector<std::string>& aL
         i++;
     }
 
-    // Resolve pin lengths from pin-decal geometry. The SHORT/LONG name heuristic covers only
-    // standard decals; custom names need their length measured from the graphics.
-    std::map<std::string, double> pinDecalLengths;
+    // Resolve the electrical stem from each pin CAEDECAL, not merely the first
+    // graphic primitive.  PCLKB, for example, starts with the clock marker while its
+    // actual terminal stem is a later primitive.  The electrical stem is the line/polyline
+    // that contains the pin-decal origin (0,0); the farthest point in that primitive gives
+    // the authored direction and length from the connection point toward the symbol body.
+    struct PIN_DECAL_METRICS
+    {
+        POINT  vector;
+        double length = 0.0;
+        double line_width = 0.0;
+        int    line_style = 255;
+        bool   valid = false;
+    };
+
+    std::map<std::string, PIN_DECAL_METRICS> pinDecalMetrics;
+    constexpr double ORIGIN_EPSILON = 1e-9;
 
     for( const auto& sym : m_symbolDefs )
     {
         if( !sym.is_pin_decal )
             continue;
+
+        PIN_DECAL_METRICS best;
 
         for( const auto& graphic : sym.graphics )
         {
@@ -888,13 +905,52 @@ size_t PADS_SCH_PARSER::parseSectionCAEDECAL( const std::vector<std::string>& aL
             if( graphic.points.size() < 2 )
                 continue;
 
-            const auto& first = graphic.points.front().coord;
-            const auto& last = graphic.points.back().coord;
-            double dx = last.x - first.x;
-            double dy = last.y - first.y;
-            pinDecalLengths[sym.name] = std::sqrt( dx * dx + dy * dy );
-            break;
+            bool containsOrigin = false;
+
+            for( const auto& point : graphic.points )
+            {
+                if( std::abs( point.coord.x ) <= ORIGIN_EPSILON
+                    && std::abs( point.coord.y ) <= ORIGIN_EPSILON )
+                {
+                    containsOrigin = true;
+                    break;
+                }
+            }
+
+            if( !containsOrigin )
+                continue;
+
+            POINT  farthest;
+            double farthestSquared = 0.0;
+
+            for( const auto& point : graphic.points )
+            {
+                double d2 = point.coord.x * point.coord.x + point.coord.y * point.coord.y;
+
+                if( d2 > farthestSquared )
+                {
+                    farthestSquared = d2;
+                    farthest = point.coord;
+                }
+            }
+
+            if( farthestSquared <= ORIGIN_EPSILON )
+                continue;
+
+            double candidateLength = std::sqrt( farthestSquared );
+
+            if( !best.valid || candidateLength > best.length )
+            {
+                best.vector = farthest;
+                best.length = candidateLength;
+                best.line_width = graphic.line_width;
+                best.line_style = graphic.line_style;
+                best.valid = true;
+            }
         }
+
+        if( best.valid )
+            pinDecalMetrics[sym.name] = best;
     }
 
     for( auto& sym : m_symbolDefs )
@@ -907,10 +963,16 @@ size_t PADS_SCH_PARSER::parseSectionCAEDECAL( const std::vector<std::string>& aL
             if( pin.pin_decal_name.empty() )
                 continue;
 
-            auto it = pinDecalLengths.find( pin.pin_decal_name );
+            auto it = pinDecalMetrics.find( pin.pin_decal_name );
 
-            if( it != pinDecalLengths.end() )
-                pin.length = it->second;
+            if( it != pinDecalMetrics.end() )
+            {
+                pin.length = it->second.length;
+                pin.pin_decal_vector = it->second.vector;
+                pin.pin_decal_line_width = it->second.line_width;
+                pin.pin_decal_line_style = it->second.line_style;
+                pin.pin_decal_geometry_resolved = true;
+            }
         }
     }
 
@@ -1181,24 +1243,21 @@ size_t PADS_SCH_PARSER::parseSymbolDef( const std::vector<std::string>& aLines, 
 
         SYMBOL_PIN pin;
 
-        // T line: T<x> y angle side pn_x pn_y pn_angle pn_just pl_x pl_y pl_angle pl_just
+        // T line: T<x> y angle xym pn_h pn_w pn_angle pn_just pl_h pl_w pl_angle pl_just
         //         pin_decal_name
+        // xym is a terminal-local mirror bitfield (X=1, Y=2), not a side index.
         if( tLine.size() > 1 && tLine[0] == 'T' )
         {
             std::string tContent = tLine.substr( 1 );
             std::istringstream tiss( tContent );
-            int                tx = 0, ty = 0, angle = 0, pnx = 0, pny = 0, plx = 0, ply = 0;
+            int tx = 0, ty = 0, angle = 0;
 
-            tiss >> tx >> ty >> angle >> pin.side >> pnx >> pny >> pin.pn_angle >> pin.pn_just >> plx >> ply
-                    >> pin.pl_angle >> pin.pl_just >> pin.pin_decal_name;
+            tiss >> tx >> ty >> angle >> pin.xym >> pin.pn_h >> pin.pn_w >> pin.pn_angle >> pin.pn_just >> pin.pl_h
+                    >> pin.pl_w >> pin.pl_angle >> pin.pl_just >> pin.pin_decal_name;
 
             pin.position.x = tx;
             pin.position.y = ty;
             pin.rotation = angle;
-            pin.pn_offset.x = pnx;
-            pin.pn_offset.y = pny;
-            pin.pl_offset.x = plx;
-            pin.pl_offset.y = ply;
 
             // The pin decal name encodes inverted/clock styles
             if( pin.pin_decal_name == "PINB" || pin.pin_decal_name == "PINORB" || pin.pin_decal_name == "PCLKB"
@@ -1236,13 +1295,13 @@ size_t PADS_SCH_PARSER::parseSymbolDef( const std::vector<std::string>& aLines, 
                 std::istringstream piss( pContent );
                 int px1 = 0, py1 = 0, px2 = 0, py2 = 0;
 
-                piss >> px1 >> py1 >> pin.p_angle1 >> pin.p_just1 >> px2 >> py2 >> pin.p_angle2 >> pin.p_just2
-                        >> pin.p_flags;
+                piss >> px1 >> py1 >> pin.pn_off_angle >> pin.pn_off_just >> px2 >> py2 >> pin.pl_off_angle
+                        >> pin.pl_off_just >> pin.p_flags;
 
-                pin.p_position1.x = px1;
-                pin.p_position1.y = py1;
-                pin.p_position2.x = px2;
-                pin.p_position2.y = py2;
+                pin.pn_offset.x = px1;
+                pin.pn_offset.y = py1;
+                pin.pl_offset.x = px2;
+                pin.pl_offset.y = py2;
 
                 // Pin name hidden if flags bit 128 set
                 if( pin.p_flags & 128 )
@@ -1335,19 +1394,24 @@ size_t PADS_SCH_PARSER::parseGraphicPrimitive( const std::vector<std::string>& a
         idx++;
     }
 
-    // A closed polygon reduces to two corner points when it is an axis-aligned rectangle;
-    // otherwise it becomes a POLYLINE.
+    // A closed polygon reduces to two corner points only when it really contains
+    // all four corners of an axis-aligned rectangle.  Merely having two distinct X
+    // and Y coordinates is not sufficient: PADS COPCLS triangles commonly repeat
+    // their first point and would otherwise be misdetected as filled rectangles
+    // (for example the arrow/diode triangles in the LED CAEDECAL).
     if( aGraphic.type == GRAPHIC_TYPE::RECTANGLE && aGraphic.points.size() >= 4 )
     {
-        std::set<double> uniqueX, uniqueY;
+        std::set<double>                    uniqueX, uniqueY;
+        std::set<std::pair<double, double>> uniquePoints;
 
         for( const auto& pt : aGraphic.points )
         {
             uniqueX.insert( pt.coord.x );
             uniqueY.insert( pt.coord.y );
+            uniquePoints.insert( { pt.coord.x, pt.coord.y } );
         }
 
-        bool isRect = ( uniqueX.size() == 2 && uniqueY.size() == 2 );
+        bool isRect = ( uniqueX.size() == 2 && uniqueY.size() == 2 && uniquePoints.size() == 4 );
 
         if( isRect )
         {
@@ -1954,6 +2018,17 @@ size_t PADS_SCH_PARSER::parsePartPlacement( const std::vector<std::string>& aLin
             if( i < aLines.size() )
                 attr.name = aLines[i];
 
+            if( ( aPart.reference == "Y1" || aPart.reference == "Y2" )
+                && ( attr.name == "VALUE" || attr.name == "Value" || attr.name == "Value1" ) )
+            {
+                std::fprintf( stderr,
+                              "PADS-DIAG PARSER ref=%s field=%s raw=(%.0f,%.0f) "
+                              "fieldRot=%.0f just=%d h=%d w=%d vis=%d\n",
+                              aPart.reference.c_str(), attr.name.c_str(),
+                              attr.position.x, attr.position.y, attr.rotation,
+                              attr.justification, attr.height, attr.width, attr.visibility );
+            }
+
             aPart.attributes.push_back( attr );
             i++;
         }
@@ -2513,6 +2588,7 @@ size_t PADS_SCH_PARSER::parseSectionNETNAMES( const std::vector<std::string>& aL
         // Fields: net_name anchor_ref x_offset y_offset rotation justification f3 f4 f5 f6 f7
         //         line_width height "fontinfo"
         NETNAME_LABEL label;
+        label.sheet_number = m_currentSheet;
         std::istringstream iss( line );
 
         iss >> label.net_name >> label.anchor_ref >> label.x_offset >> label.y_offset >> label.rotation

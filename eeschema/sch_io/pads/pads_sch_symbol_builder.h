@@ -72,7 +72,8 @@ public:
      * Build a power symbol using hard-coded KiCad-standard graphics, or nullptr if the name
      * is unrecognized. Caller takes ownership.
      */
-    LIB_SYMBOL* BuildKiCadPowerSymbol( const std::string& aKiCadName );
+    LIB_SYMBOL* BuildKiCadPowerSymbol( const std::string& aKiCadName,
+                                           const std::string& aPadsDecalName = {} );
 
     /**
      * Map a PADS special_variant decal name and pin type to a power symbol style name for
@@ -162,7 +163,8 @@ private:
     /// renumbered to the KiCad 1/2 convention.
     static bool isDiodeAKPinSet( const std::vector<SYMBOL_PIN>& aPins );
 
-    SCH_PIN* createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent, bool aMapDiodeAK = false );
+    SCH_PIN* createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent, bool aMapDiodeAK = false,
+                        int aUnit = 0 );
 
     /// Build the configured SCH_TEXT for one symbol text field, or nullptr when its content is
     /// empty. A non-zero @p aUnit binds the text to that body unit.

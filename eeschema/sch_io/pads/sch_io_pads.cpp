@@ -382,6 +382,13 @@ static int computePowerOrientation( const std::string& aOpcId, const std::vector
     int dx = adjPos.x - aOpcPos.x;
     int dy = adjPos.y - aOpcPos.y;
 
+    // A power connector can sit directly on a component pin, producing a zero-length
+    // PADS connection segment.  Such a segment carries no orientation information.
+    // Keep the native CAEDECAL orientation instead of accidentally treating (0,0)
+    // as a horizontal wire and rotating GND/AGND by 90 degrees.
+    if( dx == 0 && dy == 0 )
+        return SYMBOL_ORIENTATION_T::SYM_ORIENT_0;
+
     // Determine which direction the wire approaches from (relative to OPC position).
     // The symbol body should face AWAY from the wire.
     // In KiCad Y-down coordinates: dy > 0 means wire goes down from OPC.
@@ -890,6 +897,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
             // (e.g. +BUBBLE → +VDC) which preserves the original PADS symbol shape,
             // falling back to net-name matching (e.g. GND → GND, +5V → +5V).
             std::string powerStyle;
+            std::string powerDecal;
 
             if( isPower && ptIt != parser.GetPartTypes().end() && !ptIt->second.special_variants.empty() )
             {
@@ -897,6 +905,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                 varIdx = std::min( varIdx, static_cast<int>( ptIt->second.special_variants.size() ) - 1 );
                 const PADS_SCH::PARTTYPE_DEF::SPECIAL_VARIANT& variant = ptIt->second.special_variants[varIdx];
 
+                powerDecal = variant.decal_name;
                 powerStyle = PADS_SCH::PADS_SCH_SYMBOL_BUILDER::GetPowerStyleFromVariant( variant.decal_name,
                                                                                           variant.pin_type );
             }
@@ -922,7 +931,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
 
             if( isPower && !powerStyle.empty() )
             {
-                instanceSymbol = symbolBuilder.BuildKiCadPowerSymbol( powerStyle );
+                instanceSymbol = symbolBuilder.BuildKiCadPowerSymbol( powerStyle, powerDecal );
 
                 if( !powerLibId.has_value() )
                     powerLibId = LIB_ID( wxT( "power" ), wxString::FromUTF8( powerStyle ) );
@@ -1061,13 +1070,12 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                             if( attr.name == "VALUE" || attr.name == "VALUE1" || attr.name == "Value1" )
                             {
                                 SCH_FIELD* valField = symbol->GetField( FIELD_T::VALUE );
-                                int        fx = schIUScale.MilsToIU( KiROUND( attr.position.x ) );
-
-                                if( part.mirror_flags & 1 )
-                                    fx = -fx;
-
-                                VECTOR2I fieldPos( fx, -schIUScale.MilsToIU( KiROUND( attr.position.y ) ) );
-                                valField->SetPosition( symbol->GetPosition() + fieldPos );
+                                VECTOR2I      localOffset(
+                                        schIUScale.MilsToIU( KiROUND( attr.position.x ) ),
+                                        -schIUScale.MilsToIU( KiROUND( attr.position.y ) ) );
+                                VECTOR2I fieldOffset =
+                                        symbol->GetTransform().TransformCoordinate( localOffset );
+                                valField->SetPosition( symbol->GetPosition() + fieldOffset );
 
                                 int fieldTextSize = schIUScale.MilsToIU( 50 );
                                 valField->SetTextSize( VECTOR2I( fieldTextSize, fieldTextSize ) );
@@ -1077,10 +1085,8 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                                 // applied by ApplyFieldSettings.
                                 GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
                                 GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
-                                PADS_COMMON::DecodeNineWayJustification( attr.justification, hJustify, vJustify );
-
-                                if( part.mirror_flags & 1 )
-                                    hJustify = GetFlippedAlignment( hJustify );
+                                PADS_COMMON::DecodeNineWayJustification( attr.justification, hJustify, vJustify,
+                                                                            attr.rotation );
 
                                 valField->SetHorizJustify( hJustify );
                                 valField->SetVertJustify( vJustify );
@@ -1139,6 +1145,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                 int        labelSize = schIUScale.MilsToIU( 50 );
                 label->SetTextSize( VECTOR2I( labelSize, labelSize ) );
                 label->SetSpinStyle( SPIN_STYLE::RIGHT );
+                label->SetVisible( false );
                 label->SetFlags( IS_NEW );
                 ctx.screen->Append( label );
             }
@@ -1174,28 +1181,8 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
         }
     }
 
-    // Build set of OPC reference IDs for non-power signal OPCs. Each entry
-    // corresponds to a wire endpoint reference like "@@@O48" that should receive
-    // its own global label with orientation derived from the wire direction.
-    std::set<std::string> signalOpcIds;
-
-    for( const PADS_SCH::OFF_PAGE_CONNECTOR& opc : parser.GetOffPageConnectors() )
-    {
-        if( opc.signal_name.empty() || powerSignalNames.count( opc.signal_name ) )
-            continue;
-
-        signalOpcIds.insert( "@@@O" + std::to_string( opc.id ) );
-    }
-
-    // Map each off-page anchor (@@@O..) to its *NETNAMES* presentation.  Orientation
-    // comes from the *OFFPAGE REFS* transform; NETNAMES is only text presentation/offset.
-    std::map<std::string, PADS_SCH::NETNAME_LABEL> netNameLabels;
-
-    for( const PADS_SCH::NETNAME_LABEL& nn : parser.GetNetNameLabels() )
-    {
-        if( !nn.anchor_ref.empty() )
-            netNameLabels[nn.anchor_ref] = nn;
-    }
+    // OPC ordinals restart on every PADS sheet.  Build both OPC and NETNAMES
+    // lookup tables per sheet below so one sheet cannot overwrite another.
 
     // PADS power ports carry no reference designator, so the importer invents one
     // A per-sheet counter restarts at #PWR0001 on sheet two and collides
@@ -1267,6 +1254,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                         int        labelSize = schIUScale.MilsToIU( 50 );
                         label->SetTextSize( VECTOR2I( labelSize, labelSize ) );
                         label->SetSpinStyle( orient );
+                        label->SetVisible( false );
                         label->SetFlags( IS_NEW );
                         ctx.screen->Append( label );
                     }
@@ -1299,6 +1287,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                         int        labelSize = schIUScale.MilsToIU( 50 );
                         label->SetTextSize( VECTOR2I( labelSize, labelSize ) );
                         label->SetSpinStyle( orient );
+                        label->SetVisible( false );
                         label->SetFlags( IS_NEW );
                         ctx.screen->Append( label );
                     }
@@ -1398,9 +1387,11 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
             ctx.screen->Append( junction );
         }
 
-        // Build a per-sheet map so repeated @@@O ordinals on different sheets cannot
-        // cross-contaminate orientation.
+        // Build per-sheet OPC and NETNAMES maps.  PADS restarts @@@O ordinals on
+        // every sheet, so a design-wide map would cross-contaminate presentation.
+        std::set<std::string>                              sheetSignalOpcIds;
         std::map<std::string, PADS_SCH::OFF_PAGE_CONNECTOR> sheetOffPageConnectors;
+        std::map<std::string, PADS_SCH::NETNAME_LABEL>      sheetNetNameLabels;
 
         for( const PADS_SCH::OFF_PAGE_CONNECTOR& opc : parser.GetOffPageConnectors() )
         {
@@ -1410,12 +1401,20 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                 continue;
             }
 
-            sheetOffPageConnectors.emplace( "@@@O" + std::to_string( opc.id ), opc );
+            std::string anchor = "@@@O" + std::to_string( opc.id );
+            sheetSignalOpcIds.insert( anchor );
+            sheetOffPageConnectors.emplace( anchor, opc );
+        }
+
+        for( const PADS_SCH::NETNAME_LABEL& nn : parser.GetNetNameLabels() )
+        {
+            if( nn.sheet_number == sheetNum && !nn.anchor_ref.empty() )
+                sheetNetNameLabels[nn.anchor_ref] = nn;
         }
 
         // Create net labels, skipping power nets that get dedicated symbols.
-        schBuilder.CreateNetLabels( sheetSignals, ctx.screen, signalOpcIds, sheetOffPageConnectors,
-                                    powerSignalNames, netNameLabels );
+        schBuilder.CreateNetLabels( sheetSignals, ctx.screen, sheetSignalOpcIds,
+                                    sheetOffPageConnectors, powerSignalNames, sheetNetNameLabels );
 
         // Place off-page connectors: power/ground types become SCH_SYMBOL with
         // KiCad standard power graphics; signal types become SCH_GLOBALLABEL.
@@ -1430,8 +1429,12 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
             VECTOR2I pos( schIUScale.MilsToIU( KiROUND( opc.position.x ) ),
                           pageHeightIU - schIUScale.MilsToIU( KiROUND( opc.position.y ) ) );
 
-            // Resolve power style from the PARTTYPE variant definition
+            // Resolve power style from the PARTTYPE variant definition.  Keep the
+            // source CAEDECAL name as well: when *NETNAMES* has no per-instance
+            // presentation, its REF-DES attribute is the PADS default net-name
+            // presentation for GND/AGND/+V symbols.
             std::string powerStyle;
+            std::string powerDecalName = opc.signal_name;
             auto        opcPtIt = parser.GetPartTypes().find( opc.symbol_lib );
 
             if( opcPtIt != parser.GetPartTypes().end() && !opcPtIt->second.special_keyword.empty()
@@ -1441,13 +1444,14 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                 idx = std::min( idx, static_cast<int>( opcPtIt->second.special_variants.size() ) - 1 );
                 const PADS_SCH::PARTTYPE_DEF::SPECIAL_VARIANT& variant = opcPtIt->second.special_variants[idx];
 
+                powerDecalName = variant.decal_name;
                 powerStyle = PADS_SCH::PADS_SCH_SYMBOL_BUILDER::GetPowerStyleFromVariant( variant.decal_name,
                                                                                           variant.pin_type );
             }
 
             if( !powerStyle.empty() )
             {
-                LIB_SYMBOL* pwrSym = symbolBuilder.BuildKiCadPowerSymbol( powerStyle );
+                LIB_SYMBOL* pwrSym = symbolBuilder.BuildKiCadPowerSymbol( powerStyle, powerDecalName );
 
                 if( pwrSym )
                 {
@@ -1477,12 +1481,20 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                     if( netName.StartsWith( wxT( "/" ) ) )
                         netName = wxT( "~{" ) + netName.Mid( 1 ) + wxT( "}" );
 
-                    symbol->GetField( FIELD_T::VALUE )->SetText( netName );
-                    symbol->GetField( FIELD_T::VALUE )->SetVisible( true );
+                    SCH_FIELD* powerValue = symbol->GetField( FIELD_T::VALUE );
+                    powerValue->SetText( netName );
 
-                    auto nnIt = netNameLabels.find( "@@@O" + std::to_string( opc.id ) );
+                    auto nnIt = sheetNetNameLabels.find( "@@@O" + std::to_string( opc.id ) );
 
-                    if( nnIt != netNameLabels.end() )
+                    // In PADS, Display PG Name is a per-instance choice.  Visible
+                    // power/ground names are emitted in *NETNAMES* even when they use
+                    // the default CAEDECAL position (for example +3V3 at 0,330).
+                    // GND/AGND instances with the name hidden have no NETNAMES record.
+                    // Preserve that distinction instead of making every KiCad power
+                    // Value visible by default.
+                    powerValue->SetVisible( nnIt != sheetNetNameLabels.end() );
+
+                    if( nnIt != sheetNetNameLabels.end() )
                     {
                         const PADS_SCH::NETNAME_LABEL& nn = nnIt->second;
                         SCH_FIELD*                     value = symbol->GetField( FIELD_T::VALUE );
@@ -1511,6 +1523,66 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                         // transform (for example a ground body rotated by 180 degrees).
                         value->SetEffectiveHorizJustify( hJustify );
                         value->SetEffectiveVertJustify( vJustify );
+                    }
+                    else
+                    {
+                        // No *NETNAMES* entry means PADS is using the CAEDECAL default
+                        // net-name presentation.  For the built-in power/ground decals this
+                        // is stored in the REF-DES attribute (for example GND: 100,-50;
+                        // AGND: 260,0; +3V3: 0,330).  CAEDECAL coordinates are local and
+                        // use the opposite Y direction from KiCad, so invert Y first and
+                        // then transform through the placed power symbol.
+                        const PADS_SCH::SYMBOL_DEF* sourceDecal = parser.GetSymbolDef( powerDecalName );
+
+                        if( sourceDecal )
+                        {
+                            const PADS_SCH::CAEDECAL_ATTR* refDes = nullptr;
+
+                            for( const PADS_SCH::CAEDECAL_ATTR& attr : sourceDecal->attrs )
+                            {
+                                if( attr.attr_name == "REF-DES" )
+                                {
+                                    refDes = &attr;
+                                    break;
+                                }
+                            }
+
+                            if( refDes )
+                            {
+                                SCH_FIELD* value = symbol->GetField( FIELD_T::VALUE );
+                                VECTOR2I localOffset( schIUScale.MilsToIU( KiROUND( refDes->position.x ) ),
+                                                      -schIUScale.MilsToIU( KiROUND( refDes->position.y ) ) );
+                                VECTOR2I fieldOffset =
+                                        symbol->GetTransform().TransformCoordinate( localOffset );
+
+                                value->SetPosition( symbol->GetPosition() + fieldOffset );
+                                value->SetCanAutoplace( false );
+
+                                // Reuse the validated System/Default Font scaling used for
+                                // explicit NETNAMES records.  CAEDECAL width is the stroke
+                                // width here, matching NETNAME_LABEL::width_pct semantics.
+                                PADS_SCH::NETNAME_LABEL defaultPresentation;
+                                defaultPresentation.font_name = refDes->font_name;
+                                defaultPresentation.height = refDes->height;
+                                defaultPresentation.width_pct = refDes->width;
+                                applyPadsAsciiPowerNetNamePresentation( *value, defaultPresentation, params );
+
+                                GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
+                                GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+
+                                if( refDes->justification == 4 )
+                                    hJustify = GR_TEXT_H_ALIGN_CENTER;
+                                else
+                                    PADS_COMMON::DecodeJustification( refDes->justification,
+                                                                      hJustify, vJustify );
+
+                                value->SetHorizJustify( hJustify );
+                                value->SetVertJustify( vJustify );
+
+                                if( refDes->angle != 0 )
+                                    value->SetTextAngleDegrees( refDes->angle );
+                            }
+                        }
                     }
 
                     wxString pwrRef = wxString::Format( wxT( "#PWR%04d" ), pwrIndex++ );
