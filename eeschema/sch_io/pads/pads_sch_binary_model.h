@@ -418,13 +418,17 @@ struct MODEL_PIN_DEFINITION
     SOURCE_STRING                name;
     SOURCE_STRING                decalName;
     SOURCE_POINT                 position;
-    uint32_t                     side = 0;
+    uint32_t                     xym = 0;
     int                          angle = 0;
     uint16_t                     presentationFlags = 0;
     uint16_t                     visibilityAndNumberPresentationFlags = 0;
     uint32_t                     electricalType = 0;
     uint32_t                     graphicStyle = 0;
     int64_t                      length = 0;
+    SOURCE_POINT                 pinDecalVector;
+    int64_t                      pinDecalStrokeWidth = 0;
+    MODEL_LINE_STYLE             pinDecalLineStyle = MODEL_LINE_STYLE::DEFAULT;
+    bool                         pinDecalGeometryResolved = false;
     MODEL_TEXT_PRESENTATION      presentation;
     MODEL_TEXT_PRESENTATION      namePresentation;
     MODEL_TEXT_PRESENTATION      numberPresentation;
@@ -664,11 +668,20 @@ struct MODEL_LABEL
     SHEET_REFERENCE              sheet;
     MODEL_LABEL_KIND             kind = MODEL_LABEL_KIND::LOCAL;
     SOURCE_STRING                text;
+    SOURCE_STRING                decalName;
     SOURCE_POINT                 position;
     SOURCE_POINT                 textOffset;
     int                          angle = 0;
     uint8_t                      symbolVariant = 0xFF;
+    bool                         hasNetNamePresentation = false;
     MODEL_TEXT_PRESENTATION      presentation;
+
+    // Default power/ground net-name presentation stored by PADS in the
+    // CAEDECAL REF-DES field.  An instance NETNAMES record overrides it.
+    bool                         hasDefaultPresentation = false;
+    SOURCE_POINT                 defaultTextOffset;
+    int                          defaultAngle = 0;
+    MODEL_TEXT_PRESENTATION      defaultPresentation;
     std::vector<SHEET_REFERENCE> linkedSheets;
     std::vector<SOURCE_PROPERTY> properties;
 

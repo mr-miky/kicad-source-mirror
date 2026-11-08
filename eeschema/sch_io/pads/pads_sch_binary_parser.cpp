@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -497,6 +498,30 @@ namespace
 
         default: return MODEL_JUSTIFICATION::RIGHT; // KiCad BOTTOM mapping
         }
+    }
+
+
+    uint16_t rotatedFieldJustification( uint16_t aValue, int aAngle )
+    {
+        // PADS swaps the side-selector bits for field text rotated by
+        // 90/270 degrees.  This mirrors the ASCII importer behavior.
+        const int quarterTurns = NormalizeAngle( aAngle ) / 900;
+
+        if( ( quarterTurns & 1 ) == 0 )
+            return aValue;
+
+        const uint16_t bit0 = aValue & 0x0001;
+        const uint16_t bit1 = aValue & 0x0002;
+
+        aValue &= static_cast<uint16_t>( ~0x0003 );
+
+        if( bit0 )
+            aValue |= 0x0002;
+
+        if( bit1 )
+            aValue |= 0x0001;
+
+        return aValue;
     }
 
 
@@ -1771,24 +1796,27 @@ namespace
                                              decodeLocalCoordinate( aCursor.U16At( terminalOffset + 12 ) ), pinSource };
                 const uint16_t presentationFlags = aCursor.U16At( terminalOffset + 22 );
                 const uint16_t visibilityFlags = aCursor.U16At( terminalOffset + 24 );
-                const uint16_t side = presentationFlags & 0x0006;
                 definitionPin.presentationFlags = presentationFlags;
                 definitionPin.visibilityAndNumberPresentationFlags = visibilityFlags;
-                definitionPin.side = side / 2;
+
+                // PADS binary stores the same terminal-local X/Y mirror state as
+                // the ASCII T-line xym field, shifted left by one because bit 0
+                // carries the terminal quarter-turn flag.
+                definitionPin.xym = ( presentationFlags & 0x0006 ) >> 1;
 
                 definitionPin.angle = ( presentationFlags & 0x0001 ) != 0 ? 900 : 0;
-                definitionPin.nameAngle = ( presentationFlags & 0x0100 ) != 0 ? 900 : 0;
-                definitionPin.numberAngle = ( visibilityFlags & 0x0001 ) != 0 ? 900 : 0;
+                definitionPin.numberAngle = ( presentationFlags & 0x0100 ) != 0 ? 900 : 0;
+                definitionPin.nameAngle = ( visibilityFlags & 0x0001 ) != 0 ? 900 : 0;
 
-                definitionPin.nameJustification =
-                        terminalJustification( ( presentationFlags >> 12 ) & 0x0F, definitionPin.nameAngle != 0 );
+                definitionPin.numberJustification =
+                        terminalJustification( ( presentationFlags >> 12 ) & 0x0F, definitionPin.numberAngle != 0 );
 
                 if( ( presentationFlags & 0x00F8 ) != 0 )
                     PADS_SCH_BINARY_PARSER::RecordUnknownEnum( wxS( "terminal side" ), presentationFlags, pinSource,
                                                                aModel.diagnostics );
 
-                definitionPin.numberJustification =
-                        terminalJustification( ( visibilityFlags >> 4 ) & 0x0F, definitionPin.numberAngle != 0 );
+                definitionPin.nameJustification =
+                        terminalJustification( ( visibilityFlags >> 4 ) & 0x0F, definitionPin.nameAngle != 0 );
                 const uint16_t nameOffsetFlags = visibilityFlags & 0x0F00;
                 definitionPin.nameOffsetAngle = ( nameOffsetFlags & 0x0100 ) != 0 ? 900 : 0;
                 definitionPin.numberOffsetAngle = ( nameOffsetFlags & 0x0200 ) != 0 ? 900 : 0;
@@ -1850,26 +1878,52 @@ namespace
                     const wxString pinDecalName = pinDecal->name.text;
                     definitionPin.decalName = pinDecal->name;
 
-                    int64_t provenLength = 0;
+                    int64_t      bestDistanceSquared = 0;
+                    SOURCE_POINT bestVector;
+                    int64_t      bestStrokeWidth = 0;
+                    MODEL_LINE_STYLE bestLineStyle = MODEL_LINE_STYLE::DEFAULT;
 
                     for( const MODEL_GRAPHIC& pinGraphic : pinDecal->graphics )
                     {
-                        const bool containsOrigin = std::ranges::any_of( pinGraphic.points,
-                                                                         []( const SOURCE_POINT& aPoint )
-                                                                         {
-                                                                             return aPoint.x == 0 && aPoint.y == 0;
-                                                                         } );
+                        if( pinGraphic.kind != MODEL_GRAPHIC_KIND::LINE
+                            && pinGraphic.kind != MODEL_GRAPHIC_KIND::POLYLINE )
+                        {
+                            continue;
+                        }
+
+                        const bool containsOrigin = std::ranges::any_of(
+                                pinGraphic.points,
+                                []( const SOURCE_POINT& aPoint )
+                                {
+                                    return aPoint.x == 0 && aPoint.y == 0;
+                                } );
 
                         if( !containsOrigin )
                             continue;
 
                         for( const SOURCE_POINT& point : pinGraphic.points )
-                            provenLength =
-                                    std::max( provenLength, std::max( std::abs( point.x ), std::abs( point.y ) ) );
+                        {
+                            const int64_t distanceSquared = point.x * point.x + point.y * point.y;
+
+                            if( distanceSquared > bestDistanceSquared )
+                            {
+                                bestDistanceSquared = distanceSquared;
+                                bestVector = point;
+                                bestStrokeWidth = pinGraphic.strokeWidth;
+                                bestLineStyle = pinGraphic.lineStyle;
+                            }
+                        }
                     }
 
-                    if( provenLength != 0 )
-                        definitionPin.length = provenLength;
+                    if( bestDistanceSquared != 0 )
+                    {
+                        definitionPin.length = static_cast<int64_t>(
+                                std::llround( std::sqrt( static_cast<double>( bestDistanceSquared ) ) ) );
+                        definitionPin.pinDecalVector = bestVector;
+                        definitionPin.pinDecalStrokeWidth = bestStrokeWidth;
+                        definitionPin.pinDecalLineStyle = bestLineStyle;
+                        definitionPin.pinDecalGeometryResolved = true;
+                    }
                     else
                     {
                         SOURCE_PROPERTY lengthProperty =
@@ -1897,7 +1951,8 @@ namespace
                         wxS( "pin_number_width_half_mils" ),
                         wxString::Format( wxS( "%lld" ), definitionPin.numberPresentation.width ), pinSource ) );
                 definitionPin.properties.push_back(
-                        sourceProperty( wxS( "terminal_side" ), wxString::Format( wxS( "%u" ), side ), pinSource ) );
+                        sourceProperty( wxS( "terminal_xym" ),
+                                        wxString::Format( wxS( "%u" ), definitionPin.xym ), pinSource ) );
                 decal.definition->pins.push_back( std::move( definitionPin ) );
             }
         }
@@ -2843,7 +2898,8 @@ namespace
                 static_cast<int64_t>( aDecode.cursor.U16At( aOffset + aFieldLayout.height ) ) * 2;
         field.presentation.width =
                 static_cast<int64_t>( aDecode.cursor.U8At( aOffset + aFieldLayout.width ) ) * 2;
-        const uint16_t justification = aDecode.cursor.U16At( aOffset + aFieldLayout.angle + 2 );
+        const uint16_t justification = rotatedFieldJustification(
+                aDecode.cursor.U16At( aOffset + aFieldLayout.angle + 2 ), field.angle );
         field.presentation.horizontalJustification = horizontalJustification( justification );
         field.presentation.verticalJustification = verticalJustification( justification );
         SOURCE_PROVENANCE fontSource = fieldSource;
@@ -2909,7 +2965,8 @@ namespace
             if( field.angle % 900 != 0 )
                 throwDecodeError( fieldSource, wxS( "unsupported placement-field rotation" ) );
 
-            const uint8_t justification = aDecode.cursor.U8At( fieldOffset + aDecode.layout.customJustification );
+            const uint16_t justification = rotatedFieldJustification(
+                    aDecode.cursor.U8At( fieldOffset + aDecode.layout.customJustification ), field.angle );
             field.presentation.source = fieldSource;
             field.presentation.horizontalJustification = horizontalJustification( justification );
             field.presentation.verticalJustification = verticalJustification( justification );
@@ -3938,6 +3995,7 @@ namespace
                                       static_cast<int>( aDecode.sheetIndex ) );
                     SOURCE_STRING  decalName = decodeFixedString( aDecode.bytes, decalSource.absoluteOffset,
                                                                   decalSource.length, decalSource, aModel.diagnostics );
+                    label.decalName = decalName;
                     const uint32_t definitionRecord = aDecode.cursor.U32At( decalSource.absoluteOffset + 48 );
 
                     if( definitionRecord >= aDecode.controllers.pools[2].count )
@@ -3945,6 +4003,27 @@ namespace
 
                     const DEFINITION_ID definitionId(
                             static_cast<uint32_t>( aDecode.sheetIndex * 0x100000 + 1 + definitionRecord ) );
+
+                    // Preserve the CAEDECAL's default power/ground name anchor.
+                    // PADS stores this in REF-DES even though KiCad represents
+                    // the displayed net name as the symbol Value.
+                    auto definition = std::ranges::find(
+                            aModel.definitions, definitionId, &MODEL_SYMBOL_DEFINITION::id );
+
+                    if( definition == aModel.definitions.end() )
+                        throwDecodeError( decalSource, wxS( "off-page decal definition is unresolved" ) );
+
+                    for( const MODEL_FIELD& field : definition->fields )
+                    {
+                        if( field.name.text.CmpNoCase( wxS( "REF-DES" ) ) != 0 )
+                            continue;
+
+                        label.hasDefaultPresentation = true;
+                        label.defaultTextOffset = field.position;
+                        label.defaultAngle = field.angle;
+                        label.defaultPresentation = field.presentation;
+                        break;
+                    }
                     auto specialPartOwnsDefinition = [&]( const wxString& aPartName )
                     {
                         return std::ranges::any_of(
@@ -4012,6 +4091,11 @@ namespace
                 }
             }
 
+            // PADS only displays a power/ground net name when a NETNAMES
+            // presentation record exists for that instance.
+            if( label.kind == MODEL_LABEL_KIND::GROUND || label.kind == MODEL_LABEL_KIND::POWER )
+                label.presentation.visible = false;
+
             label.properties.push_back(
                     sourceProperty( wxS( "offpage_variant" ), wxString::Format( wxS( "%u" ), rawKind ), source ) );
             aModel.labels.push_back( std::move( label ) );
@@ -4024,8 +4108,10 @@ namespace
     {
         MODEL_TEXT_PRESENTATION presentation;
         presentation.source = aSource;
-        presentation.height = aDecode.cursor.U16At( aOffset + 2 );
-        presentation.width = aDecode.cursor.U16At( aOffset + 4 );
+        // NETNAMES stores height/line-width in whole mils.  The semantic
+        // binary model stores text metrics in half-mils.
+        presentation.height = static_cast<int64_t>( aDecode.cursor.U16At( aOffset + 2 ) ) * 2;
+        presentation.width = static_cast<int64_t>( aDecode.cursor.U16At( aOffset + 4 ) ) * 2;
         presentation.horizontalJustification = horizontalJustification( aDecode.cursor.U16At( aOffset + 26 ) );
         presentation.verticalJustification = verticalJustification( aDecode.cursor.U16At( aOffset + 26 ) );
         const int16_t     fontHandle = static_cast<int16_t>( aDecode.cursor.U16At( aOffset ) );
@@ -4207,6 +4293,8 @@ namespace
 
                 label->presentation = std::move( presentation );
                 label->textOffset = textOffset;
+                label->angle = NormalizeAngle( aDecode.cursor.U16At( offset + 24 ) );
+                label->hasNetNamePresentation = true;
                 label->properties.push_back(
                         sourceProperty( wxS( "net_name_text_offset" ),
                                         wxString::Format( wxS( "%lld,%lld" ), textOffset.x, textOffset.y ), source ) );
@@ -4371,7 +4459,12 @@ namespace
             std::ranges::for_each( placement.fields, applyField );
 
         for( MODEL_LABEL& label : aModel.labels )
+        {
             inheritDefaultSystemFont( label.presentation, settings );
+
+            if( label.hasDefaultPresentation )
+                inheritDefaultSystemFont( label.defaultPresentation, settings );
+        }
 
         for( MODEL_TEXT& text : aModel.texts )
             inheritDefaultSystemFont( text.presentation, settings );

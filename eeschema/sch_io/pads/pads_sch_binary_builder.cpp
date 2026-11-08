@@ -11,6 +11,7 @@
 
 #include <sch_io/pads/pads_sch_binary_builder.h>
 
+
 #include <bitmap_base.h>
 #include <lib_id.h>
 #include <lib_symbol.h>
@@ -36,6 +37,7 @@
 #include <schematic.h>
 #include <schematic_settings.h>
 #include <io/pads/pads_attribute_mapper.h>
+#include <io/pads/pads_common.h>
 #include <sch_io/ole_image.h>
 #include <sch_io/pads/pads_sch_symbol_builder.h>
 #include <stroke_params.h>
@@ -246,21 +248,56 @@ namespace
     }
 
 
+    SOURCE_POINT transformPadsTerminalVector( const SOURCE_POINT& aVector, int aAngle, uint32_t aXym )
+    {
+        const double radians = static_cast<double>( aAngle ) * M_PI / 1800.0;
+        const double c = std::cos( radians );
+        const double s = std::sin( radians );
+
+        SOURCE_POINT result = aVector;
+        result.x = std::llround( static_cast<double>( aVector.x ) * c
+                                 - static_cast<double>( aVector.y ) * s );
+        result.y = std::llround( static_cast<double>( aVector.x ) * s
+                                 + static_cast<double>( aVector.y ) * c );
+
+        if( aXym & 0x1 )
+            result.x = -result.x;
+
+        if( aXym & 0x2 )
+            result.y = -result.y;
+
+        return result;
+    }
+
+
+    SOURCE_POINT padsTerminalStemVector( const MODEL_PIN_DEFINITION& aPin )
+    {
+        if( aPin.pinDecalGeometryResolved )
+            return transformPadsTerminalVector( aPin.pinDecalVector, aPin.angle, aPin.xym );
+
+        // Compatibility fallback for malformed/incomplete libraries.  Normal
+        // imports use the resolved pin-decal geometry above.
+        SOURCE_POINT fallback;
+
+        if( aPin.decalName.text.Contains( wxS( "VRT" ) ) )
+            fallback.y = -aPin.length;
+        else
+            fallback.x = aPin.length;
+
+        return transformPadsTerminalVector( fallback, aPin.angle, aPin.xym );
+    }
+
+
     PIN_ORIENTATION pinOrientation( const MODEL_PIN_DEFINITION& aPin )
     {
-        const int  angle = NormalizeAngle( aPin.angle );
-        const bool verticalDecal = aPin.decalName.text.Contains( wxS( "VRT" ) );
+        const SOURCE_POINT stemVector = padsTerminalStemVector( aPin );
+        const int64_t      kicadDx = stemVector.x;
+        const int64_t      kicadDy = -stemVector.y; // PADS Y-up -> KiCad Y-down
 
-        if( verticalDecal )
-            return aPin.side == 2 ? PIN_ORIENTATION::PIN_UP : PIN_ORIENTATION::PIN_DOWN;
+        if( std::abs( kicadDx ) >= std::abs( kicadDy ) )
+            return kicadDx >= 0 ? PIN_ORIENTATION::PIN_RIGHT : PIN_ORIENTATION::PIN_LEFT;
 
-        switch( angle )
-        {
-        case 900: return aPin.side >= 2 ? PIN_ORIENTATION::PIN_DOWN : PIN_ORIENTATION::PIN_UP;
-        case 1800: return ( aPin.side & 1 ) != 0 ? PIN_ORIENTATION::PIN_RIGHT : PIN_ORIENTATION::PIN_LEFT;
-        case 2700: return aPin.side >= 2 ? PIN_ORIENTATION::PIN_UP : PIN_ORIENTATION::PIN_DOWN;
-        default: return ( aPin.side & 1 ) != 0 ? PIN_ORIENTATION::PIN_LEFT : PIN_ORIENTATION::PIN_RIGHT;
-        }
+        return kicadDy >= 0 ? PIN_ORIENTATION::PIN_DOWN : PIN_ORIENTATION::PIN_UP;
     }
 
 
@@ -314,8 +351,9 @@ namespace
     }
 
 
-    constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.75;
-    constexpr double PADS_SYMBOL_LABEL_TEXT_HEIGHT_CORRECTION = 0.8075;
+    constexpr double PADS_SYSTEM_TEXT_HEIGHT_CORRECTION = 0.5885217956;
+// Calibrated from a PADS Verdana field authored at 97 mil: 1.45 mm in KiCad matches the PADS visual size.
+// 1.45 mm / ( 97 mil * 0.0254 mm/mil ) = 0.5885217956.
 
 
     int64_t padsVisualTextHeight(
@@ -557,6 +595,23 @@ namespace
     }
 
 
+    std::string padsPowerDecalName( const MODEL_LABEL& aLabel )
+    {
+        if( !aLabel.decalName.text.IsEmpty() )
+            return aLabel.decalName.text.ToStdString();
+
+        return aLabel.text.text.ToStdString();
+    }
+
+
+    std::string padsPowerStyle( const MODEL_LABEL& aLabel )
+    {
+        return PADS_SCH::PADS_SCH_SYMBOL_BUILDER::GetPowerStyleFromVariant(
+                padsPowerDecalName( aLabel ),
+                aLabel.kind == MODEL_LABEL_KIND::GROUND ? "G" : "P" );
+    }
+
+
     std::unique_ptr<LIB_SYMBOL> makePadsPowerLibrary( const MODEL_LABEL& aLabel )
     {
         wxString name;
@@ -568,112 +623,60 @@ namespace
         else
             name = wxString::Format( wxS( "PADS_POWER_%u" ), aLabel.symbolVariant );
 
-        auto symbol = std::make_unique<LIB_SYMBOL>( name );
-        symbol->SetGlobalPower();
-        symbol->SetShowPinNumbers( false );
-        symbol->SetShowPinNames( false );
+        const std::string style = padsPowerStyle( aLabel );
 
-        auto mil = []( int aMils )
-        {
-            return schIUScale.MilsToIU( aMils );
-        };
-        auto addLine = [&]( std::initializer_list<VECTOR2I> aPoints )
-        {
-            auto line = std::make_unique<SCH_SHAPE>( SHAPE_T::POLY, LAYER_DEVICE );
+        if( style.empty() )
+            return nullptr;
 
-            for( const VECTOR2I& point : aPoints )
-                line->AddPoint( point );
+        PADS_SCH::PARAMETERS params;
+        PADS_SCH::PADS_SCH_SYMBOL_BUILDER symbolBuilder( params );
+        std::unique_ptr<LIB_SYMBOL> symbol(
+                symbolBuilder.BuildKiCadPowerSymbol( style, padsPowerDecalName( aLabel ) ) );
 
-            line->SetStroke( STROKE_PARAMS( mil( 10 ), LINE_STYLE::SOLID ) );
-            symbol->AddDrawItem( line.release() );
-        };
-        auto addTriangle = [&]( int aStemLength )
-        {
-            addLine( { { 0, 0 }, { 0, mil( aStemLength ) } } );
-            auto triangle = std::make_unique<SCH_SHAPE>( SHAPE_T::POLY, LAYER_DEVICE );
-            triangle->AddPoint( { 0, mil( aStemLength ) } );
-            triangle->AddPoint( { -mil( 50 ), mil( 100 ) } );
-            triangle->AddPoint( { mil( 50 ), mil( 100 ) } );
-            triangle->AddPoint( { 0, mil( aStemLength ) } );
-            triangle->SetStroke( STROKE_PARAMS( mil( 10 ), LINE_STYLE::SOLID ) );
-            triangle->SetFillMode( FILL_T::FILLED_SHAPE );
-            symbol->AddDrawItem( triangle.release() );
-        };
+        if( !symbol )
+            return nullptr;
 
-        if( aLabel.kind == MODEL_LABEL_KIND::GROUND )
-        {
-            switch( aLabel.symbolVariant )
-            {
-            case 1:
-                addLine( { { 0, 0 },
-                           { 0, -mil( 50 ) },
-                           { -mil( 100 ), -mil( 50 ) },
-                           { 0, -mil( 200 ) },
-                           { mil( 100 ), -mil( 50 ) },
-                           { 0, -mil( 50 ) } } );
-                break;
-
-            case 2:
-                addLine( { { 0, 0 }, { 0, -mil( 100 ) } } );
-                addLine( { { -mil( 100 ), -mil( 100 ) }, { mil( 100 ), -mil( 100 ) } } );
-                addLine( { { -mil( 100 ), -mil( 100 ) }, { -mil( 150 ), -mil( 200 ) } } );
-                addLine( { { 0, -mil( 100 ) }, { -mil( 50 ), -mil( 200 ) } } );
-                addLine( { { mil( 100 ), -mil( 100 ) }, { mil( 50 ), -mil( 200 ) } } );
-                break;
-
-            default:
-                addLine( { { 0, 0 }, { 0, -mil( 100 ) } } );
-                addLine( { { -mil( 100 ), -mil( 100 ) }, { mil( 100 ), -mil( 100 ) } } );
-                addLine( { { -mil( 60 ), -mil( 150 ) }, { mil( 60 ), -mil( 150 ) } } );
-                addLine( { { -mil( 20 ), -mil( 200 ) }, { mil( 20 ), -mil( 200 ) } } );
-                break;
-            }
-        }
-        else if( aLabel.symbolVariant == 1 || aLabel.symbolVariant == 3 )
-        {
-            addTriangle( 250 );
-        }
-        else if( aLabel.symbolVariant == 4 )
-        {
-            addTriangle( 200 );
-        }
-        else
-        {
-            addLine( { { 0, 0 }, { 0, mil( 100 ) } } );
-            auto circle = std::make_unique<SCH_SHAPE>( SHAPE_T::CIRCLE, LAYER_DEVICE );
-            circle->SetCenter( { 0, mil( 150 ) } );
-            circle->SetEnd( { mil( 50 ), mil( 150 ) } );
-            circle->SetStroke( STROKE_PARAMS( mil( 10 ), LINE_STYLE::SOLID ) );
-            circle->SetFillMode( FILL_T::NO_FILL );
-            symbol->AddDrawItem( circle.release() );
-        }
-
-        auto pin = std::make_unique<SCH_PIN>( symbol.get() );
-        pin->SetNumber( wxS( "1" ) );
-        pin->SetName( name );
-        pin->SetType( ELECTRICAL_PINTYPE::PT_POWER_IN );
-        pin->SetVisible( false );
-        pin->SetLength( 0 );
-        pin->SetPosition( { 0, 0 } );
-        pin->SetOrientation( aLabel.kind == MODEL_LABEL_KIND::GROUND ? PIN_ORIENTATION::PIN_DOWN
-                                                                     : PIN_ORIENTATION::PIN_UP );
-        symbol->AddDrawItem( pin.release() );
-        symbol->GetReferenceField().SetText( wxS( "#PWR" ) );
-        symbol->GetReferenceField().SetVisible( false );
+        // Keep the binary import's private library identifier stable.
+        symbol->SetName( name );
         return symbol;
+    }
+
+
+    int padsPowerOrientation( const MODEL_LABEL& aLabel,
+                              const SOURCE_POINT* aAdjacentWirePoint, bool aPinUp )
+    {
+        if( !aAdjacentWirePoint )
+            return SYM_ORIENT_0;
+
+        const int64_t dx = aAdjacentWirePoint->x - aLabel.position.x;
+        const int64_t dy = -( aAdjacentWirePoint->y - aLabel.position.y ); // PADS Y-up -> KiCad Y-down
+
+        if( dx == 0 && dy == 0 )
+            return SYM_ORIENT_0;
+
+        if( std::abs( dx ) >= std::abs( dy ) )
+        {
+            if( dx > 0 )
+                return aPinUp ? SYM_ORIENT_90 : SYM_ORIENT_270;
+
+            return aPinUp ? SYM_ORIENT_270 : SYM_ORIENT_90;
+        }
+
+        if( dy > 0 )
+            return aPinUp ? SYM_ORIENT_0 : SYM_ORIENT_180;
+
+        return aPinUp ? SYM_ORIENT_180 : SYM_ORIENT_0;
     }
 
 
     std::unique_ptr<SCH_SYMBOL> makePowerSymbol( const MODEL_LABEL& aLabel, const SCH_SHEET_PATH& aPath,
                                                  int aPageHeight, int aOrdinal,
+                                                 const SOURCE_POINT* aAdjacentWirePoint,
                                                  std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
-        int orientation = SYM_ORIENT_180;
-
-        if( aLabel.kind == MODEL_LABEL_KIND::POWER && ( aLabel.symbolVariant == 2 || aLabel.symbolVariant == 3 ) )
-        {
-            orientation = SYM_ORIENT_0;
-        }
+        const std::string powerStyle = padsPowerStyle( aLabel );
+        const bool pinUp = powerStyle == "VCC" || powerStyle == "PWR_TRIANGLE";
+        const int orientation = padsPowerOrientation( aLabel, aAdjacentWirePoint, pinUp );
 
         std::unique_ptr<LIB_SYMBOL> library = makePadsPowerLibrary( aLabel );
 
@@ -700,15 +703,29 @@ namespace
         {
             value->SetText( aLabel.text.text );
 
-            // PADS stores the label offset in local symbol coordinates.  Transform it
-            // through the generated power symbol so ground and rotated power variants
-            // keep the authored text position.
-            VECTOR2I textOffset =
-                    symbol->GetTransform().TransformCoordinate( localPoint( aLabel.textOffset ) );
-            value->SetPosition( symbol->GetPosition() + textOffset );
-            value->SetTextAngle( EDA_ANGLE( aLabel.angle, TENTHS_OF_A_DEGREE_T ) );
-            applyTextPresentation( value, aLabel.presentation, aLabel.presentation.visible,
-                                   aDiagnostics, PADS_SYMBOL_LABEL_TEXT_HEIGHT_CORRECTION );
+            if( aLabel.hasNetNamePresentation )
+            {
+                // NETNAMES offsets are authored in page coordinates.
+                value->SetPosition( symbol->GetPosition() + localPoint( aLabel.textOffset ) );
+                value->SetTextAngle( EDA_ANGLE( aLabel.angle, TENTHS_OF_A_DEGREE_T ) );
+                applyTextPresentation( value, aLabel.presentation,
+                                       aLabel.presentation.visible, aDiagnostics );
+            }
+            else if( aLabel.hasDefaultPresentation )
+            {
+                // CAEDECAL REF-DES is local to the power/ground symbol.
+                VECTOR2I textOffset = symbol->GetTransform().TransformCoordinate(
+                        localPoint( aLabel.defaultTextOffset ) );
+                value->SetPosition( symbol->GetPosition() + textOffset );
+                value->SetTextAngle( EDA_ANGLE( aLabel.defaultAngle, TENTHS_OF_A_DEGREE_T ) );
+                applyTextPresentation( value, aLabel.defaultPresentation,
+                                       aLabel.presentation.visible, aDiagnostics );
+            }
+            else
+            {
+                applyTextPresentation( value, aLabel.presentation,
+                                       aLabel.presentation.visible, aDiagnostics );
+            }
         }
 
         return symbol;
@@ -752,10 +769,10 @@ namespace
         const double widthRatio = static_cast<double>( sourceExtents.x ) / pinExtents.x;
         const double heightRatio = static_cast<double>( sourceExtents.y ) / pinExtents.y;
 
-        // PADS' declared system-font height is a character-cell measure.  A controlled
-        // 97 mil Verdana fixture renders correctly in KiCad at about 80.75% of the
-        // metric-only fit (2.2266/2.2325 mm -> approximately 1.8 mm).
-        constexpr double PADS_PIN_TEXT_HEIGHT_CORRECTION = 0.8075;
+        // PADS system-font height is a character-cell measure.  Use the same
+        // visual-height calibration validated for symbol REF/VALUE fields:
+        // 97 mil PADS -> about 1.45 mm in KiCad.
+        constexpr double PADS_PIN_TEXT_HEIGHT_CORRECTION = 0.5885217956;
         const double fitted = static_cast<double>( nominalSize )
                               * std::min( widthRatio, heightRatio )
                               * PADS_PIN_TEXT_HEIGHT_CORRECTION;
@@ -770,7 +787,13 @@ namespace
         pin->SetName( aPin.name.text );
         pin->SetPosition( localPoint( aPin.position ) );
         pin->SetOrientation( pinOrientation( aPin ) );
-        pin->SetLength( toIU( aPin.length ) );
+
+        int pinLength = toIU( aPin.length );
+
+        if( aPin.decalName.text == wxS( "PINB" ) )
+            pinLength += schIUScale.MilsToIU( 50 );
+
+        pin->SetLength( pinLength );
         pin->SetType( pinType( aPin.electricalType ) );
         pin->SetShape( pinShape( aPin.graphicStyle ) );
         pin->SetVisible( aPin.presentation.visible );
@@ -782,6 +805,120 @@ namespace
                                                   aPin.numberPresentation ) );
 
         return pin;
+    }
+
+
+    void addPinStem( const MODEL_PIN_DEFINITION& aPin, LIB_SYMBOL* aParent, int aUnit )
+    {
+        if( !aPin.pinDecalGeometryResolved )
+            return;
+
+        const SOURCE_POINT stemVector = padsTerminalStemVector( aPin );
+        const VECTOR2I     start = localPoint( aPin.position );
+        const VECTOR2I     delta( toIU( stemVector.x ), -toIU( stemVector.y ) );
+
+        if( delta.x == 0 && delta.y == 0 )
+            return;
+
+        auto stem = std::make_unique<SCH_SHAPE>( SHAPE_T::POLY, LAYER_DEVICE );
+        stem->AddPoint( start );
+        stem->AddPoint( start + delta );
+        stem->SetStroke( STROKE_PARAMS( toIU( aPin.pinDecalStrokeWidth ),
+                                        lineStyle( aPin.pinDecalLineStyle ) ) );
+        stem->SetUnit( aUnit );
+        aParent->AddDrawItem( stem.release() );
+    }
+
+    struct PADS_PIN_NAME_CANDIDATE
+    {
+        const MODEL_PIN_DEFINITION* pin = nullptr;
+        wxString                    text;
+        int                         unit = 0;
+    };
+
+
+    VECTOR2I padsTerminalNameOffset( const MODEL_PIN_DEFINITION& aPin )
+    {
+        const double radians = static_cast<double>( aPin.angle ) * M_PI / 1800.0;
+        const double c = std::cos( radians );
+        const double s = std::sin( radians );
+
+        double x = static_cast<double>( aPin.nameOffset.x ) * c
+                   - static_cast<double>( aPin.nameOffset.y ) * s;
+        double y = static_cast<double>( aPin.nameOffset.x ) * s
+                   + static_cast<double>( aPin.nameOffset.y ) * c;
+
+        if( ( aPin.presentationFlags & 0x0002 ) != 0 )
+            x = -x;
+
+        if( ( aPin.presentationFlags & 0x0004 ) != 0 )
+            y = -y;
+
+        return { toIU( static_cast<int64_t>( std::llround( x ) ) ),
+                 -toIU( static_cast<int64_t>( std::llround( y ) ) ) };
+    }
+
+
+    std::unique_ptr<SCH_TEXT> makePadsPinNameText(
+            const PADS_PIN_NAME_CANDIDATE& aCandidate,
+            std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
+    {
+        const MODEL_PIN_DEFINITION& pin = *aCandidate.pin;
+
+        auto text = std::make_unique<SCH_TEXT>(
+                localPoint( pin.position ) + padsTerminalNameOffset( pin ),
+                aCandidate.text, LAYER_DEVICE );
+
+        text->SetUnit( aCandidate.unit );
+        text->SetTextAngle( EDA_ANGLE( pin.nameAngle, TENTHS_OF_A_DEGREE_T ) );
+
+        const int textSize =
+                fittedPinTextSize( PADS_PIN_NAME_CALIBRATION, pin.namePresentation );
+
+        if( textSize > 0 )
+            text->SetTextSize( { textSize, textSize } );
+
+        if( pin.namePresentation.width > 0 )
+            text->SetTextThickness( toIU( pin.namePresentation.width ) );
+
+        text->SetBold( pin.namePresentation.bold );
+        text->SetItalic( pin.namePresentation.italic );
+
+        GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
+        GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+
+        PADS_COMMON::DecodeNineWayJustification(
+                pin.nameJustification, hJustify, vJustify );
+
+        if( ( pin.presentationFlags & 0x0002 ) != 0 )
+        {
+            if( hJustify == GR_TEXT_H_ALIGN_LEFT )
+                hJustify = GR_TEXT_H_ALIGN_RIGHT;
+            else if( hJustify == GR_TEXT_H_ALIGN_RIGHT )
+                hJustify = GR_TEXT_H_ALIGN_LEFT;
+        }
+
+        if( ( pin.presentationFlags & 0x0004 ) != 0 )
+        {
+            if( vJustify == GR_TEXT_V_ALIGN_TOP )
+                vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+            else if( vJustify == GR_TEXT_V_ALIGN_BOTTOM )
+                vJustify = GR_TEXT_V_ALIGN_TOP;
+        }
+
+        text->SetHorizJustify( hJustify );
+        text->SetVertJustify( vJustify );
+
+        if( pin.namePresentation.underline )
+        {
+            aDiagnostics.push_back(
+                    MakePropertyDiagnostic(
+                            RPT_SEVERITY_WARNING, pin.namePresentation.source,
+                            wxS( "underline" ), PROPERTY_DISPOSITION::UNSUPPORTED,
+                            wxS( "PADS pin-name underline is unsupported" ) ) );
+        }
+
+        return text;
     }
 
 
@@ -928,11 +1065,16 @@ namespace
     }
 
 
-    void addDefinitionUnit( const MODEL_INDEX& aIndex, LIB_SYMBOL* aLibrary,
-                            const MODEL_SYMBOL_DEFINITION& aDefinition, const MODEL_GATE* aGate,
-                            int aUnit, std::vector<PARSER_DIAGNOSTIC>& aDiagnostics,
-                            const std::vector<PLACED_PIN_REFERENCE>* aPlacementPins = nullptr,
-                            const MODEL_CONNECTOR_PIN*               aConnectorPin = nullptr )
+    void addDefinitionUnit(
+            const MODEL_INDEX& aIndex,
+            LIB_SYMBOL* aLibrary,
+            const MODEL_SYMBOL_DEFINITION& aDefinition,
+            const MODEL_GATE* aGate,
+            int aUnit,
+            std::vector<PARSER_DIAGNOSTIC>& aDiagnostics,
+            std::vector<PADS_PIN_NAME_CANDIDATE>& aPinNameCandidates,
+            const std::vector<PLACED_PIN_REFERENCE>* aPlacementPins = nullptr,
+            const MODEL_CONNECTOR_PIN* aConnectorPin = nullptr )
     {
         for( const MODEL_GRAPHIC& graphic : aDefinition.graphics )
         {
@@ -952,22 +1094,31 @@ namespace
 
         auto addPin = [&]( const PIN_REFERENCE& aPinReference, size_t aPinOrdinal )
         {
-            std::unique_ptr<SCH_PIN> pin = makePin( pinById( aIndex, aDefinition, aPinReference.id ), aLibrary );
+            const MODEL_PIN_DEFINITION& sourcePin =
+                    pinById( aIndex, aDefinition, aPinReference.id );
+
+            std::unique_ptr<SCH_PIN> pin = makePin( sourcePin, aLibrary );
+            wxString                 displayName = sourcePin.name.text;
 
             if( aGate && aPinOrdinal < aGate->logicalPins.size() )
             {
                 const MODEL_GATE_PIN& logicalPin = aGate->logicalPins[aPinOrdinal];
                 pin->SetNumber( logicalPin.number.text );
-                pin->SetName( logicalPin.name.text );
+                displayName = logicalPin.name.text;
+                pin->SetName( displayName );
                 pin->SetType( pinType( logicalPin.electricalType ) );
             }
 
             if( aConnectorPin )
             {
                 pin->SetNumber( aConnectorPin->number.text );
-                pin->SetName( aConnectorPin->name.text );
+                displayName = aConnectorPin->name.text;
+                pin->SetName( displayName );
                 pin->SetType( pinType( aConnectorPin->electricalType ) );
             }
+
+            if( !displayName.IsEmpty() && sourcePin.namePresentation.visible )
+                aPinNameCandidates.push_back( { &sourcePin, displayName, aUnit } );
 
             pin->SetUnit( aUnit );
             aLibrary->AddDrawItem( pin.release() );
@@ -998,6 +1149,7 @@ namespace
 
                 pin->SetUnit( aUnit );
                 aLibrary->AddDrawItem( pin.release() );
+                addPinStem( sourcePin, aLibrary, aUnit );
             }
         }
     }
@@ -1011,6 +1163,7 @@ namespace
         wxString               libraryName = part.name.text;
         auto                   library = std::make_unique<LIB_SYMBOL>( libraryName );
         const MODEL_GATE*      connectorGate = nullptr;
+        std::vector<PADS_PIN_NAME_CANDIDATE> pinNameCandidates;
 
         for( const MODEL_GATE& gate : part.gates )
         {
@@ -1036,8 +1189,15 @@ namespace
             for( size_t index = 0; index < connectorGate->connectorPins.size(); ++index )
             {
                 const MODEL_CONNECTOR_PIN& connectorPin = connectorGate->connectorPins[index];
-                addDefinitionUnit( aIndex, library.get(), definition, connectorGate, static_cast<int>( index + 1 ),
-                                   aDiagnostics, &aPlacement.pins, &connectorPin );
+                addDefinitionUnit(aIndex,
+                        library.get(),
+                        definition,
+                        connectorGate,
+                        static_cast<int>( index + 1 ),
+                        aDiagnostics,
+                        pinNameCandidates,
+                        &aPlacement.pins,
+                        &connectorPin);
 
                 if( aPlacement.reference.text.EndsWith( wxS( "-" ) + connectorPin.number.text ) )
                     aUnit = static_cast<int>( index + 1 );
@@ -1059,15 +1219,28 @@ namespace
                 const MODEL_SYMBOL_DEFINITION&           definition = definitionById( aIndex, definitionId );
                 const std::vector<PLACED_PIN_REFERENCE>* placementPins =
                         gate.unit == aPlacement.unit ? &aPlacement.pins : nullptr;
-                addDefinitionUnit( aIndex, library.get(), definition, &gate, static_cast<int>( gate.unit ),
-                                   aDiagnostics, placementPins );
+                addDefinitionUnit(aIndex,
+                        library.get(),
+                        definition,
+                        &gate,
+                        static_cast<int>( gate.unit ),
+                        aDiagnostics,
+                        pinNameCandidates,
+                        placementPins);
             }
         }
         else
         {
             const MODEL_SYMBOL_DEFINITION& definition = definitionById( aIndex, aPlacement.definition.id );
             const MODEL_GATE*              gate = part.gates.empty() ? nullptr : &part.gates.front();
-            addDefinitionUnit( aIndex, library.get(), definition, gate, 0, aDiagnostics, &aPlacement.pins );
+            addDefinitionUnit(aIndex,
+                    library.get(),
+                    definition,
+                    gate,
+                    0,
+                    aDiagnostics,
+                    pinNameCandidates,
+                    &aPlacement.pins);
         }
 
         for( const MODEL_SIGNAL_PIN& signalPin : part.signalPins )
@@ -1081,7 +1254,30 @@ namespace
             library->AddDrawItem( pin.release() );
         }
 
-        library->SetShowPinNames( aPlacement.pinNamesVisible );
+        // KiCad native pin names cannot reproduce arbitrary PADS per-pin
+        // offsets. Use explicit SCH_TEXT only when every named/visible pin uses
+        // a vertical pin decal. This covers DIO-V (D6 K/A1/A2) conservatively.
+        const bool usePadsPinNamePlacement =
+                !pinNameCandidates.empty()
+                && std::ranges::all_of(
+                        pinNameCandidates,
+                        []( const PADS_PIN_NAME_CANDIDATE& aCandidate )
+                        {
+                            return aCandidate.pin
+                                   && aCandidate.pin->decalName.text.Contains( wxS( "VRT" ) );
+                        } );
+
+        if( usePadsPinNamePlacement )
+        {
+            for( const PADS_PIN_NAME_CANDIDATE& candidate : pinNameCandidates )
+            {
+                std::unique_ptr<SCH_TEXT> pinName =
+                        makePadsPinNameText( candidate, aDiagnostics );
+                library->AddDrawItem( pinName.release() );
+            }
+        }
+
+        library->SetShowPinNames( aPlacement.pinNamesVisible && !usePadsPinNamePlacement );
         library->SetShowPinNumbers( aPlacement.pinNumbersVisible );
         return library;
     }
@@ -2122,6 +2318,16 @@ namespace
         {
             const MODEL_LABEL& label = *labelPointer;
 
+            const SOURCE_POINT* adjacentWirePoint = nullptr;
+            auto adjacency = aIndex.endpointAdjacencyBySheet.find(
+                    { aSourceSheet.id.Value(), label.position.x, label.position.y } );
+
+            if( adjacency != aIndex.endpointAdjacencyBySheet.end()
+                && !adjacency->second.empty() )
+            {
+                adjacentWirePoint = &adjacency->second.front();
+            }
+
             std::unique_ptr<SCH_ITEM> item;
 
             switch( label.kind )
@@ -2142,7 +2348,7 @@ namespace
             case MODEL_LABEL_KIND::GROUND:
             case MODEL_LABEL_KIND::POWER:
                 item = makePowerSymbol( label, aPath, pageHeight, aStaged.nextPowerOrdinal++,
-                                        aStaged.result.diagnostics );
+                                        adjacentWirePoint, aStaged.result.diagnostics );
                 ++aStaged.result.counts.symbols;
                 break;
 
@@ -2179,14 +2385,38 @@ namespace
                 // must run last because applyTextPresentation() changes angle/alignment.
                 if( auto* globalLabel = dynamic_cast<SCH_GLOBALLABEL*>( text ) )
                 {
-                    const SOURCE_POINT* adjacentWirePoint = nullptr;
-                    auto adjacency = aIndex.endpointAdjacencyBySheet.find(
-                            { aSourceSheet.id.Value(), label.position.x, label.position.y } );
-
-                    if( adjacency != aIndex.endpointAdjacencyBySheet.end()
-                        && !adjacency->second.empty() )
+                    // PADS binary off-page measured body-fit scaling.
+                    // PADS REFIN/REFOUT has a 100 mil external body height.  Measure the
+                    // actual KiCad SCH_GLOBALLABEL body, including outline stroke, and fit
+                    // the text size so that the external body thickness matches PADS.
                     {
-                        adjacentWirePoint = &adjacency->second.front();
+                        const int targetBody = schIUScale.MilsToIU( 100.0 );
+                        int low = 1;
+                        int high = targetBody;
+                        int best = low;
+
+                        while( low <= high )
+                        {
+                            const int candidate = low + ( high - low ) / 2;
+                            globalLabel->SetTextSize( VECTOR2I( candidate, candidate ) );
+
+                            const BOX2I body = globalLabel->GetBodyBoundingBox( nullptr );
+                            const bool horizontal = globalLabel->GetSpinStyle() == SPIN_STYLE::LEFT
+                                                    || globalLabel->GetSpinStyle() == SPIN_STYLE::RIGHT;
+                            const int bodyThickness = horizontal ? body.GetHeight() : body.GetWidth();
+
+                            if( bodyThickness <= targetBody )
+                            {
+                                best = candidate;
+                                low = candidate + 1;
+                            }
+                            else
+                            {
+                                high = candidate - 1;
+                            }
+                        }
+
+                        globalLabel->SetTextSize( VECTOR2I( best, best ) );
                     }
 
                     globalLabel->SetSpinStyle(

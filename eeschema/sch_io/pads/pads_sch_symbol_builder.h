@@ -146,6 +146,7 @@ public:
 
 private:
     int toKiCadUnits( double aPadsValue ) const;
+    int padsPinTextSize( int aPadsHeight ) const;
 
     /**
      * Create a SCH_SHAPE from a PADS graphic element. Returns nullptr for mixed line/arc
@@ -163,8 +164,9 @@ private:
     /// renumbered to the KiCad 1/2 convention.
     static bool isDiodeAKPinSet( const std::vector<SYMBOL_PIN>& aPins );
 
-    SCH_PIN* createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent, bool aMapDiodeAK = false,
-                        int aUnit = 0 );
+    SCH_PIN* createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent,
+                         bool aMapDiodeAK = false, int aUnit = 0,
+                         int aNumberTextHeight = 0, int aNameTextHeight = 0 );
 
     /// Build the configured SCH_TEXT for one symbol text field, or nullptr when its content is
     /// empty. A non-zero @p aUnit binds the text to that body unit.
