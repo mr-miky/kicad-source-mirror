@@ -23,8 +23,6 @@
 #include <ki_exception.h>
 #include <reporter.h>
 
-#include <cstdio>
-
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -2012,17 +2010,6 @@ size_t PADS_SCH_PARSER::parsePartPlacement( const std::vector<std::string>& aLin
 
             if( i < aLines.size() )
                 attr.name = aLines[i];
-
-            if( ( aPart.reference == "Y1" || aPart.reference == "Y2" )
-                && ( attr.name == "VALUE" || attr.name == "Value" || attr.name == "Value1" ) )
-            {
-                std::fprintf( stderr,
-                              "PADS-DIAG PARSER ref=%s field=%s raw=(%.0f,%.0f) "
-                              "fieldRot=%.0f just=%d h=%d w=%d vis=%d\n",
-                              aPart.reference.c_str(), attr.name.c_str(),
-                              attr.position.x, attr.position.y, attr.rotation,
-                              attr.justification, attr.height, attr.width, attr.visibility );
-            }
 
             aPart.attributes.push_back( attr );
             i++;
