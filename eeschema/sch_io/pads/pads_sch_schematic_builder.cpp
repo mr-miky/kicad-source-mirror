@@ -37,8 +37,6 @@
 
 #include <advanced_config.h>
 
-#include <cstdio>
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -766,27 +764,6 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
                                   -toKiCadUnits( attr.position.y ) );
             VECTOR2I fieldOffset = aSymbol->GetTransform().TransformCoordinate( localOffset );
 
-            if( ( aPlacement.reference == "Y1" || aPlacement.reference == "Y2" )
-                && mapper.IsValueField( attr.name ) )
-            {
-                const VECTOR2I symbolPos = aSymbol->GetPosition();
-                const VECTOR2I finalPos = symbolPos + fieldOffset;
-
-                std::fprintf( stderr,
-                              "PADS-DIAG BUILDER ref=%s value=%s "
-                              "partPads=(%.0f,%.0f) partRot=%.0f mirror=%d "
-                              "raw=(%.0f,%.0f) fieldRot=%.0f just=%d "
-                              "localIU=(%d,%d) transformedIU=(%d,%d) "
-                              "symbolIU=(%d,%d) setIU=(%d,%d)\n",
-                              aPlacement.reference.c_str(), attr.value.c_str(),
-                              aPlacement.position.x, aPlacement.position.y,
-                              aPlacement.rotation, aPlacement.mirror_flags,
-                              attr.position.x, attr.position.y, attr.rotation,
-                              attr.justification, localOffset.x, localOffset.y,
-                              fieldOffset.x, fieldOffset.y, symbolPos.x, symbolPos.y,
-                              finalPos.x, finalPos.y );
-            }
-
             field->SetPosition( aSymbol->GetPosition() + fieldOffset );
 
             if( attr.rotation != 0.0 )
@@ -818,23 +795,6 @@ void PADS_SCH_SCHEMATIC_BUILDER::ApplyFieldSettings( SCH_SYMBOL*           aSymb
 
             field->SetHorizJustify( hJustify );
             field->SetVertJustify( vJustify );
-
-            if( ( aPlacement.reference == "Y1" || aPlacement.reference == "Y2" )
-                && mapper.IsValueField( attr.name ) )
-            {
-                const char* hName = hJustify == GR_TEXT_H_ALIGN_CENTER ? "CENTER"
-                                  : hJustify == GR_TEXT_H_ALIGN_RIGHT ? "RIGHT" : "LEFT";
-                const char* vName = vJustify == GR_TEXT_V_ALIGN_CENTER ? "CENTER"
-                                  : vJustify == GR_TEXT_V_ALIGN_TOP ? "TOP" : "BOTTOM";
-                const VECTOR2I actualPos = field->GetPosition();
-
-                std::fprintf( stderr,
-                              "PADS-DIAG FINAL ref=%s field=%s actualIU=(%d,%d) "
-                              "fieldRot=%.0f justRaw=%d h=%s v=%s visible=%d\n",
-                              aPlacement.reference.c_str(), attr.name.c_str(),
-                              actualPos.x, actualPos.y, attr.rotation, attr.justification,
-                              hName, vName, field->IsVisible() ? 1 : 0 );
-            }
 
             applyPadsAsciiFieldFont( *field, attr, m_params );
         }
