@@ -68,6 +68,23 @@ int PADS_SCH_SYMBOL_BUILDER::toKiCadUnits( double aPadsValue ) const
 }
 
 
+int PADS_SCH_SYMBOL_BUILDER::padsPinTextSize( int aPadsHeight ) const
+{
+    if( aPadsHeight <= 0 )
+        return schIUScale.MilsToIU( 50 );
+
+    const bool systemFont =
+            wxString::FromUTF8( m_params.font_mode ).CmpNoCase( wxS( "System" ) ) == 0;
+
+    // PADS 7 pt is about 97 mil nominal, but measured uppercase cap-height
+    // is about 55-58 mil in the source rendering.
+    constexpr double PADS_PIN_VISUAL_HEIGHT_CORRECTION = 0.5885217956;
+    const double correction = systemFont ? PADS_PIN_VISUAL_HEIGHT_CORRECTION : 1.0;
+
+    return std::max( 1, KiROUND( toKiCadUnits( aPadsHeight ) * correction ) );
+}
+
+
 LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildSymbol( const SYMBOL_DEF& aSymbolDef )
 {
     LIB_SYMBOL* libSymbol = new LIB_SYMBOL( wxString::FromUTF8( aSymbolDef.name ) );
@@ -86,7 +103,7 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildSymbol( const SYMBOL_DEF& aSymbolDef )
 
     for( const SYMBOL_PIN& pin : aSymbolDef.pins )
     {
-        SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK );
+        SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK, 0, aSymbolDef.height, aSymbolDef.h2 );
 
         if( schPin )
             libSymbol->AddDrawItem( schPin );
@@ -170,7 +187,7 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildMultiUnitSymbol( const PARTTYPE_DEF&  
 
         for( const SYMBOL_PIN& pin : pins )
         {
-            SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK, unit );
+            SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK, unit, symDef.height, symDef.h2 );
 
             if( schPin )
                 libSymbol->AddDrawItem( schPin );
@@ -263,7 +280,7 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::GetOrCreatePartTypeSymbol( const PARTTYPE_D
 
     for( const SYMBOL_PIN& pin : pins )
     {
-        SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK );
+        SCH_PIN* schPin = createPin( pin, libSymbol, mapDiodeAK, 0, aSymbolDef.height, aSymbolDef.h2 );
 
         if( schPin )
             libSymbol->AddDrawItem( schPin );
@@ -302,12 +319,8 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::GetOrCreatePartTypeSymbol( const PARTTYPE_D
 
             if( aSymbolDef.h2 > 0 )
             {
-                int nominalSize = toKiCadUnits( aSymbolDef.h2 );
-                int textHeight = static_cast<int>(
-                        nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale );
-                int textWidth = static_cast<int>(
-                        nominalSize * ADVANCED_CFG::GetCfg().m_PadsSchTextWidthScale );
-                pinName->SetTextSize( VECTOR2I( textWidth, textHeight ) );
+                int visualSize = padsPinTextSize( aSymbolDef.h2 );
+                pinName->SetTextSize( VECTOR2I( visualSize, visualSize ) );
             }
 
             if( aSymbolDef.w2 > 0 )
@@ -426,7 +439,7 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::GetOrCreateConnectorPinSymbol( const PARTTY
                 pin.type = PADS_SCH_PARSER::ParsePinTypeChar( aPartType.gates[0].pins[p].pin_type );
         }
 
-        SCH_PIN* schPin = createPin( pin, libSymbol );
+        SCH_PIN* schPin = createPin( pin, libSymbol, false, 0, aSymbolDef.height, aSymbolDef.h2 );
 
         if( schPin )
             libSymbol->AddDrawItem( schPin );
@@ -497,7 +510,7 @@ LIB_SYMBOL* PADS_SCH_SYMBOL_BUILDER::BuildMultiUnitConnectorSymbol( const PARTTY
                     pin.name = ptPinIt->second->pin_name;
             }
 
-            SCH_PIN* schPin = createPin( pin, libSymbol, false, unit );
+            SCH_PIN* schPin = createPin( pin, libSymbol, false, unit, aSymbolDef.height, aSymbolDef.h2 );
 
             if( schPin )
                 libSymbol->AddDrawItem( schPin );
@@ -847,7 +860,8 @@ static POINT padsTerminalStemVector( const SYMBOL_PIN& aPin )
 
 
 SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL* aParent,
-                                             bool aMapDiodeAK, int aUnit )
+                                             bool aMapDiodeAK, int aUnit,
+                                             int aNumberTextHeight, int aNameTextHeight )
 {
     SCH_PIN* pin = new SCH_PIN( aParent );
 
@@ -913,9 +927,8 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
 
     pin->SetShape( pinShape );
 
-    int pinTextSize = schIUScale.MilsToIU( 50 );
-    pin->SetNumberTextSize( pinTextSize );
-    pin->SetNameTextSize( pinTextSize );
+    pin->SetNumberTextSize( padsPinTextSize( aNumberTextHeight ) );
+    pin->SetNameTextSize( padsPinTextSize( aNameTextHeight ) );
 
     if( aUnit != 0 )
         pin->SetUnit( aUnit );

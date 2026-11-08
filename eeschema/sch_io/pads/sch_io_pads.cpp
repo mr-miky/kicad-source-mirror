@@ -281,7 +281,7 @@ static void applyPadsAsciiPowerNetNamePresentation( SCH_FIELD& aField,
             // PADS system-font height is a Windows character-cell height.  Match
             // the already validated symbol-field conversion: 100 mil -> 75 mil
             // visual height in KiCad, i.e. 1.905 mm for the current Verdana fixture.
-            constexpr double PADS_SYSTEM_FIELD_HEIGHT_CORRECTION = 0.75;
+            constexpr double PADS_SYSTEM_FIELD_HEIGHT_CORRECTION = 0.5885217956;
             int visualSize = KiROUND( schIUScale.MilsToIU( aLabel.height )
                                       * PADS_SYSTEM_FIELD_HEIGHT_CORRECTION );
             aField.SetTextSize( VECTOR2I( visualSize, visualSize ) );

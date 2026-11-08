@@ -511,6 +511,24 @@ namespace
     }
 
 
+    MODEL_JUSTIFICATION freeTextHorizontalJustification( uint16_t aValue )
+    {
+        switch( aValue & 0x000F )
+        {
+        case 0:
+        case 2:
+        case 8: return MODEL_JUSTIFICATION::LEFT;
+
+        case 4:
+        case 6:
+        case 10:
+        case 12:
+        case 14: return MODEL_JUSTIFICATION::CENTER;
+
+        default: return MODEL_JUSTIFICATION::RIGHT;
+        }
+    }
+
     constexpr uint32_t CP1252_HIGH[] = { 0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
                                          0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD, 0x017D, 0xFFFD,
                                          0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
@@ -1754,9 +1772,10 @@ namespace
                 definitionPin.presentationFlags = presentationFlags;
                 definitionPin.visibilityAndNumberPresentationFlags = visibilityFlags;
 
-                // PADS binary stores the same terminal-local X/Y mirror state as the ASCII T-line side field,
-                // shifted left by one because bit 0 carries the terminal quarter-turn flag.
-                definitionPin.side = ( presentationFlags & 0x0006 ) >> 1;
+                // PADS binary stores the same terminal-local X/Y mirror state as
+                // the ASCII T-line xym field, shifted left by one because bit 0
+                // carries the terminal quarter-turn flag.
+                definitionPin.xym = ( presentationFlags & 0x0006 ) >> 1;
 
                 definitionPin.angle = ( presentationFlags & 0x0001 ) != 0 ? 900 : 0;
                 definitionPin.numberAngle = ( presentationFlags & 0x0100 ) != 0 ? 900 : 0;
@@ -1832,26 +1851,52 @@ namespace
                     const wxString pinDecalName = pinDecal->name.text;
                     definitionPin.decalName = pinDecal->name;
 
-                    int64_t provenLength = 0;
+                    int64_t      bestDistanceSquared = 0;
+                    SOURCE_POINT bestVector;
+                    int64_t      bestStrokeWidth = 0;
+                    MODEL_LINE_STYLE bestLineStyle = MODEL_LINE_STYLE::DEFAULT;
 
                     for( const MODEL_GRAPHIC& pinGraphic : pinDecal->graphics )
                     {
-                        const bool containsOrigin = std::ranges::any_of( pinGraphic.points,
-                                                                         []( const SOURCE_POINT& aPoint )
-                                                                         {
-                                                                             return aPoint.x == 0 && aPoint.y == 0;
-                                                                         } );
+                        if( pinGraphic.kind != MODEL_GRAPHIC_KIND::LINE
+                            && pinGraphic.kind != MODEL_GRAPHIC_KIND::POLYLINE )
+                        {
+                            continue;
+                        }
+
+                        const bool containsOrigin = std::ranges::any_of(
+                                pinGraphic.points,
+                                []( const SOURCE_POINT& aPoint )
+                                {
+                                    return aPoint.x == 0 && aPoint.y == 0;
+                                } );
 
                         if( !containsOrigin )
                             continue;
 
                         for( const SOURCE_POINT& point : pinGraphic.points )
-                            provenLength =
-                                    std::max( provenLength, std::max( std::abs( point.x ), std::abs( point.y ) ) );
+                        {
+                            const int64_t distanceSquared = point.x * point.x + point.y * point.y;
+
+                            if( distanceSquared > bestDistanceSquared )
+                            {
+                                bestDistanceSquared = distanceSquared;
+                                bestVector = point;
+                                bestStrokeWidth = pinGraphic.strokeWidth;
+                                bestLineStyle = pinGraphic.lineStyle;
+                            }
+                        }
                     }
 
-                    if( provenLength != 0 )
-                        definitionPin.length = provenLength;
+                    if( bestDistanceSquared != 0 )
+                    {
+                        definitionPin.length = static_cast<int64_t>(
+                                std::llround( std::sqrt( static_cast<double>( bestDistanceSquared ) ) ) );
+                        definitionPin.pinDecalVector = bestVector;
+                        definitionPin.pinDecalStrokeWidth = bestStrokeWidth;
+                        definitionPin.pinDecalLineStyle = bestLineStyle;
+                        definitionPin.pinDecalGeometryResolved = true;
+                    }
                     else
                     {
                         SOURCE_PROPERTY lengthProperty =
@@ -1879,20 +1924,8 @@ namespace
                         wxS( "pin_number_width_half_mils" ),
                         wxString::Format( wxS( "%lld" ), definitionPin.numberPresentation.width ), pinSource ) );
                 definitionPin.properties.push_back(
-                        sourceProperty( wxS( "terminal_side" ),
-                                        wxString::Format( wxS( "%u" ), definitionPin.side ), pinSource ) );
-
-                // Keep the ASCII P-line positions; PADS draws nothing at them so their meaning is unknown
-                for( int pair = 0; pair < 2; ++pair )
-                {
-                    const size_t pairOffset = terminalOffset + 14 + pair * 4;
-                    definitionPin.properties.push_back( sourceProperty(
-                            wxString::Format( wxS( "terminal_p_line_position_%d" ), pair + 1 ),
-                            wxString::Format( wxS( "%lld,%lld" ), decodeLocalCoordinate( aCursor.U16At( pairOffset ) ),
-                                              decodeLocalCoordinate( aCursor.U16At( pairOffset + 2 ) ) ),
-                            pinSource ) );
-                }
-
+                        sourceProperty( wxS( "terminal_xym" ),
+                                        wxString::Format( wxS( "%u" ), definitionPin.xym ), pinSource ) );
                 decal.definition->pins.push_back( std::move( definitionPin ) );
             }
         }
@@ -3928,6 +3961,7 @@ namespace
                                       static_cast<int>( aDecode.sheetIndex ) );
                     SOURCE_STRING  decalName = decodeFixedString( aDecode.bytes, decalSource.absoluteOffset,
                                                                   decalSource.length, decalSource, aModel.diagnostics );
+                    label.decalName = decalName;
                     const uint32_t definitionRecord = aDecode.cursor.U32At( decalSource.absoluteOffset + 48 );
 
                     if( definitionRecord >= aDecode.controllers.pools[2].count )
@@ -3935,6 +3969,27 @@ namespace
 
                     const DEFINITION_ID definitionId(
                             static_cast<uint32_t>( aDecode.sheetIndex * 0x100000 + 1 + definitionRecord ) );
+
+                    // Preserve the CAEDECAL's default power/ground name anchor.
+                    // PADS stores this in REF-DES even though KiCad represents
+                    // the displayed net name as the symbol Value.
+                    auto definition = std::ranges::find(
+                            aModel.definitions, definitionId, &MODEL_SYMBOL_DEFINITION::id );
+
+                    if( definition == aModel.definitions.end() )
+                        throwDecodeError( decalSource, wxS( "off-page decal definition is unresolved" ) );
+
+                    for( const MODEL_FIELD& field : definition->fields )
+                    {
+                        if( field.name.text.CmpNoCase( wxS( "REF-DES" ) ) != 0 )
+                            continue;
+
+                        label.hasDefaultPresentation = true;
+                        label.defaultTextOffset = field.position;
+                        label.defaultAngle = field.angle;
+                        label.defaultPresentation = field.presentation;
+                        break;
+                    }
                     auto specialPartOwnsDefinition = [&]( const wxString& aPartName )
                     {
                         return std::ranges::any_of(
@@ -4002,6 +4057,8 @@ namespace
                 }
             }
 
+            // PADS only displays a power/ground net name when a NETNAMES
+            // presentation record exists for that instance.
             if( label.kind == MODEL_LABEL_KIND::GROUND || label.kind == MODEL_LABEL_KIND::POWER )
                 label.presentation.visible = false;
 
@@ -4201,6 +4258,7 @@ namespace
                 label->presentation = std::move( presentation );
                 label->textOffset = textOffset;
                 label->angle = NormalizeAngle( aDecode.cursor.U16At( offset + 24 ) );
+                label->hasNetNamePresentation = true;
                 label->properties.push_back(
                         sourceProperty( wxS( "net_name_text_offset" ),
                                         wxString::Format( wxS( "%lld,%lld" ), textOffset.x, textOffset.y ), source ) );
@@ -4364,7 +4422,12 @@ namespace
             std::ranges::for_each( placement.fields, applyField );
 
         for( MODEL_LABEL& label : aModel.labels )
+        {
             inheritDefaultSystemFont( label.presentation, settings );
+
+            if( label.hasDefaultPresentation )
+                inheritDefaultSystemFont( label.defaultPresentation, settings );
+        }
 
         for( MODEL_TEXT& text : aModel.texts )
             inheritDefaultSystemFont( text.presentation, settings );

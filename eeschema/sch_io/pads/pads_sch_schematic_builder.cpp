@@ -572,10 +572,12 @@ static void applyPadsAsciiFieldFont( SCH_FIELD& aField, const PART_ATTRIBUTE& aA
 
     if( aAttr.height > 0 )
     {
-        // Match the binary importer: PADS system-font height is a character-cell
-        // height. KiCad's outline-font size is the visual/em height. Controlled
-        // 100 mil fixtures (e.g. Q1 REF-DES/PART-TYPE) match at 75 mil.
-        constexpr double PADS_SYSTEM_FIELD_HEIGHT_CORRECTION = 0.75;
+        // Match the binary importer: calibrate PADS system/TrueType field height
+        // to KiCad's outline-font visual size.  A PADS Verdana field authored at
+        // 97 mil matches visually at about 1.45 mm in KiCad:
+        //   1.45 mm / ( 97 mil * 0.0254 mm/mil ) = 0.5885217956.
+        // Stroke-font fields keep the normal ASCII PADS 0.50/0.46 path above.
+        constexpr double PADS_SYSTEM_FIELD_HEIGHT_CORRECTION = 0.5885217956;
         int visualSize = KiROUND( schIUScale.MilsToIU( aAttr.height )
                                   * PADS_SYSTEM_FIELD_HEIGHT_CORRECTION );
         aField.SetTextSize( VECTOR2I( visualSize, visualSize ) );
