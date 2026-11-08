@@ -356,10 +356,30 @@ void DecodeJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
 }
 
 void DecodeNineWayJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
-                                 GR_TEXT_V_ALIGN_T& aVJustify )
+                                 GR_TEXT_V_ALIGN_T& aVJustify, double aRotationDegrees )
 {
-    // PADS nine-way justification is a bit field. Horizontal center overrides
-    // the left/right selector, and vertical middle overrides bottom/top.
+    // PADS attribute-label justification is a sparse bit field.  For text
+    // rotated by 90/270 degrees PADS explicitly swaps the meanings of bits 0
+    // and 1 (horizontal side selector vs. vertical side selector).  Normalize
+    // those bits first, then decode the usual 0/1/4, 2/3/6, 8/9/12 table.
+    int quarterTurns = static_cast<int>( std::lround( aRotationDegrees / 90.0 ) );
+
+    if( ( quarterTurns & 1 ) != 0 )
+    {
+        int bit0 = aJustification & 0x1;
+        int bit1 = aJustification & 0x2;
+
+        aJustification &= ~0x3;
+
+        if( bit0 )
+            aJustification |= 0x2;
+
+        if( bit1 )
+            aJustification |= 0x1;
+    }
+
+    // Horizontal center overrides the left/right selector, and vertical middle
+    // overrides bottom/top.
     if( aJustification & 0x4 )
         aHJustify = GR_TEXT_H_ALIGN_CENTER;
     else if( aJustification & 0x1 )

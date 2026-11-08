@@ -150,7 +150,7 @@ void DecodeJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
  * continue to use its own decoder.
  */
 void DecodeNineWayJustification( int aJustification, GR_TEXT_H_ALIGN_T& aHJustify,
-                                 GR_TEXT_V_ALIGN_T& aVJustify );
+                                 GR_TEXT_V_ALIGN_T& aVJustify, double aRotationDegrees = 0.0 );
 
 /**
  * Map a PADS board coordinate to a KiCad internal coordinate.
