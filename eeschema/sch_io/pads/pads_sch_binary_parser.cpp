@@ -407,6 +407,8 @@ namespace
     uint32_t pinElectricalType( uint8_t aType, const SOURCE_PROVENANCE& aSource,
                                 std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
+        // PADS Logic canonical pin electrical types:
+        // S, B, C, O, T, L, Z, P, G, U.  There is no canonical 'E'.
         switch( aType )
         {
         case 'U': return 0;
@@ -414,8 +416,8 @@ namespace
         case 'S': return 2;
         case 'B': return 3;
         case 'T': return 4;
-        case 'C': return 5;
-        case 'E': return 6;
+        case 'C':
+        case 'O': return 5; // KiCad folds Or-tieable Source into Open Collector.
         case 'P':
         case 'G': return 7;
         case 'Z': return 8;
@@ -1668,10 +1670,10 @@ namespace
 // PADS binary pin body-root geometry
 //
 // The pin CAEDECAL gives the terminal/decorator direction, but its farthest
-// point is not necessarily the owning symbol's body attachment point. KiCad
+// point is not necessarily the owning symbol's body attachment point.  KiCad
 // SCH_PIN length is connection-point -> pin-root, so ray-cast from the terminal
 // electrical point into the owning symbol body and use the nearest positive
-// intersection. The pin-decal-derived length remains the fallback.
+// intersection.  The pin-decal-derived length remains the fallback.
 struct BINARY_RAY_POINT
 {
     double x = 0.0;
@@ -2584,7 +2586,8 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                     field.presentation.font = decodedDefinitionFont( fontHandle, fontSource );
                     field.presentation.properties.push_back( sourceProperty(
                             wxS( "font_handle" ), wxString::Format( wxS( "%d" ), fontHandle ), fontSource ) );
-                    const uint16_t justification = aCursor.U16At( usedOffset + 66 + standard * 8 );
+                    const uint16_t justification = rotatedFieldJustification(
+                            aCursor.U16At( usedOffset + 66 + standard * 8 ), field.angle );
                     field.presentation.horizontalJustification = horizontalJustification( justification );
                     field.presentation.verticalJustification = verticalJustification( justification );
                     decal.definition->fields.push_back( std::move( field ) );
@@ -4195,6 +4198,65 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
     }
 
 
+
+    int64_t binaryOffPageBodyHeight( const MODEL_SYMBOL_DEFINITION& aDefinition )
+    {
+        bool    found = false;
+        int64_t minY = 0;
+        int64_t maxY = 0;
+
+        auto consider = [&]( int64_t aY )
+        {
+            if( !found )
+            {
+                minY = aY;
+                maxY = aY;
+                found = true;
+                return;
+            }
+
+            minY = std::min( minY, aY );
+            maxY = std::max( maxY, aY );
+        };
+
+        for( const MODEL_GRAPHIC& graphic : aDefinition.graphics )
+        {
+            if( graphic.kind == MODEL_GRAPHIC_KIND::TEXT )
+                continue;
+
+            if( graphic.kind == MODEL_GRAPHIC_KIND::CIRCLE && graphic.points.size() >= 2 )
+            {
+                const double cx =
+                        ( static_cast<double>( graphic.points[0].x ) + graphic.points[1].x ) / 2.0;
+                const double cy =
+                        ( static_cast<double>( graphic.points[0].y ) + graphic.points[1].y ) / 2.0;
+                const double radius =
+                        std::hypot( static_cast<double>( graphic.points[1].x - graphic.points[0].x ),
+                                    static_cast<double>( graphic.points[1].y - graphic.points[0].y ) )
+                        / 2.0;
+                static_cast<void>( cx );
+                consider( static_cast<int64_t>( std::llround( cy - radius ) ) );
+                consider( static_cast<int64_t>( std::llround( cy + radius ) ) );
+                continue;
+            }
+
+            if( graphic.kind == MODEL_GRAPHIC_KIND::ARC )
+            {
+                consider( graphic.arcBoundsStart.y );
+                consider( graphic.arcBoundsEnd.y );
+            }
+
+            for( const SOURCE_POINT& point : graphic.points )
+                consider( point.y );
+        }
+
+        if( !found || maxY <= minY )
+            return 0;
+
+        return maxY - minY;
+    }
+
+
     void decodeOffpageLabels( const CONNECTIVITY_DECODE& aDecode, const SHEET_CONNECTIVITY& aConnectivity,
                               const std::vector<bool>& aClaimedBusEntries, PADS_SCH_MODEL& aModel )
     {
@@ -4300,6 +4362,8 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
                     if( definition == aModel.definitions.end() )
                         throwDecodeError( decalSource, wxS( "off-page decal definition is unresolved" ) );
+
+                    label.offpageBodyHeight = binaryOffPageBodyHeight( *definition );
 
                     for( const MODEL_FIELD& field : definition->fields )
                     {

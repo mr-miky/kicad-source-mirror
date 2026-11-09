@@ -223,7 +223,7 @@ namespace
     {
         switch( aType )
         {
-        case 0: return ELECTRICAL_PINTYPE::PT_PASSIVE;
+        case 0: return ELECTRICAL_PINTYPE::PT_UNSPECIFIED; // PADS 'U' = Undefined
         case 1: return ELECTRICAL_PINTYPE::PT_INPUT;
         case 2: return ELECTRICAL_PINTYPE::PT_OUTPUT;
         case 3: return ELECTRICAL_PINTYPE::PT_BIDI;
@@ -1454,7 +1454,6 @@ namespace
         std::array<bool, 9>             reservedComments{};
         std::vector<const MODEL_FIELD*> fallbackComments;
         wxString                        companyName;
-        wxString                        code;
 
         for( const MODEL_FIELD& field : aSheet.titleBlockFields )
         {
@@ -1468,8 +1467,6 @@ namespace
                 title.SetDate( field.value.text );
             else if( name == wxS( "company name" ) )
                 companyName = field.value.text;
-            else if( name == wxS( "code" ) )
-                code = field.value.text;
             else if( auto comment = commentFields.find( name ); comment != commentFields.end() )
             {
                 reservedComments[comment->second] = true;
@@ -1481,7 +1478,7 @@ namespace
             }
         }
 
-        title.SetCompany( companyName.IsEmpty() ? code : companyName );
+        title.SetCompany( companyName );
 
         auto fallback = fallbackComments.begin();
 
@@ -1514,21 +1511,30 @@ namespace
     }
 
 
-    std::string worksheetVariable( const wxString& aText )
+    std::string worksheetVariable( const wxString& aText, const MODEL_SHEET& aSheet )
     {
         static const std::map<wxString, std::string> variables = {
-            { wxS( "Title" ), "${TITLE}" },           { wxS( "Revision" ), "${REVISION}" },
-            { wxS( "Drawn Date" ), "${ISSUE_DATE}" }, { wxS( "Code" ), "${COMPANY}" },
-            { wxS( "Designed" ), "${COMMENT1}" },     { wxS( "Des Date" ), "${COMMENT2}" },
-            { wxS( "Drawn By" ), "${COMMENT3}" },     { wxS( "Checked By" ), "${COMMENT4}" },
-            { wxS( "Checked Date" ), "${COMMENT5}" }, { wxS( "Approved" ), "${COMMENT6}" },
-            { wxS( "App Date" ), "${COMMENT7}" },     { wxS( "Drawing Number" ), "${COMMENT8}" },
-            { wxS( "Scale" ), "${COMMENT9}" },        { wxS( "Sheet Number" ), "${#}" },
-            { wxS( "Number of Sheets" ), "${##}" },   { wxS( "Sheet Name" ), "${SHEETNAME}" },
+            { wxS( "Title" ), "${TITLE}" },             { wxS( "Revision" ), "${REVISION}" },
+            { wxS( "Drawn Date" ), "${ISSUE_DATE}" },   { wxS( "Company Name" ), "${COMPANY}" },
+            { wxS( "Designed" ), "${COMMENT1}" },       { wxS( "Des Date" ), "${COMMENT2}" },
+            { wxS( "Drawn By" ), "${COMMENT3}" },       { wxS( "Checked By" ), "${COMMENT4}" },
+            { wxS( "Checked Date" ), "${COMMENT5}" },   { wxS( "Approved" ), "${COMMENT6}" },
+            { wxS( "App Date" ), "${COMMENT7}" },       { wxS( "Drawing Number" ), "${COMMENT8}" },
+            { wxS( "Scale" ), "${COMMENT9}" },          { wxS( "Sheet Number" ), "${#}" },
+            { wxS( "Number of Sheets" ), "${##}" },     { wxS( "Sheet Name" ), "${SHEETNAME}" },
             { wxS( "Sheet Size" ), "${PAPER}" }
         };
-        auto found = variables.find( aText );
-        return found == variables.end() ? quoteWorksheetText( aText ) : found->second;
+
+        if( auto found = variables.find( aText ); found != variables.end() )
+            return found->second;
+
+        for( const MODEL_FIELD& field : aSheet.titleBlockFields )
+        {
+            if( field.name.text == aText )
+                return quoteWorksheetText( field.value.text );
+        }
+
+        return quoteWorksheetText( aText );
     }
 
 
@@ -1573,15 +1579,39 @@ namespace
                 if( graphic.points.empty() || !graphic.presentation.visible )
                     continue;
 
-                output << "  (tbtext \"" << worksheetVariable( graphic.text.text ) << "\" (name \"\") (pos "
+                const int64_t worksheetVisualHeight = padsVisualTextHeight( graphic.presentation );
+                KIFONT::FONT* worksheetFont = resolvePadsPresentationFont( graphic.presentation );
+                double worksheetTextY = worksheetY( graphic.points.front() );
+
+                // PADS positions top/bottom justified outline text against the
+                // original Windows character-cell height.  padsVisualTextHeight()
+                // deliberately shrinks that height to match KiCad's visual/em
+                // size, so compensate the anchor by half the removed padding.
+                // Center-justified text needs no shift.
+                //
+                // Keep the correction to unrotated worksheet text until rotated
+                // template anchor directions are independently verified.
+                if( worksheetFont && !worksheetFont->IsStroke() && graphic.angle == 0
+                    && graphic.presentation.height > worksheetVisualHeight )
+                {
+                    const double anchorCompensation =
+                            static_cast<double>( graphic.presentation.height - worksheetVisualHeight )
+                            * 0.0127 / 2.0;
+
+                    if( graphic.presentation.verticalJustification == MODEL_JUSTIFICATION::RIGHT )
+                        worksheetTextY += anchorCompensation; // bottom
+                    else if( graphic.presentation.verticalJustification == MODEL_JUSTIFICATION::LEFT )
+                        worksheetTextY -= anchorCompensation; // top
+                }
+
+                output << "  (tbtext \"" << worksheetVariable( graphic.text.text, aSheet )
+                       << "\" (name \"\") (pos "
                        << worksheetX( graphic.points.front(), aSheet.pageSize ) << ' '
-                       << worksheetY( graphic.points.front() );
+                       << worksheetTextY;
 
                 if( graphic.angle != 0 )
                     output << ") (rotate " << static_cast<double>( graphic.angle ) / 10.0;
 
-                const int64_t worksheetVisualHeight = padsVisualTextHeight( graphic.presentation );
-                KIFONT::FONT* worksheetFont = resolvePadsPresentationFont( graphic.presentation );
                 output << ") (font";
                 
                 if( worksheetFont && !worksheetFont->IsStroke() )
@@ -2406,12 +2436,13 @@ namespace
                     else if( label.decalName.text.CmpNoCase( wxS( "REFOUT" ) ) == 0 )
                         globalLabel->SetShape( LABEL_FLAG_SHAPE::L_OUTPUT );
 
-                    // PADS binary off-page measured body-fit scaling.
-                    // PADS REFIN/REFOUT has a 100 mil external body height.  Measure the
-                    // actual KiCad SCH_GLOBALLABEL body, including outline stroke, and fit
-                    // the text size so that the external body thickness matches PADS.
+                    // Fit the native KiCad global-label body to the external height
+                    // measured from the selected PADS off-page CAEDECAL.  The parser
+                    // stores that source geometry in half-mils; if it is unresolved,
+                    // retain the ordinary PADS text presentation.
+                    if( label.offpageBodyHeight > 0 )
                     {
-                        const int targetBody = schIUScale.MilsToIU( 100.0 );
+                        const int targetBody = toIU( label.offpageBodyHeight );
                         int low = 1;
                         int high = targetBody;
                         int best = low;

@@ -38,6 +38,7 @@
 #include <advanced_config.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <map>
@@ -276,6 +277,44 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
                     if( !nn.font_face.empty() )
                         label->SetFontProp( wxString::FromUTF8( nn.font_face ) );
+                }
+
+                // Fit the native KiCad global-label body to the external height
+                // authored by the selected PADS REFIN/REFOUT CAEDECAL.  Do this
+                // after font/bold/italic/thickness have been applied so the measured
+                // KiCad body matches the actual rendered label.  If the source body
+                // height could not be resolved, keep the normal NETNAMES presentation.
+                if( opcIt != aOffPageConnectors.end()
+                    && opcIt->second.symbol_lib == "$OSR_SYMS"
+                    && opcIt->second.body_height > 0.0 )
+                {
+                    const int targetBody = toKiCadUnits( opcIt->second.body_height );
+                    int low = 1;
+                    int high = targetBody;
+                    int best = low;
+
+                    while( low <= high )
+                    {
+                        const int candidate = low + ( high - low ) / 2;
+                        label->SetTextSize( VECTOR2I( candidate, candidate ) );
+
+                        const BOX2I body = label->GetBodyBoundingBox( nullptr );
+                        const bool horizontal = label->GetSpinStyle() == SPIN_STYLE::LEFT
+                                                || label->GetSpinStyle() == SPIN_STYLE::RIGHT;
+                        const int bodyThickness = horizontal ? body.GetHeight() : body.GetWidth();
+
+                        if( bodyThickness <= targetBody )
+                        {
+                            best = candidate;
+                            low = candidate + 1;
+                        }
+                        else
+                        {
+                            high = candidate - 1;
+                        }
+                    }
+
+                    label->SetTextSize( VECTOR2I( best, best ) );
                 }
 
                 label->SetFlags( IS_NEW );
@@ -965,69 +1004,62 @@ void PADS_SCH_SCHEMATIC_BUILDER::CreateTitleBlock( SCH_SCREEN* aScreen )
     if( !aScreen )
         return;
 
-    // Look up the first non-empty value from a list of candidate field names
-    auto findField =
-            [this]( const std::initializer_list<const char*>& aCandidates ) -> std::string
-            {
-                for( const char* name : aCandidates )
-                {
-                    auto it = m_params.fields.find( name );
+    TITLE_BLOCK title;
 
-                    if( it != m_params.fields.end() && !it->second.empty() )
-                        return it->second;
-                }
+    // Keep this mapping in lock-step with the binary importer's
+    // applyTitleBlock().
+    static const std::map<wxString, int> commentFields = {
+        { wxS( "designed" ), 0 },   { wxS( "des date" ), 1 },       { wxS( "drawn by" ), 2 },
+        { wxS( "checked by" ), 3 }, { wxS( "checked date" ), 4 },   { wxS( "approved" ), 5 },
+        { wxS( "app date" ), 6 },   { wxS( "drawing number" ), 7 }, { wxS( "scale" ), 8 }
+    };
 
-                return {};
-            };
+    std::array<bool, 9> reservedComments{};
+    std::vector<const std::pair<std::string, std::string>*> fallbackComments;
+    wxString companyName;
 
-    TITLE_BLOCK tb;
+    for( const auto& field : m_params.field_entries )
+    {
+        const wxString name = wxString::FromUTF8( field.first ).Lower();
+        const wxString value = wxString::FromUTF8( field.second );
 
-    std::string title = findField( { "Title", "TITLE1" } );
+        if( name == wxS( "title" ) )
+            title.SetTitle( value );
+        else if( name == wxS( "revision" ) )
+            title.SetRevision( value );
+        else if( name == wxS( "date" ) || name == wxS( "drawn date" ) )
+            title.SetDate( value );
+        else if( name == wxS( "company name" ) )
+            companyName = value;
+        else if( auto comment = commentFields.find( name ); comment != commentFields.end() )
+        {
+            reservedComments[comment->second] = true;
+            title.SetComment( comment->second, value );
+        }
+        else
+        {
+            fallbackComments.push_back( &field );
+        }
+    }
 
-    if( title.empty() )
-        title = m_params.job_name;
+    // Code is intentionally not a fallback for Company.
+    title.SetCompany( companyName );
 
-    if( !title.empty() )
-        tb.SetTitle( wxString::FromUTF8( title ) );
+    auto fallback = fallbackComments.begin();
 
-    std::string date = findField( { "DATE", "Release Date", "Drawn Date" } );
+    for( size_t comment = 0;
+         comment < reservedComments.size() && fallback != fallbackComments.end();
+         ++comment )
+    {
+        if( !reservedComments[comment] )
+        {
+            title.SetComment( comment, wxString::FromUTF8( ( *fallback )->second ) );
+            ++fallback;
+        }
+    }
 
-    if( !date.empty() )
-        tb.SetDate( wxString::FromUTF8( date ) );
-
-    std::string revision = findField( { "Revision", "VER" } );
-
-    if( !revision.empty() )
-        tb.SetRevision( wxString::FromUTF8( revision ) );
-
-    std::string company = findField( { "Company Name" } );
-
-    if( !company.empty() )
-        tb.SetCompany( wxString::FromUTF8( company ) );
-
-    std::string drawingNumber = findField( { "DN", "Drawing Number" } );
-
-    if( !drawingNumber.empty() )
-        tb.SetComment( 0, wxString::FromUTF8( drawingNumber ) );
-
-    std::string designer = findField( { "DESIGNER" } );
-
-    if( !designer.empty() )
-        tb.SetComment( 1, wxString::FromUTF8( designer ) );
-
-    std::string drawnBy = findField( { "DRAWNBY", "Drawn By" } );
-
-    if( !drawnBy.empty() )
-        tb.SetComment( 2, wxString::FromUTF8( drawnBy ) );
-
-    std::string builtFor = findField( { "BUILTFOR" } );
-
-    if( !builtFor.empty() )
-        tb.SetComment( 3, wxString::FromUTF8( builtFor ) );
-
-    aScreen->SetTitleBlock( tb );
+    aScreen->SetTitleBlock( title );
 }
-
 
 SCH_SHEET* PADS_SCH_SCHEMATIC_BUILDER::CreateHierarchicalSheet( int aSheetNumber, int aTotalSheets,
                                                                  SCH_SHEET*      aParentSheet,

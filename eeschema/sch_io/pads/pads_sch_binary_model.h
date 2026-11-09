@@ -673,6 +673,11 @@ struct MODEL_LABEL
     SOURCE_POINT                 textOffset;
     int                          angle = 0;
     uint8_t                      symbolVariant = 0xFF;
+
+    // External height of the selected PADS off-page CAEDECAL body, in semantic
+    // model coordinate units (half-mils). Zero means unresolved.
+    int64_t                      offpageBodyHeight = 0;
+
     bool                         hasNetNamePresentation = false;
     MODEL_TEXT_PRESENTATION      presentation;
 

@@ -61,6 +61,54 @@ VECTOR2I padsSchArcMidpoint( const VECTOR2I& aStart, const VECTOR2I& aEnd, const
 }
 
 
+
+static bool padsOffPageBodyHeight( const SYMBOL_DEF& aSymbol, double& aHeight )
+{
+    bool   found = false;
+    double minY = 0.0;
+    double maxY = 0.0;
+
+    auto consider = [&]( double aY )
+    {
+        if( !found )
+        {
+            minY = aY;
+            maxY = aY;
+            found = true;
+            return;
+        }
+
+        minY = std::min( minY, aY );
+        maxY = std::max( maxY, aY );
+    };
+
+    for( const SYMBOL_GRAPHIC& graphic : aSymbol.graphics )
+    {
+        if( graphic.type == GRAPHIC_TYPE::CIRCLE )
+        {
+            consider( graphic.center.y - graphic.radius );
+            consider( graphic.center.y + graphic.radius );
+        }
+
+        for( const GRAPHIC_POINT& point : graphic.points )
+        {
+            consider( point.coord.y );
+
+            if( point.arc.has_value() )
+            {
+                consider( point.arc->bbox_y1 );
+                consider( point.arc->bbox_y2 );
+            }
+        }
+    }
+
+    if( !found || maxY <= minY )
+        return false;
+
+    aHeight = maxY - minY;
+    return true;
+}
+
 PADS_SCH_PARSER::PADS_SCH_PARSER() :
     m_reporter( nullptr ),
     m_lineNumber( 0 ),
@@ -262,6 +310,30 @@ void PADS_SCH_PARSER::mergePartTypeData()
 
             if( ovr != part.attr_overrides.end() && attr.value.empty() )
                 attr.value = ovr->second;
+        }
+    }
+
+    // Resolve each $OSR_SYMS instance to the selected REFIN/REFOUT CAEDECAL and
+    // preserve its authored external body height. flags2 is the PADS OFF variant
+    // selector: 0 selects the first OFF variant, 1 the second, and so on.
+    auto osr = m_partTypes.find( "$OSR_SYMS" );
+
+    if( osr != m_partTypes.end() )
+    {
+        for( OFF_PAGE_CONNECTOR& opc : m_offPageConnectors )
+        {
+            if( opc.symbol_lib != "$OSR_SYMS" || opc.flags2 < 0
+                || static_cast<size_t>( opc.flags2 ) >= osr->second.special_variants.size() )
+            {
+                continue;
+            }
+
+            const std::string& decalName =
+                    osr->second.special_variants[static_cast<size_t>( opc.flags2 )].decal_name;
+            const SYMBOL_DEF* decal = GetSymbolDef( decalName );
+
+            if( decal )
+                padsOffPageBodyHeight( *decal, opc.body_height );
         }
     }
 }
@@ -615,6 +687,7 @@ size_t PADS_SCH_PARSER::parseSectionFIELDS( const std::vector<std::string>& aLin
             }
 
             m_parameters.fields[fieldName] = fieldValue;
+            m_parameters.field_entries.emplace_back( fieldName, fieldValue );
         }
 
         i++;
@@ -800,7 +873,8 @@ size_t PADS_SCH_PARSER::parseSectionLINES( const std::vector<std::string>& aLine
                         std::istringstream tiss( pline );
                         int tx = 0, ty = 0;
 
-                        tiss >> tx >> ty >> text.rotation >> text.justification >> text.height >> text.width_factor;
+                        tiss >> tx >> ty >> text.rotation >> text.justification >> text.height >> text.width_factor
+                             >> text.attr_flag;
 
                         text.position.x = tx;
                         text.position.y = ty;
@@ -3029,7 +3103,9 @@ PIN_TYPE PADS_SCH_PARSER::parsePinType( const std::string& aTypeStr )
     if( upper == "I" || upper == "IN" || upper == "INPUT" || upper == "L" )
         return PIN_TYPE::INPUT;
 
-    if( upper == "O" || upper == "OUT" || upper == "OUTPUT" || upper == "S" )
+    // PADS canonical 'S' is Source.  Keep long-form OUTPUT aliases, but do not
+    // treat single-letter 'O' as OUTPUT: PADS defines 'O' as Or-tieable Source.
+    if( upper == "OUT" || upper == "OUTPUT" || upper == "S" )
         return PIN_TYPE::OUTPUT;
 
     if( upper == "B" || upper == "BI" || upper == "BIDIR" || upper == "BIDIRECTIONAL" )
@@ -3038,9 +3114,14 @@ PIN_TYPE PADS_SCH_PARSER::parsePinType( const std::string& aTypeStr )
     if( upper == "T" || upper == "TRI" || upper == "TRISTATE" )
         return PIN_TYPE::TRISTATE;
 
-    if( upper == "OC" || upper == "OPENCOLLECTOR" )
+    // KiCad has no separate Or-tieable Source electrical type.  Match the
+    // PADS classification used elsewhere in KiCad and fold both C and O into
+    // Open Collector.
+    if( upper == "C" || upper == "O" || upper == "OC" || upper == "OPENCOLLECTOR" )
         return PIN_TYPE::OPEN_COLLECTOR;
 
+    // Retain legacy long-form aliases, but there is no canonical PADS 'E'
+    // single-letter pin type.
     if( upper == "OE" || upper == "OPENEMITTER" )
         return PIN_TYPE::OPEN_EMITTER;
 
@@ -3056,14 +3137,20 @@ PIN_TYPE PADS_SCH_PARSER::parsePinType( const std::string& aTypeStr )
 
 PIN_TYPE PADS_SCH_PARSER::ParsePinTypeChar( char aTypeChar )
 {
+    // PADS Logic canonical pin electrical types:
+    // S, B, C, O, T, L, Z, P, G, U.  There is no canonical 'E'.
     switch( std::toupper( aTypeChar ) )
     {
     case 'L': return PIN_TYPE::INPUT;
     case 'S': return PIN_TYPE::OUTPUT;
     case 'B': return PIN_TYPE::BIDIRECTIONAL;
-    case 'P': return PIN_TYPE::POWER;
+    case 'T': return PIN_TYPE::TRISTATE;
+    case 'C':
+    case 'O': return PIN_TYPE::OPEN_COLLECTOR;
+    case 'P':
     case 'G': return PIN_TYPE::POWER;
     case 'U': return PIN_TYPE::UNSPECIFIED;
+    case 'Z': return PIN_TYPE::UNSPECIFIED; // Terminator has no direct KiCad ERC equivalent.
     default:  return PIN_TYPE::UNSPECIFIED;
     }
 }
