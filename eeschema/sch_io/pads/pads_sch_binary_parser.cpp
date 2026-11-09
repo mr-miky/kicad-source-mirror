@@ -426,41 +426,30 @@ namespace
     }
 
 
-    SOURCE_POINT pageExtent( const std::string& aPage, const SOURCE_PROVENANCE& aSource )
+    SOURCE_POINT pageExtent( uint32_t aPage, const SOURCE_PROVENANCE& aSource )
     {
-        // PADS stores ANSI sizes as A-E and ISO sizes as A0-A5. MODEL_SETTINGS
-        // dimensions are expressed in half-mils and use landscape orientation.
-        if( aPage == "A5" )
-            return { 16535, 11654, aSource };
-
-        if( aPage == "A4" )
-            return { 23386, 16535, aSource };
-
-        if( aPage == "A3" )
-            return { 33071, 23386, aSource };
-
-        if( aPage == "A2" )
-            return { 46772, 33071, aSource };
-
-        if( aPage == "A1" )
-            return { 66220, 46772, aSource };
-
-        if( aPage == "A0" )
-            return { 93622, 66220, aSource };
-
-        if( aPage.size() == 1 )
+        // Controlled PADS Logic native-save fixtures prove that design settings
+        // offset +80 is a u32 sheet-size enum, independent of the BORDER NAME
+        // string stored at +264. Observed fixtures give 0=A, 2=C, 5=A4,
+        // 6=A3, 7=A2, 8=A1, 9=A0 and 10=F; the contiguous ANSI sequence gives
+        // 1=B, 3=D and 4=E.
+        //
+        // Dimensions are expressed in half-mils and use landscape orientation.
+        switch( aPage )
         {
-            switch( aPage[0] )
-            {
-            case 'A': return { 22000, 17000, aSource };
-            case 'B': return { 34000, 22000, aSource };
-            case 'C': return { 44000, 34000, aSource };
-            case 'D': return { 68000, 44000, aSource };
-            case 'E': return { 88000, 68000, aSource };
-            }
+        case 0:  return { 22000, 17000, aSource }; // ANSI A
+        case 1:  return { 34000, 22000, aSource }; // ANSI B
+        case 2:  return { 44000, 34000, aSource }; // ANSI C
+        case 3:  return { 68000, 44000, aSource }; // ANSI D
+        case 4:  return { 88000, 68000, aSource }; // ANSI E
+        case 5:  return { 23386, 16535, aSource }; // ISO A4
+        case 6:  return { 33071, 23386, aSource }; // ISO A3
+        case 7:  return { 46772, 33071, aSource }; // ISO A2
+        case 8:  return { 66220, 46772, aSource }; // ISO A1
+        case 9:  return { 93622, 66220, aSource }; // ISO A0
+        case 10: return { 80000, 56000, aSource }; // ANSI F
+        default: throwDecodeError( aSource, wxS( "invalid design page-size enum" ) );
         }
-
-        throwDecodeError( aSource, wxS( "invalid design page-size token" ) );
     }
 
 
@@ -1111,8 +1100,17 @@ namespace
         presentation.width = static_cast<int64_t>( aCursor.U8At( aOffset + 30 ) ) * 2;
         presentation.properties.push_back( sourceProperty(
                 wxS( "display_flags" ), wxString::Format( wxS( "%u" ), aCursor.U8At( aOffset + 31 ) ), aSource ) );
-        presentation.horizontalJustification = horizontalJustification( aCursor.U16At( aOffset + 18 ) );
-        presentation.verticalJustification = verticalJustification( aCursor.U16At( aOffset + 18 ) );
+        // PADS stores the nine-way justification selector in the text-local
+        // frame.  For 90/270 degree text the low selector bits are swapped;
+        // normalize them before decoding the semantic horizontal/vertical anchor.
+        // Controlled title-block fixtures confirm:
+        //   Middle Right: 0 deg raw 9, 90 deg raw 10 -> normalized 9
+        //   Top Right:    0 deg raw 3, 90 deg raw 3  -> normalized 3
+        const int      textAngle = NormalizeAngle( aCursor.U16At( aOffset + 16 ) );
+        const uint16_t justification =
+                rotatedFieldJustification( aCursor.U16At( aOffset + 18 ), textAngle );
+        presentation.horizontalJustification = horizontalJustification( justification );
+        presentation.verticalJustification = verticalJustification( justification );
 
         SOURCE_PROVENANCE fontSource = aSource;
         fontSource.absoluteOffset += 28;
@@ -4955,32 +4953,18 @@ namespace
                                                      settingsOffset, settingsPool.usedBytes, -1 );
         aModel.settings.source = settingsSource;
 
-        constexpr size_t PAGE_FIELD_OFFSET = 264;
-        constexpr size_t PAGE_FIELD_BYTES = 11;
-        const size_t     pageFieldOffset = settingsOffset + PAGE_FIELD_OFFSET;
-        size_t           pageFieldEnd = pageFieldOffset;
-
-        while( pageFieldEnd < pageFieldOffset + PAGE_FIELD_BYTES && aBytes[pageFieldEnd] != 0 )
-            ++pageFieldEnd;
+        constexpr size_t PAGE_SIZE_ENUM_OFFSET = 80;
 
         SOURCE_PROVENANCE pageSource = settingsSource;
-        pageSource.absoluteOffset += PAGE_FIELD_OFFSET;
-        pageSource.length = PAGE_FIELD_BYTES;
+        pageSource.absoluteOffset += PAGE_SIZE_ENUM_OFFSET;
+        pageSource.length = 4;
 
-        if( pageFieldEnd == pageFieldOffset + PAGE_FIELD_BYTES )
-            throwDecodeError( pageSource, wxS( "invalid design page-size field" ) );
-
-        std::string pageField( aBytes.begin() + pageFieldOffset, aBytes.begin() + pageFieldEnd );
-        std::string pageDesignator;
-
-        if( pageField.starts_with( "SIZE" ) && pageField.size() > 4 )
-            pageDesignator = pageField.substr( 4 );
-        else if( pageField.starts_with( "WDITBSIZE" ) && pageField.size() > 9 )
-            pageDesignator = pageField.substr( 9 );
-        else
-            throwDecodeError( pageSource, wxS( "invalid design page-size field" ) );
-
-        aModel.settings.pageSize = pageExtent( pageDesignator, pageSource );
+        // +264 is the PADS BORDER NAME / drafting-template name, not the
+        // sheet-size field. Standard borders such as "SIZEA3" made the old
+        // interpretation appear correct until a custom name (for example
+        // "SIZEA3_TEST") separated the two concepts.
+        const uint32_t pageSizeRaw = aCursor.U32At( settingsOffset + PAGE_SIZE_ENUM_OFFSET );
+        aModel.settings.pageSize = pageExtent( pageSizeRaw, pageSource );
         aModel.settings.defaultLineWidth = static_cast<int64_t>( aCursor.U32At( settingsOffset + 12 ) ) * 2;
         aModel.settings.defaultBusWidth = static_cast<int64_t>( aCursor.U32At( settingsOffset + 16 ) ) * 2;
 
@@ -5229,8 +5213,20 @@ namespace
             text.presentation.width = aCursor.U8At( recordOffset + 30 );
             const uint8_t displayFlags = aCursor.U8At( recordOffset + 31 );
             text.presentation.visible = ( displayFlags & 1 ) == 0;
-            text.presentation.horizontalJustification = freeTextHorizontalJustification( justification );
-            text.presentation.verticalJustification = verticalJustification( justification );
+            // PADS stores the low nine-way justification selector bits in the
+            // text-local frame.  For 90/270 degree text bits 0 and 1 are swapped.
+            // This is the same rule already used for rotated placement fields.
+            //
+            // Title-block fixture:
+            //   Sheet Number: 90 deg, raw 0  -> 0 -> bottom-left
+            //   Drawn By:     90 deg, raw 10 -> 9 -> middle-right
+            const uint16_t rotatedJustification =
+                    rotatedFieldJustification( justification, text.angle );
+
+            text.presentation.horizontalJustification =
+                    freeTextHorizontalJustification( rotatedJustification );
+            text.presentation.verticalJustification =
+                    verticalJustification( rotatedJustification );
 
             SOURCE_PROVENANCE fontHandleSource = textSource;
             fontHandleSource.length = 2;
