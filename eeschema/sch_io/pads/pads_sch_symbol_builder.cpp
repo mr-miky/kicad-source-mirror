@@ -889,13 +889,8 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
     // Set pin length
     int length = toKiCadUnits( aPin.length );
 
-    // PADS PINB is authored as a 140 mil stem followed by a 50 mil diameter
-    // inversion bubble (total reach 190 mil from the electrical connection point).
-    // KiCad's INVERTED pin renderer includes the bubble inside SCH_PIN::GetLength():
-    // with a 50 mil decorator, a 190 mil pin therefore leaves exactly 140 mil of
-    // straight line before the bubble, matching the PADS PINB geometry.
-    if( aPin.pin_decal_name == "PINB" )
-        length += toKiCadUnits( 50.0 );
+    // pin.length is resolved by the ASCII parser from the actual symbol-body
+    // attachment point when possible, with the pin-decal stem as fallback.
 
     pin->SetLength( length );
 
@@ -920,7 +915,12 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
     // Set graphic style
     GRAPHIC_PINSHAPE pinShape = GRAPHIC_PINSHAPE::LINE;
 
-    if( aPin.inverted )
+    // PINIEB is the native active-low input marker, not an inversion bubble.
+    if( aPin.pin_decal_name == "PINIEB" )
+        pinShape = GRAPHIC_PINSHAPE::INPUT_LOW;
+    else if( aPin.inverted && aPin.clock )
+        pinShape = GRAPHIC_PINSHAPE::INVERTED_CLOCK;
+    else if( aPin.inverted )
         pinShape = GRAPHIC_PINSHAPE::INVERTED;
     else if( aPin.clock )
         pinShape = GRAPHIC_PINSHAPE::CLOCK;
@@ -933,26 +933,42 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
     if( aUnit != 0 )
         pin->SetUnit( aUnit );
 
-    // SCH_PIN owns the electrical connection but KiCad does not preserve the authored
-    // PADS pin-decal stroke width.  Overlay only the resolved terminal stem as symbol
-    // graphics.  It is local to the LIB_SYMBOL (and to the same unit), so it follows
-    // move/rotate/mirror operations and never creates an independent schematic object.
+    // Preserve an authored PADS terminal stroke only when KiCad's native pin
+    // does not already represent it. Decorated KiCad pins draw their own stem,
+    // bubble/clock/wedge; a plain default solid stem is also redundant when it
+    // exactly matches the KiCad pin root.
     if( aPin.pin_decal_geometry_resolved )
     {
         VECTOR2I stemEnd( pos.x + toKiCadUnits( stemVector.x ),
                           pos.y - toKiCadUnits( stemVector.y ) );
 
-        if( stemEnd != pos )
+        int stemWidth = toKiCadUnits( aPin.pin_decal_line_width );
+
+        if( stemWidth == 0 )
+            stemWidth = toKiCadUnits( m_params.line_width );
+
+        VECTOR2I kicadStemEnd = pos;
+
+        switch( orientation )
+        {
+        case PIN_ORIENTATION::PIN_RIGHT: kicadStemEnd.x += length; break;
+        case PIN_ORIENTATION::PIN_LEFT:  kicadStemEnd.x -= length; break;
+        case PIN_ORIENTATION::PIN_DOWN:  kicadStemEnd.y += length; break;
+        case PIN_ORIENTATION::PIN_UP:    kicadStemEnd.y -= length; break;
+        case PIN_ORIENTATION::INHERIT:   break;
+        }
+
+        const bool redundantStem =
+                pinShape != GRAPHIC_PINSHAPE::LINE
+                || ( stemEnd == kicadStemEnd
+                     && stemWidth == toKiCadUnits( m_params.line_width )
+                     && aPin.pin_decal_line_style == 255 );
+
+        if( stemEnd != pos && !redundantStem )
         {
             SCH_SHAPE* stem = new SCH_SHAPE( SHAPE_T::POLY, LAYER_DEVICE );
             stem->AddPoint( pos );
             stem->AddPoint( stemEnd );
-
-            int stemWidth = toKiCadUnits( aPin.pin_decal_line_width );
-
-            if( stemWidth == 0 )
-                stemWidth = toKiCadUnits( m_params.line_width );
-
             stem->SetStroke( STROKE_PARAMS(
                     stemWidth, PADS_COMMON::PadsLineStyleToKiCad( aPin.pin_decal_line_style ) ) );
 
