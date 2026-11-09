@@ -840,6 +840,245 @@ size_t PADS_SCH_PARSER::parseSectionLINES( const std::vector<std::string>& aLine
 }
 
 
+
+// PADS pin body-root geometry
+//
+// A PADS pin CAEDECAL describes the terminal decoration/stem, but its farthest
+// point is not necessarily the symbol-body attachment point. KiCad SCH_PIN
+// length is connection-point -> pin-root, so derive that root from the owning
+// symbol body by ray-casting from the electrical point in the transformed
+// pin-decal direction. If no body intersection is found, callers retain the
+// pin-decal-derived fallback length.
+static POINT padsPinBodyRootDirection( const POINT& aVector, double aAngle, int aXym )
+{
+    const double radians = aAngle * M_PI / 180.0;
+    const double c = std::cos( radians );
+    const double s = std::sin( radians );
+
+    POINT result;
+    result.x = aVector.x * c - aVector.y * s;
+    result.y = aVector.x * s + aVector.y * c;
+
+    if( aXym & 0x1 )
+        result.x = -result.x;
+
+    if( aXym & 0x2 )
+        result.y = -result.y;
+
+    return result;
+}
+
+
+static double padsCross2d( const POINT& aA, const POINT& aB )
+{
+    return aA.x * aB.y - aA.y * aB.x;
+}
+
+
+static bool padsRaySegmentIntersection( const POINT& aOrigin, const POINT& aDir,
+                                        const POINT& aStart, const POINT& aEnd,
+                                        double& aDistance )
+{
+    constexpr double EPSILON = 1e-9;
+
+    POINT segment{ aEnd.x - aStart.x, aEnd.y - aStart.y };
+    POINT offset{ aStart.x - aOrigin.x, aStart.y - aOrigin.y };
+    const double denominator = padsCross2d( aDir, segment );
+
+    if( std::abs( denominator ) <= EPSILON )
+        return false;
+
+    const double distance = padsCross2d( offset, segment ) / denominator;
+    const double u = padsCross2d( offset, aDir ) / denominator;
+
+    if( distance <= EPSILON || u < -EPSILON || u > 1.0 + EPSILON )
+        return false;
+
+    aDistance = distance;
+    return true;
+}
+
+
+static double padsNormalizeAngle( double aAngle )
+{
+    const double full = 2.0 * M_PI;
+
+    while( aAngle < 0.0 )
+        aAngle += full;
+
+    while( aAngle >= full )
+        aAngle -= full;
+
+    return aAngle;
+}
+
+
+static bool padsPointOnArc( const POINT& aPoint, const POINT& aStart,
+                            const POINT& aCenter, double aSweepTenths )
+{
+    constexpr double ANGLE_EPSILON = 1e-7;
+
+    if( std::abs( aSweepTenths ) >= 3600.0 - ANGLE_EPSILON )
+        return true;
+
+    const double startAngle = std::atan2( aStart.y - aCenter.y, aStart.x - aCenter.x );
+    const double pointAngle = std::atan2( aPoint.y - aCenter.y, aPoint.x - aCenter.x );
+    const double sweep = aSweepTenths * M_PI / 1800.0;
+
+    if( sweep > 0.0 )
+        return padsNormalizeAngle( pointAngle - startAngle ) <= sweep + ANGLE_EPSILON;
+
+    if( sweep < 0.0 )
+        return padsNormalizeAngle( startAngle - pointAngle ) <= -sweep + ANGLE_EPSILON;
+
+    return false;
+}
+
+
+template<typename ACCEPT>
+static void padsRayCircleIntersections( const POINT& aOrigin, const POINT& aDir,
+                                        const POINT& aCenter, double aRadius,
+                                        ACCEPT aAccept )
+{
+    constexpr double EPSILON = 1e-9;
+
+    if( aRadius <= EPSILON )
+        return;
+
+    POINT rel{ aOrigin.x - aCenter.x, aOrigin.y - aCenter.y };
+    const double projection = rel.x * aDir.x + rel.y * aDir.y;
+    const double constant = rel.x * rel.x + rel.y * rel.y - aRadius * aRadius;
+    const double discriminant = projection * projection - constant;
+
+    if( discriminant < -EPSILON )
+        return;
+
+    const double root = std::sqrt( std::max( 0.0, discriminant ) );
+    const double distances[2] = { -projection - root, -projection + root };
+
+    for( double distance : distances )
+    {
+        if( distance <= EPSILON )
+            continue;
+
+        POINT point{ aOrigin.x + distance * aDir.x,
+                     aOrigin.y + distance * aDir.y };
+
+        aAccept( distance, point );
+    }
+}
+
+
+static bool padsPinBodyRootDistance( const SYMBOL_DEF& aSymbol, const SYMBOL_PIN& aPin,
+                                     double& aDistance )
+{
+    constexpr double EPSILON = 1e-9;
+
+    if( !aPin.pin_decal_geometry_resolved )
+        return false;
+
+    POINT dir = padsPinBodyRootDirection( aPin.pin_decal_vector, aPin.rotation, aPin.xym );
+    const double dirLength = std::sqrt( dir.x * dir.x + dir.y * dir.y );
+
+    if( dirLength <= EPSILON )
+        return false;
+
+    dir.x /= dirLength;
+    dir.y /= dirLength;
+
+    bool found = false;
+    double best = 0.0;
+
+    auto consider = [&]( double aCandidate )
+    {
+        if( aCandidate <= EPSILON )
+            return;
+
+        if( !found || aCandidate < best )
+        {
+            best = aCandidate;
+            found = true;
+        }
+    };
+
+    auto considerSegment = [&]( const POINT& aStart, const POINT& aEnd )
+    {
+        double distance = 0.0;
+
+        if( padsRaySegmentIntersection( aPin.position, dir, aStart, aEnd, distance ) )
+            consider( distance );
+    };
+
+    for( const SYMBOL_GRAPHIC& graphic : aSymbol.graphics )
+    {
+        if( graphic.type == GRAPHIC_TYPE::RECTANGLE && graphic.points.size() >= 2 )
+        {
+            const double minX = std::min( graphic.points[0].coord.x, graphic.points[1].coord.x );
+            const double maxX = std::max( graphic.points[0].coord.x, graphic.points[1].coord.x );
+            const double minY = std::min( graphic.points[0].coord.y, graphic.points[1].coord.y );
+            const double maxY = std::max( graphic.points[0].coord.y, graphic.points[1].coord.y );
+
+            const POINT p0{ minX, minY };
+            const POINT p1{ maxX, minY };
+            const POINT p2{ maxX, maxY };
+            const POINT p3{ minX, maxY };
+
+            considerSegment( p0, p1 );
+            considerSegment( p1, p2 );
+            considerSegment( p2, p3 );
+            considerSegment( p3, p0 );
+            continue;
+        }
+
+        if( graphic.type == GRAPHIC_TYPE::CIRCLE )
+        {
+            padsRayCircleIntersections(
+                    aPin.position, dir, graphic.center, graphic.radius,
+                    [&]( double aCandidate, const POINT& )
+                    {
+                        consider( aCandidate );
+                    } );
+            continue;
+        }
+
+        if( graphic.points.size() < 2 )
+            continue;
+
+        for( size_t i = 0; i + 1 < graphic.points.size(); ++i )
+        {
+            const GRAPHIC_POINT& start = graphic.points[i];
+            const GRAPHIC_POINT& end = graphic.points[i + 1];
+
+            if( start.arc.has_value() )
+            {
+                const ARC_DATA& arc = *start.arc;
+                POINT center{ ( arc.bbox_x1 + arc.bbox_x2 ) / 2.0,
+                              ( arc.bbox_y1 + arc.bbox_y2 ) / 2.0 };
+                const double dx = start.coord.x - center.x;
+                const double dy = start.coord.y - center.y;
+                const double radius = std::sqrt( dx * dx + dy * dy );
+
+                padsRayCircleIntersections(
+                        aPin.position, dir, center, radius,
+                        [&]( double aCandidate, const POINT& aPoint )
+                        {
+                            if( padsPointOnArc( aPoint, start.coord, center, arc.angle ) )
+                                consider( aCandidate );
+                        } );
+            }
+            else
+            {
+                considerSegment( start.coord, end.coord );
+            }
+        }
+    }
+
+    if( found )
+        aDistance = best;
+
+    return found;
+}
+
 size_t PADS_SCH_PARSER::parseSectionCAEDECAL( const std::vector<std::string>& aLines, size_t aStartLine )
 {
     size_t i = aStartLine + 1;
@@ -965,6 +1204,14 @@ size_t PADS_SCH_PARSER::parseSectionCAEDECAL( const std::vector<std::string>& aL
                 pin.pin_decal_line_width = it->second.line_width;
                 pin.pin_decal_line_style = it->second.line_style;
                 pin.pin_decal_geometry_resolved = true;
+
+                // Prefer the actual connection-point -> symbol-body root distance.
+                // The pin-decal stem length remains the fallback for symbols whose
+                // body geometry cannot be intersected reliably.
+                double bodyRootDistance = 0.0;
+
+                if( padsPinBodyRootDistance( sym, pin, bodyRootDistance ) )
+                    pin.length = bodyRootDistance;
             }
         }
     }

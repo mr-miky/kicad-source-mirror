@@ -1664,6 +1664,286 @@ namespace
     }
 
 
+
+// PADS binary pin body-root geometry
+//
+// The pin CAEDECAL gives the terminal/decorator direction, but its farthest
+// point is not necessarily the owning symbol's body attachment point. KiCad
+// SCH_PIN length is connection-point -> pin-root, so ray-cast from the terminal
+// electrical point into the owning symbol body and use the nearest positive
+// intersection. The pin-decal-derived length remains the fallback.
+struct BINARY_RAY_POINT
+{
+    double x = 0.0;
+    double y = 0.0;
+};
+
+
+static BINARY_RAY_POINT binaryPinBodyDirection( const SOURCE_POINT& aVector, int aAngle, uint32_t aXym )
+{
+    const double radians = static_cast<double>( aAngle ) * M_PI / 1800.0;
+    const double c = std::cos( radians );
+    const double s = std::sin( radians );
+
+    BINARY_RAY_POINT result;
+    result.x = static_cast<double>( aVector.x ) * c - static_cast<double>( aVector.y ) * s;
+    result.y = static_cast<double>( aVector.x ) * s + static_cast<double>( aVector.y ) * c;
+
+    if( aXym & 0x1 )
+        result.x = -result.x;
+
+    if( aXym & 0x2 )
+        result.y = -result.y;
+
+    return result;
+}
+
+
+static double binaryCross2d( const BINARY_RAY_POINT& aA, const BINARY_RAY_POINT& aB )
+{
+    return aA.x * aB.y - aA.y * aB.x;
+}
+
+
+static bool binaryRaySegmentIntersection( const BINARY_RAY_POINT& aOrigin,
+                                          const BINARY_RAY_POINT& aDir,
+                                          const BINARY_RAY_POINT& aStart,
+                                          const BINARY_RAY_POINT& aEnd,
+                                          double& aDistance )
+{
+    constexpr double EPSILON = 1e-9;
+
+    const BINARY_RAY_POINT segment{ aEnd.x - aStart.x, aEnd.y - aStart.y };
+    const BINARY_RAY_POINT offset{ aStart.x - aOrigin.x, aStart.y - aOrigin.y };
+    const double denominator = binaryCross2d( aDir, segment );
+
+    if( std::abs( denominator ) <= EPSILON )
+        return false;
+
+    const double distance = binaryCross2d( offset, segment ) / denominator;
+    const double u = binaryCross2d( offset, aDir ) / denominator;
+
+    if( distance <= EPSILON || u < -EPSILON || u > 1.0 + EPSILON )
+        return false;
+
+    aDistance = distance;
+    return true;
+}
+
+
+static double binaryNormalizeAngle( double aAngle )
+{
+    const double full = 2.0 * M_PI;
+
+    while( aAngle < 0.0 )
+        aAngle += full;
+
+    while( aAngle >= full )
+        aAngle -= full;
+
+    return aAngle;
+}
+
+
+static bool binaryPointOnArc( const BINARY_RAY_POINT& aPoint,
+                              const BINARY_RAY_POINT& aStart,
+                              const BINARY_RAY_POINT& aCenter,
+                              int aSweepTenths, bool aClockwise )
+{
+    constexpr double ANGLE_EPSILON = 1e-7;
+    const double sweep = std::abs( static_cast<double>( aSweepTenths ) ) * M_PI / 1800.0;
+
+    if( sweep >= 2.0 * M_PI - ANGLE_EPSILON )
+        return true;
+
+    if( sweep <= ANGLE_EPSILON )
+        return false;
+
+    const double startAngle = std::atan2( aStart.y - aCenter.y, aStart.x - aCenter.x );
+    const double pointAngle = std::atan2( aPoint.y - aCenter.y, aPoint.x - aCenter.x );
+
+    if( aClockwise )
+        return binaryNormalizeAngle( startAngle - pointAngle ) <= sweep + ANGLE_EPSILON;
+
+    return binaryNormalizeAngle( pointAngle - startAngle ) <= sweep + ANGLE_EPSILON;
+}
+
+
+template<typename ACCEPT>
+static void binaryRayCircleIntersections( const BINARY_RAY_POINT& aOrigin,
+                                          const BINARY_RAY_POINT& aDir,
+                                          const BINARY_RAY_POINT& aCenter,
+                                          double aRadius, ACCEPT aAccept )
+{
+    constexpr double EPSILON = 1e-9;
+
+    if( aRadius <= EPSILON )
+        return;
+
+    const BINARY_RAY_POINT rel{ aOrigin.x - aCenter.x, aOrigin.y - aCenter.y };
+    const double projection = rel.x * aDir.x + rel.y * aDir.y;
+    const double constant = rel.x * rel.x + rel.y * rel.y - aRadius * aRadius;
+    const double discriminant = projection * projection - constant;
+
+    if( discriminant < -EPSILON )
+        return;
+
+    const double root = std::sqrt( std::max( 0.0, discriminant ) );
+    const double distances[2] = { -projection - root, -projection + root };
+
+    for( double distance : distances )
+    {
+        if( distance <= EPSILON )
+            continue;
+
+        const BINARY_RAY_POINT point{ aOrigin.x + distance * aDir.x,
+                                      aOrigin.y + distance * aDir.y };
+
+        aAccept( distance, point );
+    }
+}
+
+
+static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
+                                       const MODEL_PIN_DEFINITION& aPin,
+                                       double& aDistance )
+{
+    constexpr double EPSILON = 1e-9;
+
+    if( !aPin.pinDecalGeometryResolved )
+        return false;
+
+    BINARY_RAY_POINT dir = binaryPinBodyDirection( aPin.pinDecalVector, aPin.angle, aPin.xym );
+    const double dirLength = std::hypot( dir.x, dir.y );
+
+    if( dirLength <= EPSILON )
+        return false;
+
+    dir.x /= dirLength;
+    dir.y /= dirLength;
+
+    const BINARY_RAY_POINT origin{ static_cast<double>( aPin.position.x ),
+                                   static_cast<double>( aPin.position.y ) };
+
+    bool found = false;
+    double best = 0.0;
+
+    auto consider = [&]( double aCandidate )
+    {
+        if( aCandidate <= EPSILON )
+            return;
+
+        if( !found || aCandidate < best )
+        {
+            best = aCandidate;
+            found = true;
+        }
+    };
+
+    auto considerSegment = [&]( const SOURCE_POINT& aStart, const SOURCE_POINT& aEnd )
+    {
+        const BINARY_RAY_POINT start{ static_cast<double>( aStart.x ),
+                                      static_cast<double>( aStart.y ) };
+        const BINARY_RAY_POINT end{ static_cast<double>( aEnd.x ),
+                                    static_cast<double>( aEnd.y ) };
+        double distance = 0.0;
+
+        if( binaryRaySegmentIntersection( origin, dir, start, end, distance ) )
+            consider( distance );
+    };
+
+    for( const MODEL_GRAPHIC& graphic : aSymbol.graphics )
+    {
+        if( graphic.kind == MODEL_GRAPHIC_KIND::TEXT )
+            continue;
+
+        if( graphic.kind == MODEL_GRAPHIC_KIND::RECTANGLE && graphic.points.size() >= 2 )
+        {
+            const double minX = std::min( static_cast<double>( graphic.points[0].x ),
+                                          static_cast<double>( graphic.points[1].x ) );
+            const double maxX = std::max( static_cast<double>( graphic.points[0].x ),
+                                          static_cast<double>( graphic.points[1].x ) );
+            const double minY = std::min( static_cast<double>( graphic.points[0].y ),
+                                          static_cast<double>( graphic.points[1].y ) );
+            const double maxY = std::max( static_cast<double>( graphic.points[0].y ),
+                                          static_cast<double>( graphic.points[1].y ) );
+
+            const BINARY_RAY_POINT p0{ minX, minY };
+            const BINARY_RAY_POINT p1{ maxX, minY };
+            const BINARY_RAY_POINT p2{ maxX, maxY };
+            const BINARY_RAY_POINT p3{ minX, maxY };
+
+            double distance = 0.0;
+
+            if( binaryRaySegmentIntersection( origin, dir, p0, p1, distance ) )
+                consider( distance );
+
+            if( binaryRaySegmentIntersection( origin, dir, p1, p2, distance ) )
+                consider( distance );
+
+            if( binaryRaySegmentIntersection( origin, dir, p2, p3, distance ) )
+                consider( distance );
+
+            if( binaryRaySegmentIntersection( origin, dir, p3, p0, distance ) )
+                consider( distance );
+
+            continue;
+        }
+
+        if( graphic.kind == MODEL_GRAPHIC_KIND::CIRCLE && graphic.points.size() >= 2 )
+        {
+            const BINARY_RAY_POINT p0{ static_cast<double>( graphic.points[0].x ),
+                                       static_cast<double>( graphic.points[0].y ) };
+            const BINARY_RAY_POINT p1{ static_cast<double>( graphic.points[1].x ),
+                                       static_cast<double>( graphic.points[1].y ) };
+            const BINARY_RAY_POINT center{ ( p0.x + p1.x ) / 2.0,
+                                           ( p0.y + p1.y ) / 2.0 };
+            const double radius = std::hypot( p1.x - p0.x, p1.y - p0.y ) / 2.0;
+
+            binaryRayCircleIntersections(
+                    origin, dir, center, radius,
+                    [&]( double aCandidate, const BINARY_RAY_POINT& )
+                    {
+                        consider( aCandidate );
+                    } );
+            continue;
+        }
+
+        if( graphic.kind == MODEL_GRAPHIC_KIND::ARC && graphic.points.size() >= 2 )
+        {
+            const SOURCE_POINT& startSource = graphic.points.front();
+            const BINARY_RAY_POINT start{ static_cast<double>( startSource.x ),
+                                          static_cast<double>( startSource.y ) };
+            const BINARY_RAY_POINT center{ static_cast<double>( graphic.arcCenter.x ),
+                                           static_cast<double>( graphic.arcCenter.y ) };
+            const double radius = std::hypot( start.x - center.x, start.y - center.y );
+
+            binaryRayCircleIntersections(
+                    origin, dir, center, radius,
+                    [&]( double aCandidate, const BINARY_RAY_POINT& aPoint )
+                    {
+                        if( binaryPointOnArc( aPoint, start, center, graphic.arcSweepAngle,
+                                              graphic.arcClockwise ) )
+                        {
+                            consider( aCandidate );
+                        }
+                    } );
+            continue;
+        }
+
+        if( graphic.points.size() < 2 )
+            continue;
+
+        for( size_t i = 0; i + 1 < graphic.points.size(); ++i )
+            considerSegment( graphic.points[i], graphic.points[i + 1] );
+    }
+
+    if( found )
+        aDistance = best;
+
+    return found;
+}
+
     void decodeUsedDecals( const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
                            const SHEET_CONTROLLERS& aControllers, const DEFINITION_LAYOUT& aLayout, size_t aSheetIndex,
                            const wxString&                              aSourceName,
@@ -1921,6 +2201,16 @@ namespace
                         definitionPin.pinDecalStrokeWidth = bestStrokeWidth;
                         definitionPin.pinDecalLineStyle = bestLineStyle;
                         definitionPin.pinDecalGeometryResolved = true;
+
+                        // Prefer the actual terminal -> owning-symbol body root.
+                        // The pin-decal-derived length above remains the fallback.
+                        double bodyRootDistance = 0.0;
+
+                        if( binaryPinBodyRootDistance( *decal.definition, definitionPin, bodyRootDistance ) )
+                        {
+                            definitionPin.length =
+                                    static_cast<int64_t>( std::llround( bodyRootDistance ) );
+                        }
                     }
                     else
                     {

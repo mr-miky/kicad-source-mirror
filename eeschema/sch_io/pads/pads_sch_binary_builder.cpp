@@ -790,12 +790,20 @@ namespace
 
         int pinLength = toIU( aPin.length );
 
-        if( aPin.decalName.text == wxS( "PINB" ) )
-            pinLength += schIUScale.MilsToIU( 50 );
+        // aPin.length is resolved by the binary parser from the actual
+        // owning-symbol body attachment point when possible, with the
+        // pin-decal-derived stem length as fallback.
 
         pin->SetLength( pinLength );
         pin->SetType( pinType( aPin.electricalType ) );
-        pin->SetShape( pinShape( aPin.graphicStyle ) );
+
+        GRAPHIC_PINSHAPE graphicShape = pinShape( aPin.graphicStyle );
+
+        // PADS PINIEB is the active-low input wedge, not a bubble.
+        if( aPin.decalName.text == wxS( "PINIEB" ) )
+            graphicShape = GRAPHIC_PINSHAPE::INPUT_LOW;
+
+        pin->SetShape( graphicShape );
         pin->SetVisible( aPin.presentation.visible );
 
         // KiCad pins do not store a font face.  Fit their single scalar text size by comparing
