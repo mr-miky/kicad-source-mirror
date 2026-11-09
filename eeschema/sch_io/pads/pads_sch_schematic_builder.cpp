@@ -237,6 +237,21 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
             if( label )
             {
+                // PADS $OSR_SYMS has exactly two off-page variants:
+                //   flags2 0 = REFIN  -> input
+                //   flags2 1 = REFOUT -> output
+                // There is no PADS bidirectional off-page variant. Unexpected
+                // values remain unspecified rather than inventing BIDI semantics.
+                if( opcIt != aOffPageConnectors.end() && opcIt->second.symbol_lib == "$OSR_SYMS" )
+                {
+                    switch( opcIt->second.flags2 )
+                    {
+                    case 0: label->SetShape( LABEL_FLAG_SHAPE::L_INPUT ); break;
+                    case 1: label->SetShape( LABEL_FLAG_SHAPE::L_OUTPUT ); break;
+                    default: label->SetShape( LABEL_FLAG_SHAPE::L_UNSPECIFIED ); break;
+                    }
+                }
+
                 // Apply the presentation authored by PADS *NETNAMES* to the
                 // off-page/global label.
                 if( presentationIt != aNetNameLabels.end() )
@@ -315,7 +330,7 @@ SCH_GLOBALLABEL* PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabel( const SCH_SIGNAL& a
     wxString labelName = convertNetName( aSignal.name );
 
     SCH_GLOBALLABEL* label = new SCH_GLOBALLABEL( aPosition, labelName );
-    label->SetShape( LABEL_FLAG_SHAPE::L_BIDI );
+    label->SetShape( LABEL_FLAG_SHAPE::L_UNSPECIFIED );
     label->SetSpinStyle( aOrientation );
 
     int labelSize = schIUScale.MilsToIU( 50 );
