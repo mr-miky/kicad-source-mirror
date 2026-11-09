@@ -93,6 +93,10 @@ struct PARAMETERS
     std::string default_font;
 
     std::map<std::string, std::string> fields;
+
+    // Preserve source order as well as name lookup.  The binary importer keeps
+    // title-block fields ordered and uses that order for COMMENT fallbacks.
+    std::vector<std::pair<std::string, std::string>> field_entries;
 };
 
 
@@ -370,6 +374,10 @@ struct OFF_PAGE_CONNECTOR
     int         rotation = 0;
     int         flags1 = 0;
     int         flags2 = 0;
+
+    // External height of the selected PADS off-page CAEDECAL body, in mils.
+    // Zero means unresolved and leaves the KiCad label at its presentation size.
+    double      body_height = 0.0;
 };
 
 
