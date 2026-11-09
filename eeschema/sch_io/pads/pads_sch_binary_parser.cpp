@@ -3231,18 +3231,19 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
             if( attributeIndex == 0xFFFF )
             {
-                name.text = wxS( "*" );
-                name.source = fieldSource;
-                value.source = fieldSource;
+                // Unbound PADS placement-field records carry presentation only;
+                // they are not component attributes and must not become a
+                // synthetic "*" field in KiCad.
+                ++aFieldCursor;
+                continue;
             }
-            else
-            {
-                if( attributeIndex >= aTarget.attributeCount )
-                    throwDecodeError( fieldSource, wxS( "placement field attribute index leaves component group" ) );
 
-                std::tie( name, value ) =
-                        decodePlacementAttribute( aDecode, aTarget.attributeStart + attributeIndex, true, aModel );
-            }
+            if( attributeIndex >= aTarget.attributeCount )
+                throwDecodeError( fieldSource, wxS( "placement field attribute index leaves component group" ) );
+
+            std::tie( name, value ) =
+                    decodePlacementAttribute( aDecode, aTarget.attributeStart + attributeIndex, true, aModel );
+
             MODEL_FIELD field;
             field.source = fieldSource;
             field.name = std::move( name );
@@ -3305,12 +3306,14 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             auto [name, value] =
                     decodePlacementAttribute( aDecode, aTarget.attributeStart + attributeIndex, true, aModel );
 
-            if( name.text.CmpNoCase( wxS( "PCB DECAL" ) ) == 0
-                || std::ranges::any_of( aPlacement.fields,
-                                        [&]( const MODEL_FIELD& aField )
-                                        {
-                                            return aField.name.text.CmpNoCase( name.text ) == 0;
-                                        } ) )
+            // Preserve real PADS attributes even when their value is empty.
+            // PCB DECAL is deliberately retained here so the builder can map
+            // it to KiCad's native Footprint field.
+            if( std::ranges::any_of( aPlacement.fields,
+                                     [&]( const MODEL_FIELD& aField )
+                                     {
+                                         return aField.name.text.CmpNoCase( name.text ) == 0;
+                                     } ) )
             {
                 continue;
             }

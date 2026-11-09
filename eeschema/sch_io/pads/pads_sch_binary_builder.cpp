@@ -1294,11 +1294,16 @@ namespace
     void applyField( SCH_SYMBOL* aSymbol, const MODEL_FIELD& aSource,
                      std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
-        SCH_FIELD* field = nullptr;
+        SCH_FIELD*            field = nullptr;
+        PADS_ATTRIBUTE_MAPPER mapper;
+        const std::string     padsName = aSource.name.text.ToStdString();
+        const std::string     mappedName = mapper.GetKiCadFieldName( padsName );
 
-        if( aSource.name.text.CmpNoCase( wxS( "REF-DES" ) ) == 0 )
+        if( mapper.IsReferenceField( padsName ) )
+        {
             field = aSymbol->GetField( FIELD_T::REFERENCE );
-        else if( aSource.name.text.CmpNoCase( wxS( "PART-TYPE" ) ) == 0 )
+        }
+        else if( mapper.IsPartTypeField( padsName ) )
         {
             const wxString fieldName = wxString::FromUTF8( PADS_ATTRIBUTE_MAPPER::FIELD_PART_TYPE );
             field = aSymbol->GetField( fieldName );
@@ -1310,19 +1315,24 @@ namespace
                 field = aSymbol->GetField( fieldName );
             }
         }
-        else if( aSource.name.text.CmpNoCase( wxS( "VALUE" ) ) == 0 )
+        else if( mapper.IsValueField( padsName ) )
         {
             field = aSymbol->GetField( FIELD_T::VALUE );
         }
+        else if( mapper.IsFootprintField( padsName ) )
+        {
+            field = aSymbol->GetField( FIELD_T::FOOTPRINT );
+        }
         else
         {
-            field = aSymbol->GetField( aSource.name.text );
+            const wxString fieldName = wxString::FromUTF8( mappedName );
+            field = aSymbol->GetField( fieldName );
 
             if( !field )
             {
-                SCH_FIELD newField( aSymbol, FIELD_T::USER, aSource.name.text );
+                SCH_FIELD newField( aSymbol, FIELD_T::USER, fieldName );
                 aSymbol->AddField( newField );
-                field = aSymbol->GetField( aSource.name.text );
+                field = aSymbol->GetField( fieldName );
             }
         }
 

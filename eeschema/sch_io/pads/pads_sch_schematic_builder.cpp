@@ -971,7 +971,7 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateCustomFields( SCH_SYMBOL*           aSymbo
     // Create fields from attr_overrides that weren't in the attributes vector
     for( const auto& [name, value] : aPlacement.attr_overrides )
     {
-        if( value.empty() || processedNames.count( name ) || mapper.IsStandardField( name )
+        if( processedNames.count( name ) || mapper.IsStandardField( name )
                 || isSignalPinOverride( name ) )
             continue;
 
