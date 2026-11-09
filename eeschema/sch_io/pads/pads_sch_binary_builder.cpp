@@ -2338,8 +2338,13 @@ namespace
                 break;
 
             case MODEL_LABEL_KIND::GLOBAL:
-                item = std::make_unique<SCH_GLOBALLABEL>( pagePoint( label.position, pageHeight ), label.text.text );
+            {
+                auto globalLabel =
+                        std::make_unique<SCH_GLOBALLABEL>( pagePoint( label.position, pageHeight ), label.text.text );
+                globalLabel->SetShape( LABEL_FLAG_SHAPE::L_UNSPECIFIED );
+                item = std::move( globalLabel );
                 break;
+            }
 
             case MODEL_LABEL_KIND::HIERARCHICAL:
                 item = std::make_unique<SCH_HIERLABEL>( pagePoint( label.position, pageHeight ), label.text.text );
@@ -2385,6 +2390,14 @@ namespace
                 // must run last because applyTextPresentation() changes angle/alignment.
                 if( auto* globalLabel = dynamic_cast<SCH_GLOBALLABEL*>( text ) )
                 {
+                    // PADS $OSR_SYMS defines only REFIN and REFOUT; it has no
+                    // bidirectional off-page variant.  The parser already resolves
+                    // the selected binary variant to its CAEDECAL name.
+                    if( label.decalName.text.CmpNoCase( wxS( "REFIN" ) ) == 0 )
+                        globalLabel->SetShape( LABEL_FLAG_SHAPE::L_INPUT );
+                    else if( label.decalName.text.CmpNoCase( wxS( "REFOUT" ) ) == 0 )
+                        globalLabel->SetShape( LABEL_FLAG_SHAPE::L_OUTPUT );
+
                     // PADS binary off-page measured body-fit scaling.
                     // PADS REFIN/REFOUT has a 100 mil external body height.  Measure the
                     // actual KiCad SCH_GLOBALLABEL body, including outline stroke, and fit
