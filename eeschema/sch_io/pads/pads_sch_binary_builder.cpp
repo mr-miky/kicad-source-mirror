@@ -2323,14 +2323,31 @@ namespace
                                                                    connection.vertices[1] ) ) )
                     labelPoint = connection.vertices[1];
 
+                // Suppress the synthetic net-name label when this connection already
+                // terminates on an explicit PADS label.  The fallback label point is
+                // intentionally biased toward a pin endpoint, while an off-page/global
+                // label normally lives at the opposite end of the same connection.
+                // Comparing only against labelPoint therefore duplicates the source
+                // label with a tiny default bidirectional SCH_GLOBALLABEL at the pin.
                 const bool hasSourceLabel = std::ranges::any_of(
                         MODEL_INDEX::ForSheet( aIndex.labelsBySheet, aSourceSheet.id ),
                         [&]( const MODEL_LABEL* aLabel )
                         {
-                            return ( aLabel->kind == MODEL_LABEL_KIND::GLOBAL || aLabel->kind == MODEL_LABEL_KIND::POWER
-                                     || aLabel->kind == MODEL_LABEL_KIND::GROUND )
-                                   && aLabel->text.text == net->name.text && aLabel->position.x == labelPoint.x
-                                   && aLabel->position.y == labelPoint.y;
+                            if( ( aLabel->kind != MODEL_LABEL_KIND::GLOBAL
+                                  && aLabel->kind != MODEL_LABEL_KIND::POWER
+                                  && aLabel->kind != MODEL_LABEL_KIND::GROUND )
+                                || aLabel->text.text != net->name.text )
+                            {
+                                return false;
+                            }
+
+                            return std::ranges::any_of(
+                                    connection.vertices,
+                                    [&]( const SOURCE_POINT& aPoint )
+                                    {
+                                        return aLabel->position.x == aPoint.x
+                                               && aLabel->position.y == aPoint.y;
+                                    } );
                         } );
 
                 if( !hasSourceLabel )
