@@ -46,6 +46,7 @@
 #include <stroke_params.h>
 
 #include <advanced_config.h>
+#include <embedded_files.h>
 #include <io/pads/pads_binary_utils.h>
 #include <io/pads/pads_common.h>
 #include <locale_io.h>
@@ -53,9 +54,13 @@
 #include <reporter.h>
 #include <trace_helpers.h>
 
+#include <cmath>
 #include <fstream>
+#include <locale>
 #include <map>
+#include <memory>
 #include <set>
+#include <sstream>
 #include <wx/filename.h>
 #include <wx/log.h>
 
@@ -542,6 +547,287 @@ static void appendGraphicPrimitive( SCH_SCREEN* aScreen, const PADS_SCH::SYMBOL_
     }
 }
 
+static std::string quotePadsAsciiWorksheetText( const std::string& aText )
+{
+    std::string result;
+
+    for( char ch : aText )
+    {
+        if( ch == '\\' || ch == '"' )
+            result.push_back( '\\' );
+
+        if( ch == '\n' )
+            result += "\\n";
+        else if( ch != '\r' )
+            result.push_back( ch );
+    }
+
+    return result;
+}
+
+
+static double padsAsciiWorksheetX( double aPadsX, const PADS_SCH::PARAMETERS& aParams )
+{
+    return ( aParams.sheet_size.width - aPadsX ) * 0.0254;
+}
+
+
+static double padsAsciiWorksheetY( double aPadsY )
+{
+    return aPadsY * 0.0254;
+}
+
+
+static std::string padsAsciiWorksheetText( const PADS_SCH::TEXT_ITEM& aText,
+                                           const PADS_SCH::PARAMETERS& aParams )
+{
+    // In a PADS border template attr_flag=1 marks a field placeholder.
+    // attr_flag=0 is ordinary literal worksheet text (e.g. "COMPANY:").
+    if( aText.attr_flag == 0 )
+        return quotePadsAsciiWorksheetText( aText.content );
+
+    static const std::map<std::string, std::string> variables = {
+        { "Title", "${TITLE}" },
+        { "Revision", "${REVISION}" },
+        { "Drawn Date", "${ISSUE_DATE}" },
+        { "Company Name", "${COMPANY}" },
+        { "Designed", "${COMMENT1}" },
+        { "Des Date", "${COMMENT2}" },
+        { "Drawn By", "${COMMENT3}" },
+        { "Checked By", "${COMMENT4}" },
+        { "Checked Date", "${COMMENT5}" },
+        { "Approved", "${COMMENT6}" },
+        { "App Date", "${COMMENT7}" },
+        { "Drawing Number", "${COMMENT8}" },
+        { "Scale", "${COMMENT9}" },
+        { "Sheet Number", "${#}" },
+        { "Number of Sheets", "${##}" },
+        { "Sheet Name", "${SHEETNAME}" },
+        { "Sheet Size", "${PAPER}" }
+    };
+
+    if( auto native = variables.find( aText.content ); native != variables.end() )
+        return native->second;
+
+    if( auto field = aParams.fields.find( aText.content ); field != aParams.fields.end() )
+        return quotePadsAsciiWorksheetText( field->second );
+
+    return quotePadsAsciiWorksheetText( aText.content );
+}
+
+
+static void appendPadsAsciiWorksheetLine( std::ostringstream& aOutput,
+                                          double aX1, double aY1,
+                                          double aX2, double aY2,
+                                          double aWidth,
+                                          const PADS_SCH::PARAMETERS& aParams )
+{
+    aOutput << "  (line (name \"\") (start "
+            << padsAsciiWorksheetX( aX1, aParams ) << ' '
+            << padsAsciiWorksheetY( aY1 )
+            << ") (end "
+            << padsAsciiWorksheetX( aX2, aParams ) << ' '
+            << padsAsciiWorksheetY( aY2 ) << ')';
+
+    if( aWidth > 0.0 )
+        aOutput << " (linewidth " << aWidth * 0.0254 << ')';
+
+    aOutput << ")\n";
+}
+
+
+static void appendPadsAsciiWorksheetPrimitive( std::ostringstream& aOutput,
+                                               const PADS_SCH::SYMBOL_GRAPHIC& aPrim,
+                                               const PADS_SCH::POINT& aOrigin,
+                                               const PADS_SCH::PARAMETERS& aParams )
+{
+    auto emitLocalLine =
+            [&]( double aX1, double aY1, double aX2, double aY2 )
+            {
+                appendPadsAsciiWorksheetLine(
+                        aOutput,
+                        aOrigin.x + aX1, aOrigin.y + aY1,
+                        aOrigin.x + aX2, aOrigin.y + aY2,
+                        aPrim.line_width, aParams );
+            };
+
+    if( aPrim.type == PADS_SCH::GRAPHIC_TYPE::CIRCLE && aPrim.radius > 0.0 )
+    {
+        constexpr int segments = 64;
+
+        for( int i = 0; i < segments; ++i )
+        {
+            const double a1 = 2.0 * M_PI * static_cast<double>( i ) / segments;
+            const double a2 = 2.0 * M_PI * static_cast<double>( i + 1 ) / segments;
+
+            emitLocalLine( aPrim.center.x + aPrim.radius * std::cos( a1 ),
+                           aPrim.center.y + aPrim.radius * std::sin( a1 ),
+                           aPrim.center.x + aPrim.radius * std::cos( a2 ),
+                           aPrim.center.y + aPrim.radius * std::sin( a2 ) );
+        }
+
+        return;
+    }
+
+    if( aPrim.type == PADS_SCH::GRAPHIC_TYPE::RECTANGLE && aPrim.points.size() == 2 )
+    {
+        const PADS_SCH::POINT& p1 = aPrim.points[0].coord;
+        const PADS_SCH::POINT& p2 = aPrim.points[1].coord;
+
+        emitLocalLine( p1.x, p1.y, p2.x, p1.y );
+        emitLocalLine( p2.x, p1.y, p2.x, p2.y );
+        emitLocalLine( p2.x, p2.y, p1.x, p2.y );
+        emitLocalLine( p1.x, p2.y, p1.x, p1.y );
+        return;
+    }
+
+    if( aPrim.points.size() < 2 )
+        return;
+
+    for( size_t i = 0; i + 1 < aPrim.points.size(); ++i )
+    {
+        const PADS_SCH::POINT& p1 = aPrim.points[i].coord;
+        const PADS_SCH::POINT& p2 = aPrim.points[i + 1].coord;
+        emitLocalLine( p1.x, p1.y, p2.x, p2.y );
+    }
+}
+
+
+static std::string serializePadsAsciiWorksheet( const PADS_SCH::LINES_ITEM& aBorder,
+                                                const PADS_SCH::PARAMETERS& aParams )
+{
+    std::ostringstream output;
+    output.imbue( std::locale::classic() );
+    output.precision( 8 );
+
+    output << "(kicad_wks (version 20220228) (generator pads_import)\n"
+              "  (setup (textsize 1.27 1.27) (linewidth 0) (textlinewidth 0)"
+              " (left_margin 0) (right_margin 0) (top_margin 0) (bottom_margin 0))\n";
+
+    for( const PADS_SCH::SYMBOL_GRAPHIC& prim : aBorder.primitives )
+        appendPadsAsciiWorksheetPrimitive( output, prim, aBorder.origin, aParams );
+
+    for( const PADS_SCH::TEXT_ITEM& text : aBorder.texts )
+    {
+        if( text.content.empty() )
+            continue;
+
+        const double padsX = aBorder.origin.x + text.position.x;
+        double       padsY = aBorder.origin.y + text.position.y;
+
+        PADS_SCH::NETNAME_LABEL fontLabel;
+        fontLabel.font_name = text.font_name;
+        const PADS_ASCII_NETNAME_FONT font =
+                resolvePadsAsciiNetNameFont( fontLabel, aParams );
+
+        const double nominalHeight =
+                text.height > 0 ? static_cast<double>( text.height ) : aParams.text_size;
+        double visualHeight = nominalHeight;
+
+        if( !font.face.IsEmpty() )
+            visualHeight = static_cast<double>( KiROUND( visualHeight * 0.5885217956 ) );
+        else
+            visualHeight *= ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale;
+
+        GR_TEXT_H_ALIGN_T hJustify = GR_TEXT_H_ALIGN_LEFT;
+        GR_TEXT_V_ALIGN_T vJustify = GR_TEXT_V_ALIGN_BOTTOM;
+        PADS_COMMON::DecodeNineWayJustification(
+                text.justification, hJustify, vJustify,
+                static_cast<double>( text.rotation ) * 90.0 );
+
+        // PADS anchors outline text to the Windows character cell, while KiCad
+        // uses the reduced visual/em height.  Keeping the original top/bottom
+        // anchor after shrinking the text shifts its visual center.  Restore
+        // the authored PADS center by moving the anchor by half the removed
+        // character-cell padding.  Middle-justified text is already centered.
+        //
+        // Limit this to unrotated worksheet text until rotated page-template
+        // anchor directions are independently verified.
+        if( !font.face.IsEmpty() && text.rotation == 0 )
+        {
+            const double anchorCompensation = ( nominalHeight - visualHeight ) / 2.0;
+
+            if( vJustify == GR_TEXT_V_ALIGN_BOTTOM )
+                padsY += anchorCompensation;
+            else if( vJustify == GR_TEXT_V_ALIGN_TOP )
+                padsY -= anchorCompensation;
+        }
+
+        output << "  (tbtext \""
+               << padsAsciiWorksheetText( text, aParams )
+               << "\" (name \"\") (pos "
+               << padsAsciiWorksheetX( padsX, aParams ) << ' '
+               << padsAsciiWorksheetY( padsY ) << ')';
+
+        if( text.rotation != 0 )
+            output << " (rotate " << static_cast<double>( text.rotation ) * 90.0 << ')';
+
+        output << " (font";
+
+        if( !font.face.IsEmpty() )
+            output << " (face \""
+                   << quotePadsAsciiWorksheetText( std::string( font.face.utf8_str() ) )
+                   << "\")";
+
+        output << " (size " << visualHeight * 0.0254
+               << ' ' << visualHeight * 0.0254 << ')';
+
+        if( text.width_factor > 0 )
+            output << " (linewidth " << static_cast<double>( text.width_factor ) * 0.0254 << ')';
+
+        if( font.bold )
+            output << " bold";
+
+        if( font.italic )
+            output << " italic";
+
+        output << ')';
+
+        if( hJustify != GR_TEXT_H_ALIGN_LEFT || vJustify != GR_TEXT_V_ALIGN_CENTER )
+        {
+            output << " (justify";
+
+            if( hJustify == GR_TEXT_H_ALIGN_CENTER )
+                output << " center";
+            else if( hJustify == GR_TEXT_H_ALIGN_RIGHT )
+                output << " right";
+
+            if( vJustify == GR_TEXT_V_ALIGN_TOP )
+                output << " top";
+            else if( vJustify == GR_TEXT_V_ALIGN_BOTTOM )
+                output << " bottom";
+
+            output << ')';
+        }
+
+        output << ")\n";
+    }
+
+    output << ")\n";
+    return output.str();
+}
+
+
+static void installPadsAsciiWorksheet( SCHEMATIC* aSchematic,
+                                       const PADS_SCH::LINES_ITEM& aBorder,
+                                       const PADS_SCH::PARAMETERS& aParams )
+{
+    const std::string serialized = serializePadsAsciiWorksheet( aBorder, aParams );
+
+    auto worksheet = std::make_shared<EMBEDDED_FILES::EMBEDDED_FILE>();
+    worksheet->name = wxS( "pads_import.kicad_wks" );
+    worksheet->type = EMBEDDED_FILES::EMBEDDED_FILE::FILE_TYPE::WORKSHEET;
+    worksheet->decompressedData.assign( serialized.begin(), serialized.end() );
+
+    if( EMBEDDED_FILES::CompressAndEncode( *worksheet ) != EMBEDDED_FILES::RETURN_CODE::OK )
+        THROW_IO_ERROR( wxS( "Could not embed the PADS ASCII worksheet." ) );
+
+    worksheet->is_valid = true;
+    aSchematic->GetEmbeddedFiles()->AddFile( worksheet );
+    aSchematic->Settings().m_SchDrawingSheetFileName = worksheet->GetLink();
+}
+
+
 
 SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC* aSchematic, SCH_SHEET* aAppendToMe,
                                            const std::map<std::string, UTF8>* aProperties )
@@ -594,11 +880,6 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
     SCH_SCREEN* rootScreen = rootSheet->GetScreen();
     wxCHECK( rootScreen, nullptr );
 
-    SCH_SHEET_INSTANCE sheetInstance;
-    sheetInstance.m_Path = rootPath.Path();
-    sheetInstance.m_PageNumber = wxT( "#" );
-    rootScreen->m_sheetInstances.emplace_back( sheetInstance );
-
     if( m_progressReporter )
         m_progressReporter->SetNumPhases( 3 );
 
@@ -648,6 +929,11 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
     // PADS Y-up to KiCad Y-down: Y_kicad = pageHeight - Y_pads
     const int pageHeightIU = pageInfo.GetHeightIU( schIUScale.IU_PER_MILS );
 
+    // The root is also a real KiCad screen.  In a multi-sheet ASCII import it
+    // acts as a hierarchy container, but it must still use the PADS page size;
+    // otherwise an embedded A3 worksheet is displayed on KiCad's default A4.
+    rootScreen->SetPageSettings( pageInfo );
+
     // Build LIB_SYMBOL objects from all CAEDECAL definitions
     for( const PADS_SCH::SYMBOL_DEF& symDef : parser.GetSymbolDefs() )
         symbolBuilder.GetOrCreateSymbol( symDef );
@@ -669,9 +955,54 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
 
     std::map<int, SheetContext> sheetContexts;
 
+    bool allPadsSheetsTopLevel = !aAppendToMe;
+
+    if( allPadsSheetsTopLevel )
+    {
+        for( int sheetNum : sheetNumbers )
+        {
+            const PADS_SCH::SHEET_HEADER* header = nullptr;
+
+            for( const PADS_SCH::SHEET_HEADER& candidate : parser.GetSheetHeaders() )
+            {
+                if( candidate.sheet_num == sheetNum )
+                {
+                    header = &candidate;
+                    break;
+                }
+            }
+
+            if( !header || header->parent_num >= 0 )
+            {
+                allPadsSheetsTopLevel = false;
+                break;
+            }
+        }
+    }
+
     if( isSingleSheet )
     {
-        int          sheetNum = *sheetNumbers.begin();
+        int sheetNum = *sheetNumbers.begin();
+
+        for( const PADS_SCH::SHEET_HEADER& header : parser.GetSheetHeaders() )
+        {
+            if( header.sheet_num == sheetNum && !header.sheet_name.empty() )
+            {
+                rootSheet->GetField( FIELD_T::SHEET_NAME )
+                        ->SetText( wxString::FromUTF8( header.sheet_name ) );
+                break;
+            }
+        }
+
+        wxString pageNo = wxS( "1" );
+        rootScreen->SetPageNumber( pageNo );
+        rootPath.SetPageNumber( pageNo );
+
+        SCH_SHEET_INSTANCE instance;
+        instance.m_Path = rootPath.Path();
+        instance.m_PageNumber = pageNo;
+        rootScreen->m_sheetInstances.emplace_back( instance );
+
         SheetContext ctx;
         ctx.sheet = rootSheet;
         ctx.screen = rootScreen;
@@ -679,25 +1010,130 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
         ctx.screen->SetPageSettings( pageInfo );
         sheetContexts[sheetNum] = ctx;
     }
+    else if( allPadsSheetsTopLevel )
+    {
+        // Flat PADS multi-sheet designs contain peer sheets. KiCad already has
+        // an internal virtual root, so do not add a visible importer container.
+        std::vector<SCH_SHEET*> topLevelSheets;
+        std::set<wxString>      usedFilenames;
+        size_t                  ordinal = 0;
+
+        auto sanitizedFilename =
+                [&]( const wxString& aName ) -> wxString
+                {
+                    wxString stem = aName;
+
+                    for( wxUniChar character : wxS( "<>:\"/\\|?*" ) )
+                        stem.Replace( wxString( character ), wxS( "_" ) );
+
+                    stem.Trim( true ).Trim( false );
+
+                    if( stem.IsEmpty() )
+                        stem = wxString::Format( wxS( "pads_sheet_%zu" ), ordinal + 1 );
+
+                    wxString candidate =
+                            stem + wxS( "." ) + FILEEXT::KiCadSchematicFileExtension;
+                    size_t suffix = 2;
+
+                    while( usedFilenames.contains( candidate.Lower() ) )
+                    {
+                        candidate = wxString::Format(
+                                wxS( "%s_%zu.%s" ), stem, suffix++,
+                                FILEEXT::KiCadSchematicFileExtension );
+                    }
+
+                    usedFilenames.insert( candidate.Lower() );
+                    return candidate;
+                };
+
+        for( int sheetNum : sheetNumbers )
+        {
+            SCH_SHEET*  sheet = nullptr;
+            SCH_SCREEN* screen = nullptr;
+
+            if( ordinal == 0 )
+            {
+                sheet = rootSheet;
+                screen = rootScreen;
+            }
+            else
+            {
+                sheet = new SCH_SHEET( aSchematic );
+                screen = new SCH_SCREEN( aSchematic );
+                sheet->SetScreen( screen );
+                sheet->SyncUuidToScreen();
+            }
+
+            wxString sheetName = wxString::Format( wxS( "Sheet %d" ), sheetNum );
+
+            for( const PADS_SCH::SHEET_HEADER& header : parser.GetSheetHeaders() )
+            {
+                if( header.sheet_num == sheetNum )
+                {
+                    if( !header.sheet_name.empty() )
+                        sheetName = wxString::FromUTF8( header.sheet_name );
+
+                    break;
+                }
+            }
+
+            wxString sheetFilename = sanitizedFilename( sheetName );
+            wxString pageNo = wxString::Format( wxS( "%zu" ), ordinal + 1 );
+
+            sheet->GetField( FIELD_T::SHEET_NAME )->SetText( sheetName );
+            sheet->GetField( FIELD_T::SHEET_FILENAME )->SetText( sheetFilename );
+            screen->SetFileName( sheetFilename );
+            screen->SetPageNumber( pageNo );
+            screen->SetPageSettings( pageInfo );
+
+            SCH_SHEET_PATH path;
+            path.push_back( sheet );
+            path.SetPageNumber( pageNo );
+
+            SCH_SHEET_INSTANCE instance;
+            instance.m_Path = path.Path();
+            instance.m_PageNumber = pageNo;
+            screen->m_sheetInstances.emplace_back( instance );
+
+            SheetContext ctx;
+            ctx.sheet = sheet;
+            ctx.screen = screen;
+            ctx.path = path;
+            sheetContexts[sheetNum] = ctx;
+
+            topLevelSheets.push_back( sheet );
+            ++ordinal;
+        }
+
+        if( topLevelSheets.empty() )
+            THROW_IO_ERROR( wxS( "PADS ASCII schematic contains no usable sheets." ) );
+
+        aSchematic->SetTopLevelSheets( topLevelSheets );
+
+        rootSheet = topLevelSheets.front();
+        rootScreen = rootSheet->GetScreen();
+        rootPath = sheetContexts.begin()->second.path;
+    }
     else
     {
-        // Multi-sheet: root is a container with sub-sheets
+        // Keep the old fallback for append mode or a PADS design that declares
+        // actual parent/child sheet relationships.
         int totalSheets = static_cast<int>( sheetNumbers.size() );
 
         for( int sheetNum : sheetNumbers )
         {
-            SCH_SHEET* subSheet = schBuilder.CreateHierarchicalSheet( sheetNum, totalSheets, rootSheet, aFileName );
+            SCH_SHEET* subSheet =
+                    schBuilder.CreateHierarchicalSheet( sheetNum, totalSheets, rootSheet, aFileName );
 
             if( !subSheet )
                 continue;
 
-            // Find the sheet name from parser headers
-            for( const PADS_SCH::SHEET_HEADER& hdr : parser.GetSheetHeaders() )
+            for( const PADS_SCH::SHEET_HEADER& header : parser.GetSheetHeaders() )
             {
-                if( hdr.sheet_num == sheetNum && !hdr.sheet_name.empty() )
+                if( header.sheet_num == sheetNum && !header.sheet_name.empty() )
                 {
-                    subSheet->GetField( FIELD_T::SHEET_NAME )->SetText( wxString::FromUTF8( hdr.sheet_name ) );
-
+                    subSheet->GetField( FIELD_T::SHEET_NAME )
+                            ->SetText( wxString::FromUTF8( header.sheet_name ) );
                     break;
                 }
             }
@@ -1628,6 +2064,20 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
         }
     }
 
+    // Convert the PADS border template into a native embedded KiCad worksheet.
+    // The same worksheet is then rendered automatically on every imported sheet.
+    if( !aAppendToMe && !params.border_template.empty() )
+    {
+        for( const PADS_SCH::LINES_ITEM& linesItem : parser.GetLinesItems() )
+        {
+            if( linesItem.name == params.border_template )
+            {
+                installPadsAsciiWorksheet( aSchematic, linesItem, params );
+                break;
+            }
+        }
+    }
+
     // Place graphic lines from *LINES* section (skip the border template) on
     // the sheet they belong to.
     if( !sheetContexts.empty() )
@@ -1659,11 +2109,23 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
         }
     }
 
-    // Set title block from parsed parameters
-    schBuilder.CreateTitleBlock( rootScreen );
+    // Set title-block values on every imported screen.  The drawing sheet is
+    // global, but KiCad resolves ${TITLE}/${COMPANY}/comments in each screen.
+    std::set<SCH_SCREEN*> titleScreens;
+    titleScreens.insert( rootScreen );
 
-    // Finalize all sheets
-    SCH_SCREENS allSheets( rootSheet );
+    for( const auto& [sheetNumber, context] : sheetContexts )
+    {
+        (void) sheetNumber;
+
+        if( context.screen )
+            titleScreens.insert( context.screen );
+    }
+
+    for( SCH_SCREEN* screen : titleScreens )
+        schBuilder.CreateTitleBlock( screen );
+
+    SCH_SCREENS allSheets( &aSchematic->Root() );
     allSheets.UpdateSymbolLinks();
     allSheets.ClearEditFlags();
 
@@ -1675,7 +2137,7 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
 
     m_errorMessages.clear();
 
-    return rootSheet;
+    return aAppendToMe ? aAppendToMe : aSchematic->GetTopLevelSheet();
 }
 
 
