@@ -12,6 +12,8 @@
 #include <sch_io/pads/pads_sch_binary_builder.h>
 
 
+#include <advanced_config.h>
+#include <bus_alias.h>
 #include <bitmap_base.h>
 #include <lib_id.h>
 #include <lib_symbol.h>
@@ -412,6 +414,72 @@ namespace
     }
 
 
+    SPIN_STYLE padsOffpageSymbolSpinStyle( const MODEL_LABEL& aLabel,
+                                           SPIN_STYLE aFallback )
+    {
+        const bool isRefIn = aLabel.decalName.text.CmpNoCase( wxS( "REFIN" ) ) == 0;
+        const bool isRefOut = aLabel.decalName.text.CmpNoCase( wxS( "REFOUT" ) ) == 0;
+
+        if( !isRefIn && !isRefOut )
+            return aFallback;
+
+        int angle = NormalizeAngle( aLabel.symbolAngle );
+
+        if( angle % 900 != 0 )
+            return aFallback;
+
+        // REFIN's source CAEDECAL points left; REFOUT's points right.
+        // The binary parser has already applied the OFFPAGE mirror flags.
+        if( isRefIn )
+            angle = NormalizeAngle( angle + 1800 );
+
+        switch( angle )
+        {
+        case 0:    return SPIN_STYLE::RIGHT;
+        case 900:  return SPIN_STYLE::UP;
+        case 1800: return SPIN_STYLE::LEFT;
+        case 2700: return SPIN_STYLE::BOTTOM;
+        default:   return aFallback;
+        }
+    }
+
+
+    // PADS binary MODEL_TEXT_PRESENTATION heights are in half-mils.
+    // Stroke adaptation is identical for all EDA_TEXT owners; the independent
+    // System/outline font calibration remains in the existing presentation path.
+    VECTOR2I padsStrokeSchematicTextSize( int64_t aHalfMilHeight )
+    {
+        // PADS_SCH_STROKE_DIRECT_EXPERIMENT: diagnostic only, restore after test.
+        constexpr double padsStrokeTestWidthScale = 0.72;
+        constexpr double padsStrokeTestHeightScale = 0.68;
+        const int64_t scaledWidth = std::max<int64_t>(
+                1, static_cast<int64_t>( std::llround(
+                           static_cast<double>( aHalfMilHeight )
+                           * padsStrokeTestWidthScale ) ) );
+        const int64_t scaledHeight = std::max<int64_t>(
+                1, static_cast<int64_t>( std::llround(
+                           static_cast<double>( aHalfMilHeight )
+                           * padsStrokeTestHeightScale ) ) );
+
+        return { toIU( scaledWidth ), toIU( scaledHeight ) };
+    }
+
+
+    VECTOR2I padsAdaptSchematicTextSize( const MODEL_TEXT_PRESENTATION& aPresentation,
+                                        const VECTOR2I& aOriginalTextSize )
+    {
+        if( aPresentation.height <= 0 )
+            return aOriginalTextSize;
+
+        KIFONT::FONT* font = resolvePadsPresentationFont( aPresentation );
+
+        if( !font || font->IsStroke() )
+            return padsStrokeSchematicTextSize( aPresentation.height );
+
+        return aOriginalTextSize;
+    }
+
+
     void applyTextPresentation(
             EDA_TEXT* aText, const MODEL_TEXT_PRESENTATION& aPresentation, bool aVisible,
             std::vector<PARSER_DIAGNOSTIC>& aDiagnostics,
@@ -421,7 +489,7 @@ namespace
         {
             const int visualHeight =
                     toIU( padsVisualTextHeight( aPresentation, aOutlineHeightCorrection ) );
-            aText->SetTextSize( { visualHeight, visualHeight } );
+            aText->SetTextSize( padsAdaptSchematicTextSize( aPresentation, { visualHeight, visualHeight } ) );
         }
 
         aText->SetHorizJustify( horizontalJustification( aPresentation.horizontalJustification ) );
@@ -545,6 +613,7 @@ namespace
         }
 
         applyTextPresentation( text.get(), aPresentation, true, aDiagnostics );
+
         return text;
     }
 
@@ -642,41 +711,28 @@ namespace
     }
 
 
-    int padsPowerOrientation( const MODEL_LABEL& aLabel,
-                              const SOURCE_POINT* aAdjacentWirePoint, bool aPinUp )
+    int padsPowerOrientation( const MODEL_LABEL& aLabel )
     {
-        if( !aAdjacentWirePoint )
-            return SYM_ORIENT_0;
-
-        const int64_t dx = aAdjacentWirePoint->x - aLabel.position.x;
-        const int64_t dy = -( aAdjacentWirePoint->y - aLabel.position.y ); // PADS Y-up -> KiCad Y-down
-
-        if( dx == 0 && dy == 0 )
-            return SYM_ORIENT_0;
-
-        if( std::abs( dx ) >= std::abs( dy ) )
+        // Power CAEDECALs are imported in their native orientation.  OFFPAGE
+        // contains the authored rotation; the parser has already folded in mirror.
+        // Neither the wire path nor the NETNAMES text is an orientation source.
+        switch( NormalizeAngle( aLabel.symbolAngle ) )
         {
-            if( dx > 0 )
-                return aPinUp ? SYM_ORIENT_90 : SYM_ORIENT_270;
-
-            return aPinUp ? SYM_ORIENT_270 : SYM_ORIENT_90;
+        case 0:    return SYM_ORIENT_0;
+        case 900:  return SYM_ORIENT_90;
+        case 1800: return SYM_ORIENT_180;
+        case 2700: return SYM_ORIENT_270;
+        default:   return SYM_ORIENT_0;
         }
-
-        if( dy > 0 )
-            return aPinUp ? SYM_ORIENT_0 : SYM_ORIENT_180;
-
-        return aPinUp ? SYM_ORIENT_180 : SYM_ORIENT_0;
     }
 
 
     std::unique_ptr<SCH_SYMBOL> makePowerSymbol( const MODEL_LABEL& aLabel, const SCH_SHEET_PATH& aPath,
                                                  int aPageHeight, int aOrdinal,
-                                                 const SOURCE_POINT* aAdjacentWirePoint,
                                                  std::vector<PARSER_DIAGNOSTIC>& aDiagnostics )
     {
-        const std::string powerStyle = padsPowerStyle( aLabel );
-        const bool pinUp = powerStyle == "VCC" || powerStyle == "PWR_TRIANGLE";
-        const int orientation = padsPowerOrientation( aLabel, aAdjacentWirePoint, pinUp );
+        // PADS off-page mirror flags require a mutable symbol orientation.
+        int orientation = padsPowerOrientation( aLabel );
 
         std::unique_ptr<LIB_SYMBOL> library = makePadsPowerLibrary( aLabel );
 
@@ -690,6 +746,15 @@ namespace
         symbol->SetLibId( libId );
         symbol->SetLibSymbol( library.release() );
         symbol->SetPosition( pagePoint( aLabel.position, aPageHeight ) );
+        // PADS controller-20 off-page mirror flags are independent of the
+        // text-angle reflection already performed by the binary parser.
+        // Use the same X/Y mirror mapping as ordinary MODEL_PLACEMENT symbols.
+        if( aLabel.offpageMirrorFlags & 1 )
+            orientation |= SYM_MIRROR_Y;
+
+        if( aLabel.offpageMirrorFlags & 2 )
+            orientation |= SYM_MIRROR_X;
+
         symbol->SetOrientation( orientation );
         const wxString reference = wxString::Format( wxS( "#PWR%04d" ), aOrdinal );
         symbol->SetRef( &aPath, reference );
@@ -742,10 +807,21 @@ namespace
     {
         const int nominalSize = toIU( aPresentation.height );
 
-        if( nominalSize <= 0 || aPresentation.font.text.IsEmpty()
-            || aPresentation.font.text == wxS( "Default Font" ) )
-        {
+        if( nominalSize <= 0 )
             return nominalSize;
+
+        // PADS Stroke text uses the schematic visual-size scale, not the
+        // original nominal character-cell height.  In particular "Default Font"
+        // in a Stroke-mode PADS drawing must not bypass the scale.  SCH_PIN
+        // exposes a single font size, so use the height scale for both names
+        // and numbers; separate width and height scales cannot be represented.
+        KIFONT::FONT* resolvedFont = resolvePadsPresentationFont( aPresentation );
+
+        if( !resolvedFont || resolvedFont->IsStroke() )
+        {
+            return std::max( 1, static_cast<int>( std::llround(
+                    static_cast<double>( nominalSize )
+                    * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale ) ) );
         }
 
         KIFONT::FONT* sourceFont = KIFONT::FONT::GetFont(
@@ -1125,8 +1201,31 @@ namespace
                 pin->SetType( pinType( aConnectorPin->electricalType ) );
             }
 
+#if defined( PADS_ENABLE_EXPLICIT_DIO_V_PIN_NAMES ) && PADS_ENABLE_EXPLICIT_DIO_V_PIN_NAMES
             if( !displayName.IsEmpty() && sourcePin.namePresentation.visible )
                 aPinNameCandidates.push_back( { &sourcePin, displayName, aUnit } );
+#endif
+
+            // The v9 placed-pin bit 0x0020 can override the PART's
+            // pin-number display state.  Keep this separate from the
+            // placement-wide 0x10 hide flag, applied by makeLibrarySymbol.
+            const MODEL_PIN_DEFINITION& numberSourcePin =
+                    pinById( aIndex, aDefinition, aPinReference.id );
+
+            if( numberSourcePin.source.version == 0x0009 )
+            {
+                bool numberVisible = numberSourcePin.numberPresentation.visible;
+
+                if( aPlacementPins && aPinOrdinal < aPlacementPins->size() )
+                    numberVisible = ( ( *aPlacementPins )[aPinOrdinal].numberPresentationFlags
+                                      & 0x0020 ) != 0;
+
+                if( !numberVisible )
+                    pin->SetNumberTextSize( 0 );
+                else if( !numberSourcePin.numberPresentation.visible )
+                    pin->SetNumberTextSize( fittedPinTextSize(
+                            PADS_PIN_NUMBER_CALIBRATION, numberSourcePin.numberPresentation ) );
+            }
 
             pin->SetUnit( aUnit );
             aLibrary->AddDrawItem( pin.release() );
@@ -1147,6 +1246,13 @@ namespace
             for( const MODEL_PIN_DEFINITION& sourcePin : aDefinition.pins )
             {
                 std::unique_ptr<SCH_PIN> pin = makePin( sourcePin, aLibrary );
+
+                // For v9, honor the PART/CAEDECAL default when no placed-pin
+                // presentation override is available.
+                if( sourcePin.source.version == 0x0009
+                    && !sourcePin.numberPresentation.visible )
+                    pin->SetNumberTextSize( 0 );
+
 
                 if( aConnectorPin )
                 {
@@ -1262,11 +1368,12 @@ namespace
             library->AddDrawItem( pin.release() );
         }
 
-        // KiCad native pin names cannot reproduce arbitrary PADS per-pin
-        // offsets. Use explicit SCH_TEXT only when every named/visible pin uses
-        // a vertical pin decal. This covers DIO-V (D6 K/A1/A2) conservatively.
+#if defined( PADS_ENABLE_EXPLICIT_DIO_V_PIN_NAMES ) && PADS_ENABLE_EXPLICIT_DIO_V_PIN_NAMES
+        // Experimental opt-in workaround for PADS symbols such as DIO-V:
+        // render pin names as explicit SCH_TEXT at the authored PADS positions.
         const bool usePadsPinNamePlacement =
-                !pinNameCandidates.empty()
+                aPlacement.pinNamesVisible
+                && !pinNameCandidates.empty()
                 && std::ranges::all_of(
                         pinNameCandidates,
                         []( const PADS_PIN_NAME_CANDIDATE& aCandidate )
@@ -1286,6 +1393,11 @@ namespace
         }
 
         library->SetShowPinNames( aPlacement.pinNamesVisible && !usePadsPinNamePlacement );
+#else
+        // Default behavior: native KiCad pin-name rendering only.
+        library->SetShowPinNames( aPlacement.pinNamesVisible );
+#endif
+
         library->SetShowPinNumbers( aPlacement.pinNumbersVisible );
         return library;
     }
@@ -1350,15 +1462,16 @@ namespace
         field->SetTextAngle( EDA_ANGLE( aSource.angle, TENTHS_OF_A_DEGREE_T ) );
         MODEL_TEXT_PRESENTATION fieldPresentation = aSource.presentation;
 
-        // PADS stores a system-font field height as the Windows character-cell height,
-        // whereas KiCad's text size behaves as the visual/em height.  Applying the raw
-        // 100 mil value makes REF-DES and VALUE about one third too large.  Keep the
-        // parser's whole-mil -> half-mil conversion exact, and adapt only system-font
-        // symbol fields here.  Stroke-font fields and SCH_PIN fitting are unaffected.
-        // Centralized in applyTextPresentation(): fields, free text, symbol text
-        // and labels now share the same PADS outline-font height semantics.
+        // Outline-font field heights are Windows character-cell sizes and retain
+        // the calibrated visual/em conversion in applyTextPresentation().
+        // Stroke-font fields instead need KiCad's independent PADS schematic
+        // width and height factors, exactly as in the ASCII importer.  Limit
+        // this adjustment to placed component fields: do not change pin text,
+        // NETNAMES, page text, or the embedded worksheet.
         applyTextPresentation( field, fieldPresentation,
                                aSource.visible && fieldPresentation.visible, aDiagnostics );
+
+        // Stroke and outline size are handled by applyTextPresentation().
     }
 
 
@@ -1589,8 +1702,19 @@ namespace
                 if( graphic.points.empty() || !graphic.presentation.visible )
                     continue;
 
-                const int64_t worksheetVisualHeight = padsVisualTextHeight( graphic.presentation );
                 KIFONT::FONT* worksheetFont = resolvePadsPresentationFont( graphic.presentation );
+
+                // Match the ASCII worksheet: stroke fonts use the configurable PADS
+                // schematic height scale.  Outline fonts retain the calibrated
+                // character-cell-to-visual-height conversion.  Heights are half-mils.
+                const int64_t worksheetVisualHeight =
+                        graphic.presentation.height <= 0
+                        || ( worksheetFont && !worksheetFont->IsStroke() )
+                                ? padsVisualTextHeight( graphic.presentation )
+                                : std::max<int64_t>(
+                                          1, static_cast<int64_t>( std::llround(
+                                                     static_cast<double>( graphic.presentation.height )
+                                                     * ADVANCED_CFG::GetCfg().m_PadsSchTextHeightScale ) ) );
                 double worksheetTextY = worksheetY( graphic.points.front() );
 
                 // PADS positions top/bottom justified outline text against the
@@ -2209,6 +2333,9 @@ namespace
             return SEGMENT_KEY( aSheet.Value(), aNet.Value(), aEnd.x, aEnd.y, aStart.x, aStart.y );
         };
 
+        // Avoid duplicate alias definitions for multiple bus segments on one sheet.
+        std::map<wxString, std::vector<wxString>> busAliasesOnSheet;
+
         for( const MODEL_BUS* bus : MODEL_INDEX::ForSheet( aIndex.busesBySheet, aSourceSheet.id ) )
         {
             if( bus->vertices.size() < 2 )
@@ -2228,17 +2355,39 @@ namespace
 
             if( !bus->declaredMembers.empty() )
             {
-                busLabel += wxS( "{" );
+                // A group bus is labelled {ALIAS}, not ALIAS{all members}.
+                // KiCad's alias definition carries the original PADS list.
+                std::vector<wxString> members;
+                members.reserve( bus->declaredMembers.size() );
 
-                for( size_t member = 0; member < bus->declaredMembers.size(); ++member )
+                for( const SOURCE_STRING& member : bus->declaredMembers )
+                    members.push_back( member.text );
+
+                auto [existing, inserted] = busAliasesOnSheet.emplace( bus->name.text, members );
+
+                if( !inserted && existing->second != members )
+                    THROW_IO_ERROR( FormatParserError( bus->source,
+                                    wxS( "PADS bus alias has inconsistent members on this sheet" ) ) );
+
+                if( inserted )
                 {
-                    if( member )
-                        busLabel += wxS( " " );
+                    // Aliases are schematic-wide, not just sheet-local.
+                    auto existingAlias = aScreen->Schematic()->GetBusAlias( bus->name.text );
 
-                    busLabel += bus->declaredMembers[member].text;
+                    if( existingAlias && existingAlias->Members() != members )
+                        THROW_IO_ERROR( FormatParserError( bus->source,
+                                        wxS( "PADS bus alias conflicts with an existing definition" ) ) );
+
+                    if( !existingAlias )
+                    {
+                        auto alias = std::make_shared<BUS_ALIAS>();
+                        alias->SetName( bus->name.text );
+                        alias->SetMembers( members );
+                        aScreen->AddBusAlias( alias );
+                    }
                 }
 
-                busLabel += wxS( "}" );
+                busLabel = wxS( "{" ) + bus->name.text + wxS( "}" );
             }
 
             auto label = std::make_unique<SCH_LABEL>( pagePoint( bus->vertices.front(), pageHeight ), busLabel );
@@ -2254,17 +2403,66 @@ namespace
                     THROW_IO_ERROR( FormatParserError( entry.memberNet.source,
                                                        wxS( "resolved bus-entry net is missing during staging" ) ) );
 
-                auto adjacency = aIndex.endpointAdjacency.find(
-                        { entry.memberNet.id.Value(), entry.position.x, entry.position.y } );
+                // Prefer the explicit connection owner recorded by PADS. Several
+                // distinct bus entries can legitimately share both net and point.
+                // A search by net/coordinates alone is ambiguous in that case.
+                SOURCE_POINT adjacentPoint = entry.position;
 
-                if( adjacency == aIndex.endpointAdjacency.end() )
-                    THROW_IO_ERROR( FormatParserError( entry.source, wxS( "bus-entry geometry is unresolved" ) ) );
+                if( entry.connectionRecordIndex )
+                {
+                    const auto& connections = ownerNet->second->connections;
+                    auto connection = std::ranges::find_if(
+                            connections,
+                            [&]( const MODEL_CONNECTION& aConnection )
+                            {
+                                return aConnection.source.recordIndex == *entry.connectionRecordIndex;
+                            } );
 
-                if( adjacency->second.size() != 1 )
-                    THROW_IO_ERROR( FormatParserError( entry.source, wxS( "bus-entry geometry is ambiguous" ) ) );
+                    if( connection == connections.end() )
+                        THROW_IO_ERROR( FormatParserError( entry.source,
+                                        wxS( "bus-entry connection handle does not belong to member net" ) ) );
+
+                    const auto& vertices = connection->vertices;
+
+                    if( vertices.size() < 2 )
+                        THROW_IO_ERROR( FormatParserError( entry.source,
+                                        wxS( "bus-entry connection has insufficient vertices" ) ) );
+
+                    const bool atFirst = vertices.front().x == entry.position.x
+                                         && vertices.front().y == entry.position.y;
+                    const bool atLast = vertices.back().x == entry.position.x
+                                        && vertices.back().y == entry.position.y;
+
+                    if( atFirst == atLast )
+                        THROW_IO_ERROR( FormatParserError( entry.source,
+                                        wxS( "bus-entry connection endpoint does not identify a unique side" ) ) );
+
+                    adjacentPoint = atFirst ? vertices[1] : vertices[vertices.size() - 2];
+
+                    if( adjacentPoint.x == entry.position.x && adjacentPoint.y == entry.position.y )
+                        THROW_IO_ERROR( FormatParserError( entry.source,
+                                        wxS( "bus-entry connection has degenerate adjacent segment" ) ) );
+                }
+                else
+                {
+                    // Keep compatibility for models not decoded from PADS binary.
+                    auto adjacency = aIndex.endpointAdjacency.find(
+                            { entry.memberNet.id.Value(), entry.position.x, entry.position.y } );
+
+                    if( adjacency == aIndex.endpointAdjacency.end() )
+                        THROW_IO_ERROR( FormatParserError( entry.source,
+                                        wxS( "bus-entry geometry is unresolved" ) ) );
+
+                    if( adjacency->second.size() != 1 )
+                        THROW_IO_ERROR( FormatParserError( entry.source,
+                                        wxS( "bus-entry geometry is ambiguous" ) ) );
+
+                    adjacentPoint = adjacency->second.front();
+                }
 
                 const VECTOR2I start = pagePoint( entry.position, pageHeight );
-                const VECTOR2I end = pagePoint( adjacency->second.front(), pageHeight );
+
+                const VECTOR2I end = pagePoint( adjacentPoint, pageHeight );
                 const VECTOR2I delta = end - start;
                 const int      span = std::max( std::abs( delta.x ), std::abs( delta.y ) );
                 const int      entrySpan = std::min( span, schIUScale.MilsToIU( DEFAULT_SCH_ENTRY_SIZE ) );
@@ -2291,7 +2489,7 @@ namespace
                 }
 
                 busEntrySegments.insert(
-                        segmentKey( aSourceSheet.id, entry.memberNet.id, entry.position, adjacency->second.front() ) );
+                        segmentKey( aSourceSheet.id, entry.memberNet.id, entry.position, adjacentPoint ) );
                 ++aStaged.result.counts.busEntries;
             }
         }
@@ -2418,7 +2616,7 @@ namespace
             case MODEL_LABEL_KIND::GROUND:
             case MODEL_LABEL_KIND::POWER:
                 item = makePowerSymbol( label, aPath, pageHeight, aStaged.nextPowerOrdinal++,
-                                        adjacentWirePoint, aStaged.result.diagnostics );
+                                        aStaged.result.diagnostics );
                 ++aStaged.result.counts.symbols;
                 break;
 
@@ -2449,10 +2647,8 @@ namespace
                 applyTextPresentation( text, label.presentation, label.presentation.visible,
                                        aStaged.result.diagnostics );
 
-                // Normalize KiCad global-label justification after applying the PADS presentation.
-                // Prefer the authored NETNAMES text offset: rotation and mirror bits do
-                // not reliably encode the off-page reading direction.  SetSpinStyle()
-                // must run last because applyTextPresentation() changes angle/alignment.
+                // OFFPAGE defines the symbol direction independently of NETNAMES.
+                // Apply its spin last because text presentation sets angle/alignment.
                 if( auto* globalLabel = dynamic_cast<SCH_GLOBALLABEL*>( text ) )
                 {
                     // PADS $OSR_SYMS defines only REFIN and REFOUT; it has no
@@ -2498,9 +2694,9 @@ namespace
                         globalLabel->SetTextSize( VECTOR2I( best, best ) );
                     }
 
-                    globalLabel->SetSpinStyle(
-                            padsLabelSpinStyle( label.position, label.textOffset,
-                                                adjacentWirePoint ) );
+                    globalLabel->SetSpinStyle( padsOffpageSymbolSpinStyle(
+                            label, padsLabelSpinStyle( label.position, label.textOffset,
+                                                       adjacentWirePoint ) ) );
                 }
             }
 

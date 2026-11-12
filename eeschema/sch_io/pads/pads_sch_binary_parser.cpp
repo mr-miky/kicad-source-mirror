@@ -1251,16 +1251,17 @@ namespace
     DEFINITION_LAYOUT definitionLayout( const PADS_IO::BINARY_CURSOR& aCursor, const SHEET_CONTROLLERS& aControllers,
                                         size_t aSheetIndex, const wxString& aSourceName, uint16_t aVersion )
     {
+        const bool legacyV9 = aVersion == 0x0009;
         requireFixedController( aControllers, 3, SYMBOL_RECORD_BYTES, aSourceName, aVersion, aSheetIndex );
         requireFixedController( aControllers, 4, SYMBOL_PIECE_BYTES, aSourceName, aVersion, aSheetIndex );
         requireFixedController( aControllers, 5, SYMBOL_VERTEX_BYTES, aSourceName, aVersion, aSheetIndex );
         requireFixedController( aControllers, 6, SYMBOL_ARC_BYTES, aSourceName, aVersion, aSheetIndex );
-        requireFixedController( aControllers, 7, USED_DECAL_BYTES, aSourceName, aVersion, aSheetIndex );
+        requireFixedController( aControllers, 7, legacyV9 ? 92 : USED_DECAL_BYTES, aSourceName, aVersion, aSheetIndex );
         requireFixedController( aControllers, 8, TERMINAL_BYTES, aSourceName, aVersion, aSheetIndex );
         requireFixedController( aControllers, 9, PART_TYPE_BYTES, aSourceName, aVersion, aSheetIndex );
         requireFixedController( aControllers, 10, GATE_BYTES, aSourceName, aVersion, aSheetIndex );
-        requireFixedController( aControllers, 11, PIN_BYTES, aSourceName, aVersion, aSheetIndex );
-        requireFixedController( aControllers, 12, SIGNAL_PIN_BYTES, aSourceName, aVersion, aSheetIndex );
+        requireFixedController( aControllers, 11, legacyV9 ? 8 : PIN_BYTES, aSourceName, aVersion, aSheetIndex );
+        requireFixedController( aControllers, 12, legacyV9 ? 52 : SIGNAL_PIN_BYTES, aSourceName, aVersion, aSheetIndex );
 
         DEFINITION_LAYOUT layout;
         layout.symbolBase = aControllers.offsets[2];
@@ -2624,7 +2625,7 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
     void decodePartTypes( const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
                           const SHEET_CONTROLLERS& aControllers, const DEFINITION_LAYOUT& aLayout, size_t aSheetIndex,
                           const wxString& aSourceName, const std::vector<USED_DECAL>& aUsedDecals,
-                          PADS_SCH_MODEL& aModel )
+                          const CONNECTIVITY_GLOBALS* aConnectivity, PADS_SCH_MODEL& aModel )
     {
         size_t signalPinCursor = 0;
 
@@ -2664,6 +2665,51 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             if( pinNameHeapBase > aLayout.pinNameBytes )
                 throwDecodeError( source, wxS( "part-type pin-name base leaves controller 14" ) );
 
+            // PADS_V000D_HIERARCHICAL_GLOBAL_NET_PIN_NAMES_V5
+            // A hierarchical sheet symbol ($$...) reuses the global-net directory
+            // for pin names: controller-11 +0 is a global-net record index, NOT
+            // an offset into the (often empty) local controller-14 string heap.
+            // For all ordinary PARTTYPEs the original controller-14 logic stays.
+            const bool hierarchicalNetNames = aModel.version == 0x000D
+                                              && part.name.text.StartsWith( wxS( "$$" ) );
+
+            auto decodePartPinName = [&]( uint32_t aNameRef, size_t aPinRecord,
+                                          const SOURCE_PROVENANCE& aPinSource,
+                                          const wxString& aNameClass ) -> SOURCE_STRING
+            {
+                if( aNameRef == 0xFFFFFFFF )
+                    return {};
+
+                if( hierarchicalNetNames )
+                {
+                    if( !aConnectivity || aNameRef >= aConnectivity->nets.size()
+                        || aConnectivity->nets[aNameRef].tombstone
+                        || aConnectivity->nets[aNameRef].name.text.IsEmpty() )
+                    {
+                        throwDecodeError( aPinSource,
+                                          wxS( "hierarchical pin-name global-net handle is invalid" ) );
+                    }
+
+                    SOURCE_PROVENANCE handleSource = aPinSource;
+                    handleSource.length = 4;
+                    part.properties.push_back( sourceProperty(
+                            wxString::Format( wxS( "hierarchical_pin_global_net_handle_%zu" ), aPinRecord ),
+                            wxString::Format( wxS( "%u" ), aNameRef ), handleSource ) );
+                    return aConnectivity->nets[aNameRef].name;
+                }
+
+                if( aNameRef >= aLayout.pinNameBytes - pinNameHeapBase )
+                    throwDecodeError( aPinSource, wxS( "pin-name offset leaves controller 14" ) );
+
+                const size_t namePosition = aLayout.pinNameBase + pinNameHeapBase + aNameRef;
+                const size_t nameAvailable = aLayout.pinNameBytes - pinNameHeapBase - aNameRef;
+                SOURCE_PROVENANCE pinNameSource = sourceAt(
+                        aSourceName, aModel.version, aNameClass, 14, aPinRecord, namePosition,
+                        nameAvailable, static_cast<int>( aSheetIndex ) );
+                return decodeFixedString( aBytes, namePosition, nameAvailable, pinNameSource,
+                                          aModel.diagnostics );
+            };
+
             auto decodePartPin = [&]( MODEL_PIN_DEFINITION& aDefinitionPin, size_t aPinRecord, MODEL_GATE& aGate )
             {
                 const size_t      pinOffset = aLayout.pinBase + aPinRecord * PIN_BYTES;
@@ -2677,18 +2723,7 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                 const uint32_t nameOffset = aCursor.U32At( pinOffset );
 
                 if( nameOffset != 0xFFFFFFFF )
-                {
-                    if( nameOffset >= aLayout.pinNameBytes - pinNameHeapBase )
-                        throwDecodeError( pinSource, wxS( "pin-name offset leaves controller 14" ) );
-
-                    SOURCE_PROVENANCE pinNameSource = sourceAt(
-                            aSourceName, aModel.version, wxS( "pin name" ), 14, aPinRecord,
-                            aLayout.pinNameBase + pinNameHeapBase + nameOffset,
-                            aLayout.pinNameBytes - pinNameHeapBase - nameOffset, static_cast<int>( aSheetIndex ) );
-                    aDefinitionPin.name = decodeFixedString( aBytes, aLayout.pinNameBase + pinNameHeapBase + nameOffset,
-                                                             aLayout.pinNameBytes - pinNameHeapBase - nameOffset,
-                                                             pinNameSource, aModel.diagnostics );
-                }
+                    aDefinitionPin.name = decodePartPinName( nameOffset, aPinRecord, pinSource, wxS( "pin name" ) );
 
                 aDefinitionPin.electricalType =
                         pinElectricalType( aCursor.U8At( pinOffset + 21 ), pinSource, aModel.diagnostics );
@@ -2722,18 +2757,8 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                 const uint32_t nameOffset = aCursor.U32At( pinOffset );
 
                 if( nameOffset != 0xFFFFFFFF )
-                {
-                    if( nameOffset >= aLayout.pinNameBytes - pinNameHeapBase )
-                        throwDecodeError( pinSource, wxS( "pin-name offset leaves controller 14" ) );
-
-                    SOURCE_PROVENANCE pinNameSource = sourceAt(
-                            aSourceName, aModel.version, wxS( "connector pin name" ), 14, aPinRecord,
-                            aLayout.pinNameBase + pinNameHeapBase + nameOffset,
-                            aLayout.pinNameBytes - pinNameHeapBase - nameOffset, static_cast<int>( aSheetIndex ) );
-                    pin.name = decodeFixedString( aBytes, aLayout.pinNameBase + pinNameHeapBase + nameOffset,
-                                                  aLayout.pinNameBytes - pinNameHeapBase - nameOffset, pinNameSource,
-                                                  aModel.diagnostics );
-                }
+                    pin.name = decodePartPinName( nameOffset, aPinRecord, pinSource,
+                                                  wxS( "connector pin name" ) );
 
                 pin.swapGroup = aCursor.U8At( pinOffset + 20 );
                 pin.electricalType = pinElectricalType( aCursor.U8At( pinOffset + 21 ), pinSource, aModel.diagnostics );
@@ -2891,7 +2916,7 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
     void decodeDefinitionsAndParts( const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
                                     const SCH_SDB_BLOCK& aBlock, size_t aSheetIndex, const wxString& aSourceName,
-                                    PADS_SCH_MODEL& aModel )
+                                    const CONNECTIVITY_GLOBALS* aConnectivity, PADS_SCH_MODEL& aModel )
     {
         const SHEET_CONTROLLERS controllers = sheetControllers( aCursor, aBlock );
 
@@ -2919,7 +2944,8 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
         decodePageGraphics( aBytes, aCursor, layout, aSheetIndex, aSourceName, pageGraphicRecords, aModel );
         decodeDefinitionFields( aBytes, aCursor, layout, aSheetIndex, aSourceName, fieldDecals, aModel );
-        decodePartTypes( aBytes, aCursor, controllers, layout, aSheetIndex, aSourceName, usedDecals, aModel );
+        decodePartTypes( aBytes, aCursor, controllers, layout, aSheetIndex, aSourceName, usedDecals,
+                         aConnectivity, aModel );
     }
 
 
@@ -3044,26 +3070,45 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                                                : wxS( "unresolved placement part-type reference" ) );
         }
 
+        // PADS_V000D_HIERARCHICAL_GROUP_SENTINEL_V6
+        // Hierarchical sheet symbols ($$ PARTTYPEs) have no component attribute
+        // group.  Their componentGroup field is 0xFFFFFFFF, not an index into
+        // outer controller 6.  All observed such placements have no custom
+        // placement fields; REF-DES and PART-TYPE fields are embedded inline.
+        // Never weaken normal component-group ownership/attribute validation.
         const uint32_t groupHandle = aDecode.cursor.U32At( aOffset + aDecode.layout.componentGroup );
+        uint32_t       attributeStart = 0;
+        uint16_t       attributeCount = 0;
 
-        if( groupHandle >= aDecode.globals.groupCount )
-            throwDecodeError( aSource, wxS( "placement component-group handle leaves outer controller 6" ) );
-
-        const size_t   groupOffset = aDecode.globals.groupBase + groupHandle * PLACEMENT_GROUP_BYTES;
-        const uint32_t attributeStart = aDecode.cursor.U32At( groupOffset );
-        const uint16_t attributeCount = aDecode.cursor.U16At( groupOffset + 20 );
-
-        if( attributeCount < 2 || attributeStart > aDecode.globals.attributeOffsetCount
-            || attributeCount > aDecode.globals.attributeOffsetCount - attributeStart )
+        if( groupHandle == 0xFFFFFFFF )
         {
-            throwDecodeError( aSource, wxS( "placement component-group attribute slice leaves controller 7" ) );
+            if( aModel.version != 0x000D || !part->name.text.StartsWith( wxS( "$$" ) ) )
+                throwDecodeError( aSource, wxS( "missing component group on non-hierarchical placement" ) );
+
+            if( aDecode.cursor.U16At( aOffset + aDecode.layout.fieldCount ) != 0 )
+                throwDecodeError( aSource, wxS( "ungrouped hierarchical placement has custom fields" ) );
         }
+        else
+        {
+            if( groupHandle >= aDecode.globals.groupCount )
+                throwDecodeError( aSource, wxS( "placement component-group handle leaves outer controller 6" ) );
 
-        auto [groupPartName, unusedGroupPartValue] =
-                decodePlacementAttribute( aDecode, attributeStart + 1, false, aModel );
+            const size_t groupOffset = aDecode.globals.groupBase + groupHandle * PLACEMENT_GROUP_BYTES;
+            attributeStart = aDecode.cursor.U32At( groupOffset );
+            attributeCount = aDecode.cursor.U16At( groupOffset + 20 );
 
-        if( groupPartName.text != part->name.text )
-            throwDecodeError( aSource, wxS( "placement component-group targets wrong part-type object class" ) );
+            if( attributeCount < 2 || attributeStart > aDecode.globals.attributeOffsetCount
+                || attributeCount > aDecode.globals.attributeOffsetCount - attributeStart )
+            {
+                throwDecodeError( aSource, wxS( "placement component-group attribute slice leaves controller 7" ) );
+            }
+
+            auto [groupPartName, unusedGroupPartValue] =
+                    decodePlacementAttribute( aDecode, attributeStart + 1, false, aModel );
+
+            if( groupPartName.text != part->name.text )
+                throwDecodeError( aSource, wxS( "placement component-group targets wrong part-type object class" ) );
+        }
 
         const uint16_t decalHandle = aDecode.cursor.U16At( aOffset + aDecode.layout.decal );
 
@@ -3135,6 +3180,10 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                            PADS_SCH_MODEL& aModel )
     {
         const size_t placedPinBase = aDecode.controllers.offsets[15];
+        // PADS may serialize placed pins in a different order from the definition.
+        // The handle in each placed-pin record gives the actual definition ordinal.
+        // Each definition pin must be referenced exactly once per placement.
+        std::vector<bool> seenPinOrdinals( aDefinition.pins.size(), false );
 
         for( size_t pin = 0; pin < aPinCount; ++pin )
         {
@@ -3144,9 +3193,13 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                               aDecode.layout.placedPinBytes, static_cast<int>( aDecode.sheetIndex ) );
             const uint16_t pinOrdinal = aDecode.cursor.U16At( pinOffset + aDecode.layout.placedPinOrdinal );
 
-            if( pinOrdinal >= aDefinition.pins.size() || pinOrdinal != pin )
+            if( pinOrdinal >= aDefinition.pins.size() )
                 throwDecodeError( pinSource, wxS( "placed-pin handle leaves placement definition" ) );
 
+            if( seenPinOrdinals[pinOrdinal] )
+                throwDecodeError( pinSource, wxS( "duplicate placed-pin handle within placement" ) );
+
+            seenPinOrdinals[pinOrdinal] = true;
             PLACED_PIN_REFERENCE pinReference{ aDefinition.pins[pinOrdinal].id, pinSource };
             pinReference.numberOffset = {
                 static_cast<int64_t>( static_cast<int16_t>( aDecode.cursor.U16At( pinOffset + 6 ) ) ) * 2,
@@ -3823,6 +3876,7 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             {
                 MODEL_PLACEMENT&     placement = *aPlacements[objectRecord];
                 const PIN_REFERENCE* matchedPin = nullptr;
+                size_t               coincidentPinCount = 0;
 
                 for( const PIN_REFERENCE& pin : placement.pins )
                 {
@@ -3836,11 +3890,14 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                     if( position.first != aWirePoint.x || position.second != aWirePoint.y )
                         continue;
 
-                    if( matchedPin )
-                        throwDecodeError( endpointSource,
-                                          wxS( "placement has duplicate pins at connection endpoint" ) );
+                    // Multiple source pins may legitimately share an electrical
+                    // anchor (for example PADS FASTON decals).  A wire connected
+                    // at this point connects every coincident pin in KiCad too.
+                    // Keep one stable model reference; the placement retains all pins.
+                    if( !matchedPin )
+                        matchedPin = &pin;
 
-                    matchedPin = &pin;
+                    ++coincidentPinCount;
                 }
 
                 if( !matchedPin )
@@ -3848,6 +3905,17 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                                       wxString::Format( wxS( "placement has no pin at connection endpoint; "
                                                              "angle %d mirror %u" ),
                                                         placement.angle, placement.mirrorFlags ) );
+
+                if( coincidentPinCount > 1 )
+                {
+                    SOURCE_PROPERTY property = sourceProperty(
+                            wxS( "coincident_placement_pin_count" ),
+                            wxString::Format( wxS( "%llu" ),
+                                              static_cast<unsigned long long>( coincidentPinCount ) ),
+                            endpointSource );
+                    property.disposition = PROPERTY_DISPOSITION::PRESERVED;
+                    result.properties.push_back( std::move( property ) );
+                }
 
                 result.kind = MODEL_ENDPOINT_KIND::PIN;
                 result.placement = PLACEMENT_REFERENCE{ placement.id, endpointSource };
@@ -4073,12 +4141,19 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             const size_t      offset = aDecode.busBase + record * BUS_RECORD_BYTES;
             SOURCE_PROVENANCE source = sourceAt( aDecode.sourceName, aModel.version, wxS( "bus" ), 18, record, offset,
                                                  BUS_RECORD_BYTES, static_cast<int>( aDecode.sheetIndex ) );
-            const uint16_t    marker = aDecode.cursor.U16At( offset + 38 );
+            // PADS Logic v0x000D bus record +38 is vertex-count/status,
+            // not an object-class enum limited to two, three or four points.
+            // Verify the high byte against the actual controller-22 vertex
+            // slice; this also rejects inconsistent or corrupt vertex counts.
+            const uint16_t marker = aDecode.cursor.U16At( offset + 38 );
+            const uint32_t markerVertexCount = marker >> 8;
+            const uint8_t  markerStatus = marker & 0xFF;
+            const uint32_t decodedVertexCount = aTiling.ends[record] - aTiling.starts[record];
 
-            const uint8_t markerStatus = marker & 0xFF;
-
-            if( marker >> 8 < 2 || marker >> 8 > 4 || ( markerStatus != 0 && markerStatus != 0xFD ) )
-                throwDecodeError( source, wxS( "invalid bus object-class marker" ) );
+            // 0xFC and 0xFD both occur in valid PADS v0x000D bus records.
+            if( decodedVertexCount < 2 || markerVertexCount != decodedVertexCount
+                || ( markerStatus != 0 && markerStatus != 0xFC && markerStatus != 0xFD ) )
+                throwDecodeError( source, wxS( "invalid bus vertex-count/status marker" ) );
 
             const size_t globalRecord = aDecode.cursor.U32At( offset + 8 );
 
@@ -4107,6 +4182,15 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             bus.name = global.name;
             bus.aliases.push_back( global.name );
             bus.declaredMembers = global.aliasMembers;
+            // Preserve the original 16-bit bus marker for future round-trip
+            // work: the numeric status is validated but not yet interpreted.
+            SOURCE_PROVENANCE busMarkerSource = source;
+            busMarkerSource.absoluteOffset += 38;
+            busMarkerSource.length = 2;
+            SOURCE_PROPERTY busMarker =
+                    sourceProperty( wxS( "raw_bus_vertex_status_marker" ),
+                                    wxString::Format( wxS( "0x%04X" ), marker ), busMarkerSource );
+            bus.properties.push_back( std::move( busMarker ) );
             SOURCE_PROPERTY identity =
                     sourceProperty( wxS( "preserved_net_identity" ),
                                     wxString::Format( wxS( "%u" ), global.preservedIdentity ), global.source );
@@ -4145,7 +4229,11 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
             std::ranges::reverse( entryRecords );
 
-            const bool exactAliasMapping = entryRecords.size() == global.aliasMembers.size();
+            // PADS bus alias members define a set of scalar names and ranges
+            // for the entire bus.  Their order is not the off-page entry order,
+            // and equal list lengths do not imply a positional mapping.
+            // Each entry's electrical net is validated through its actual
+            // connection handle and membership ownership below.
 
             for( size_t entry = 0; entry < entryRecords.size(); ++entry )
             {
@@ -4173,9 +4261,6 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                 if( !memberNet )
                     throwDecodeError( entrySource, wxS( "bus-entry connection targets wrong member-net class" ) );
 
-                if( exactAliasMapping && memberNet->name.text != global.aliasMembers[entry].text )
-                    throwDecodeError( entrySource, wxS( "bus alias member does not match connected net" ) );
-
                 const bool ownsConnection = std::ranges::any_of( memberNet->connections,
                                                                  [&]( const MODEL_CONNECTION& aConnection )
                                                                  {
@@ -4190,6 +4275,9 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                 busEntry.source = entrySource;
                 busEntry.position = offpagePosition( aDecode, entryRecord, aModel.version );
                 busEntry.memberNet = { memberNet->id, entrySource };
+                // The bus entry's +8 handle is the exact wire owner; geometry
+                // alone cannot distinguish coincident endpoints on one net.
+                busEntry.connectionRecordIndex = connectionHandle;
                 bus.entries.push_back( std::move( busEntry ) );
                 bus.memberNets.push_back( { memberNet->id, entrySource } );
             }
@@ -4307,8 +4395,10 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             if( offpageMirrorFlags & 2 )
                 offpageAngle = NormalizeAngle( -offpageAngle );
 
-            label.angle = offpageAngle;
+            // Preserve OFFPAGE orientation even when NETNAMES later sets text angle.
+            label.symbolAngle = offpageAngle;
             label.symbolVariant = rawKind;
+            label.offpageMirrorFlags = offpageMirrorFlags;
             SOURCE_PROVENANCE mirrorSource = source;
             mirrorSource.absoluteOffset += 28;
             mirrorSource.length = 2;
@@ -4467,8 +4557,13 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
         // binary model stores text metrics in half-mils.
         presentation.height = static_cast<int64_t>( aDecode.cursor.U16At( aOffset + 2 ) ) * 2;
         presentation.width = static_cast<int64_t>( aDecode.cursor.U16At( aOffset + 4 ) ) * 2;
-        presentation.horizontalJustification = horizontalJustification( aDecode.cursor.U16At( aOffset + 26 ) );
-        presentation.verticalJustification = verticalJustification( aDecode.cursor.U16At( aOffset + 26 ) );
+        // PADS NETNAMES uses the same 90/270-degree side-selector bit swap as
+        // PADS field text.  Normalize before mapping the 9-way justification.
+        const int textAngle = NormalizeAngle( aDecode.cursor.U16At( aOffset + 24 ) );
+        const uint16_t justification = rotatedFieldJustification(
+                aDecode.cursor.U16At( aOffset + 26 ), textAngle );
+        presentation.horizontalJustification = horizontalJustification( justification );
+        presentation.verticalJustification = verticalJustification( justification );
         const int16_t     fontHandle = static_cast<int16_t>( aDecode.cursor.U16At( aOffset ) );
         SOURCE_PROVENANCE fontSource = aSource;
         fontSource.length = 2;
@@ -4565,11 +4660,26 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                                                             && aBus.source.recordIndex == busRecord;
                                                  } );
 
-                if( bus == aModel.buses.end() || childHandle == 0 || childHandle > bus->memberNets.size()
-                    || bus->name.text != aDecode.globals.nets[globalRecord].name.text )
-                {
+                // The second index in PADS @@@B<bus>.<anchor> names a bus
+                // polyline anchor, not a one-based index into memberNets.
+                // In particular, @@@B0.0 is valid and must not be rejected.
+                if( bus == aModel.buses.end() )
                     throwDecodeError( source, wxS( "net-name bus owner targets wrong object class" ) );
-                }
+
+                if( bus->name.text != aDecode.globals.nets[globalRecord].name.text )
+                    throwDecodeError( source, wxS( "net-name bus owner targets a different bus name" ) );
+
+                if( childHandle >= bus->vertices.size() )
+                    throwDecodeError( source, wxS( "net-name bus anchor leaves bus vertex range" ) );
+
+                SOURCE_PROVENANCE anchorSource = source;
+                anchorSource.absoluteOffset += 40;
+                anchorSource.length = 2;
+                SOURCE_PROPERTY anchorIndex = sourceProperty(
+                        wxS( "preserved_bus_net_name_anchor_index" ),
+                        wxString::Format( wxS( "%u" ), childHandle ), anchorSource );
+                anchorIndex.disposition = PROPERTY_DISPOSITION::PRESERVED;
+                bus->properties.push_back( std::move( anchorIndex ) );
 
                 bus->properties.push_back( sourceProperty( wxS( "net_name_presentation_record" ),
                                                            wxString::Format( wxS( "%llu" ), record ), source ) );
@@ -5019,7 +5129,16 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                     continue;
 
                 for( const DEFINITION_REFERENCE& alternate : gate.alternateDefinitions )
+                {
+                    // PADS may repeat the primary CAEDECAL among a gate's alternatives
+                    // (e.g. CAPNOTPOL: CAP, CAP).  This is a redundant selection,
+                    // not a recursive symbol definition.  Preserve the alternative
+                    // in the model but do not introduce a self-edge in the graph.
+                    if( alternate.id == gate.definition.id )
+                        continue;
+
                     definitionEdges[gate.definition.id.Value()].push_back( { alternate.id.Value(), alternate.source } );
+                }
             }
         }
 
@@ -5425,12 +5544,17 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             ++titleRecord;
         }
 
-        if( titleFields.empty() )
+        // Some valid PADS schematics have no global title-block fields at all.
+        // In that case outer controller 1 is explicitly empty (count == 0 and
+        // usedBytes == 0).  Treat only a non-empty controller that yielded no
+        // decodable Field records as malformed.
+        if( titleFields.empty()
+            && ( titleFieldPool.count != 0 || titleFieldPool.usedBytes != 0 ) )
         {
             SOURCE_PROVENANCE source =
                     sourceAt( aSourceName, aModel.version, wxS( "title field" ), 1, titleFields.size(),
                               outerControllerOffset( aSdb, 1 ), titleFieldPool.usedBytes, -1 );
-            throwDecodeError( source, wxS( "title-field controller is empty" ) );
+            throwDecodeError( source, wxS( "title-field controller contains no decodable fields" ) );
         }
 
         return titleFields;
@@ -5464,8 +5588,21 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
             constexpr size_t nameOffset = 14;
 
-            if( aCursor.U16At( recordOffset + 10 ) != 0xFFFF || aCursor.U16At( recordOffset + 12 ) != 0xFFFF )
-                throwDecodeError( provenance, wxS( "invalid sheet-index class marker" ) );
+            // In PADS Logic v0x000D these are hierarchy fields, not fixed
+            // object-class sentinels.  The parent is a controller-3 record
+            // index (0xFFFF means top level).  The qualifier identifies a
+            // repeated child instance and can also be 0xFFFF (unspecified).
+            const uint16_t parentRecord = aCursor.U16At( recordOffset + 10 );
+            const uint16_t instanceQualifier = aCursor.U16At( recordOffset + 12 );
+
+            if( parentRecord != 0xFFFF && parentRecord >= aSdb.Pools()[3].count )
+                throwDecodeError( provenance, wxS( "sheet parent record index leaves controller 3" ) );
+
+            if( parentRecord == index )
+                throwDecodeError( provenance, wxS( "sheet cannot be its own parent" ) );
+
+            if( parentRecord == 0xFFFF && instanceQualifier != 0xFFFF )
+                throwDecodeError( provenance, wxS( "top-level sheet has an unexpected instance qualifier" ) );
 
             size_t nameEnd = recordOffset + nameOffset;
 
@@ -5489,6 +5626,32 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
 
             if( sheet.name.text.empty() )
                 sheet.name.text = wxS( "$$$NONE" );
+
+            if( parentRecord != 0xFFFF )
+            {
+                const size_t parentOffset = sheetIndexOffset + parentRecord * SHEET_RECORD_BYTES;
+                const uint16_t parentId = aCursor.U16At( parentOffset + 8 );
+                SOURCE_PROVENANCE parentSource = provenance;
+                parentSource.absoluteOffset += 10;
+                parentSource.length = 2;
+
+                if( parentId == 0 || parentId == 0xFFFF || parentId == sheet.id.Value() )
+                    throwDecodeError( parentSource, wxS( "sheet parent has invalid sheet identity" ) );
+
+                sheet.parent = SHEET_REFERENCE{ SHEET_ID( parentId ), parentSource };
+            }
+
+            if( instanceQualifier != 0xFFFF )
+            {
+                SOURCE_PROVENANCE qualifierSource = provenance;
+                qualifierSource.absoluteOffset += 12;
+                qualifierSource.length = 2;
+                SOURCE_PROPERTY qualifier = sourceProperty(
+                        wxS( "raw_sheet_instance_qualifier" ),
+                        wxString::Format( wxS( "%u" ), instanceQualifier ), qualifierSource );
+                qualifier.disposition = PROPERTY_DISPOSITION::PRESERVED;
+                sheet.properties.push_back( std::move( qualifier ) );
+            }
 
             sheet.pageSize = aModel.settings.pageSize;
             sheet.defaultLineWidth = aModel.settings.defaultLineWidth;
@@ -5666,14 +5829,15 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                         { heapSource,
                           PROPERTY_DISPOSITION::PRESERVED,
                           { aBytes.begin() + heapOffset, aBytes.begin() + heapOffset + heapBytes } } );
-                decodeDefinitionsAndParts( aBytes, aCursor, block, sheetIndex, aSourceName, aModel );
+                decodeDefinitionsAndParts( aBytes, aCursor, block, sheetIndex, aSourceName, nullptr, aModel );
                 ++sheetIndex;
                 continue;
             }
 
             decodeFreeText( aBytes, aCursor, aSourceName, sheetIndex, payload, textCount, heapOffset, heapBytes,
                             *placementData, aModel );
-            decodeDefinitionsAndParts( aBytes, aCursor, block, sheetIndex, aSourceName, aModel );
+            decodeDefinitionsAndParts( aBytes, aCursor, block, sheetIndex, aSourceName,
+                                       &*connectivityData, aModel );
             decodePlacements( aBytes, aCursor, block, sheetIndex, aSourceName, *placementData, aModel );
             decodeConnectivity( aBytes, aCursor, block, sheetIndex, aSourceName, *connectivityData, aModel );
             ++sheetIndex;
@@ -5809,10 +5973,2448 @@ void PADS_SCH_MODEL::ValidateOrThrow() const
 }
 
 
+// The legacy v0x0009 sheet is structurally close to v0x000D, but several
+// controller record layouts are different.  Validate them with bounded reads
+// before any semantic decoding: do not cast v9 data to the v13 record structs.
+// This is the versioned foundation for the subsequent v9 semantic decoder.
+static void validateLegacyV9Records( const PADS_SCH_SDB& aSdb, const std::vector<uint8_t>& aBytes )
+{
+    const PADS_IO::BINARY_CURSOR& cursor = aSdb.Cursor();
+    auto reject = [&]( size_t aOffset, const wxString& aDetail )
+    {
+        THROW_IO_ERROR( wxString::Format(
+                wxS( "PADS Logic binary v0x0009 at offset 0x%zX: %s" ), aOffset, aDetail.c_str() ) );
+    };
+
+    constexpr size_t SHEET_HEADER = 20;
+    constexpr size_t DESCRIPTOR_COUNT = 24;
+    constexpr size_t DESCRIPTOR_BYTES = 28;
+
+    // Controller numbers below are 1-based.  Only known *fixed* record types
+    // are checked; variable-length heaps are left to their owning decoders.
+    struct LEGACY_STRIDE { size_t controller; size_t bytes; };
+    constexpr LEGACY_STRIDE strides[] = {
+        { 1, 28 }, { 3, 80 }, { 4, 6 }, { 5, 6 }, { 6, 14 },
+        { 7, 92 }, { 8, 26 }, { 9, 76 }, { 10, 12 }, { 11, 8 },
+        { 12, 52 }, { 13, 8 }, { 15, 128 }, { 16, 12 }, { 17, 20 },
+        { 19, 12 }, { 20, 32 }, { 21, 40 }, { 22, 8 }, { 23, 40 }
+    };
+
+    for( const SCH_SDB_BLOCK& block : aSdb.Blocks() )
+    {
+        if( block.kind != SCH_SDB_BLOCK_KIND::SHEET )
+            continue;
+
+        const size_t directory = block.offset + SHEET_HEADER;
+        size_t data = directory + DESCRIPTOR_COUNT * DESCRIPTOR_BYTES;
+        std::vector<size_t>   offsets( 23 );
+        std::vector<uint32_t> counts( 23 );
+        std::vector<uint32_t> used( 23 );
+
+        for( size_t i = 0; i < offsets.size(); ++i )
+        {
+            const size_t descriptor = directory + i * DESCRIPTOR_BYTES;
+            offsets[i] = data;
+            counts[i] = cursor.U32At( descriptor + 12 );
+            used[i] = cursor.U32At( descriptor + 16 );
+
+            if( data > block.offset + block.bytes
+                || used[i] > block.offset + block.bytes - data )
+                reject( descriptor + 16, wxS( "v9 sheet controller leaves its SDB block" ) );
+
+            data += used[i];
+        }
+
+        for( const LEGACY_STRIDE& stride : strides )
+        {
+            const size_t i = stride.controller - 1;
+
+            if( used[i] != static_cast<uint64_t>( counts[i] ) * stride.bytes )
+                reject( directory + i * DESCRIPTOR_BYTES + 16,
+                        wxString::Format( wxS( "v9 controller %zu is not %zu-byte records" ),
+                                          stride.controller, stride.bytes ) );
+        }
+
+        // v9 text: 28 bytes, with string-heap offset at +4 (v13 uses +8).
+        for( size_t i = 0; i < counts[0]; ++i )
+        {
+            const size_t offset = offsets[0] + i * 28;
+            const uint32_t stringOffset = cursor.U32At( offset + 4 );
+
+            if( stringOffset >= used[1] )
+                reject( offset + 4, wxS( "v9 text string offset leaves controller 2" ) );
+
+            const auto begin = aBytes.begin() + offsets[1] + stringOffset;
+            const auto end = aBytes.begin() + offsets[1] + used[1];
+
+            if( std::find( begin, end, static_cast<uint8_t>( 0 ) ) == end )
+                reject( offset + 4, wxS( "v9 text is not NUL terminated" ) );
+        }
+
+        // v9 used decal: 92 bytes.  The definition ordinal at +48 is u16;
+        // reading it as the v13 u32 changes the handle (e.g. 0 -> 131072).
+        for( size_t i = 0; i < counts[6]; ++i )
+        {
+            const size_t offset = offsets[6] + i * 92;
+            const auto nameBegin = aBytes.begin() + offset;
+            const auto nameEnd = nameBegin + 40;
+
+            if( std::find( nameBegin, nameEnd, static_cast<uint8_t>( 0 ) ) == nameEnd )
+                reject( offset, wxS( "v9 used-decal name is unterminated" ) );
+
+            const uint16_t definition = cursor.U16At( offset + 48 );
+
+            if( definition == 0xFFFF )
+                continue;
+
+            if( definition >= counts[2] )
+                reject( offset + 48, wxS( "v9 decal definition ordinal leaves controller 3" ) );
+
+            const auto targetName = aBytes.begin() + offsets[2] + definition * 80;
+
+            if( !std::equal( nameBegin, nameBegin + 38, targetName ) )
+                reject( offset + 48, wxS( "v9 decal references a different symbol definition" ) );
+        }
+
+        uint64_t pinTotal = 0;
+        uint64_t fieldTotal = 0;
+
+        // v9 placement: 128 bytes, shifted by eight from the v13 layout.
+        for( size_t i = 0; i < counts[14]; ++i )
+        {
+            const size_t offset = offsets[14] + i * 128;
+
+            if( cursor.U16At( offset + 0x3A ) >= counts[8] )
+                reject( offset + 0x3A, wxS( "v9 placement PARTTYPE handle is out of range" ) );
+
+            if( cursor.U16At( offset + 0x3C ) >= counts[6] )
+                reject( offset + 0x3C, wxS( "v9 placement decal handle is out of range" ) );
+
+            pinTotal += cursor.U16At( offset + 0x44 );
+            fieldTotal += cursor.U16At( offset + 0x46 );
+        }
+
+        if( pinTotal != counts[15] || fieldTotal != counts[16] )
+            reject( offsets[14], wxS( "v9 placement pin/field totals disagree with controllers" ) );
+
+        // v9 OFFPAGE keeps the 32-byte v13 record format, including +26 angle
+        // and +28 mirror.  Its pointers must be in the matching controllers.
+        for( size_t i = 0; i < counts[19]; ++i )
+        {
+            const size_t offset = offsets[19] + i * 32;
+
+            if( cursor.U16At( offset + 4 ) >= counts[6]
+                || cursor.U16At( offset + 8 ) >= counts[20] )
+                reject( offset + 4, wxS( "v9 off-page decal/connection handle invalid" ) );
+        }
+
+        // v9 NETNAMES: 40 bytes instead of 48.  OFFPAGE owner at +30,
+        // while the v13 record stores it at +38.
+        for( size_t i = 0; i < counts[22]; ++i )
+        {
+            const size_t offset = offsets[22] + i * 40;
+            const uint16_t owner = cursor.U16At( offset + 30 );
+
+            if( ( owner & 0xF000 ) == 0x2000
+                && ( owner & 0x0FFF ) >= counts[19] )
+                reject( offset + 30, wxS( "v9 NETNAMES off-page owner out of range" ) );
+        }
+    }
+}
+
+// Semantic v0x0009 stage 3. The 80-byte symbol records, 6-byte graphics,
+// vertices and 14-byte arcs are shared with v0x000D. Reuse the existing
+// *semantic* graphic decoder, but keep legacy text and link records separate.
+// Do not send a model with missing parts and connections to the KiCad builder.
+// PADS Logic v0x0009 Stage 4. Graphical terminal, gate, and PARTTYPE
+// relationships are decoded independently from v0x000D. In particular the
+// 8-byte logical pin record is NOT the 24-byte v13 record. These objects are
+// intentionally not passed to the KiCad builder before placements and wires
+// can be decoded as well.
+struct LEGACY_V9_PART_COUNTS
+{
+    size_t terminals = 0;
+    size_t partTypes = 0;
+    size_t gates = 0;
+    size_t gatePins = 0;
+    size_t signalPins = 0;
+};
+
+static LEGACY_V9_PART_COUNTS decodeLegacyV9PartsAndPins(
+        const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
+        const SHEET_CONTROLLERS& aControllers, const DEFINITION_LAYOUT& aLayout,
+        size_t aSheetIndex, const wxString& aSourceName,
+        const std::vector<MODEL_SYMBOL_DEFINITION*>& aDefinitionsByRecord,
+        PADS_SCH_MODEL& aModel )
+{
+    LEGACY_V9_PART_COUNTS counts;
+    const auto& pools = aControllers.pools;
+    std::vector<MODEL_SYMBOL_DEFINITION*> decals( pools[6].count, nullptr );
+    std::vector<bool> claimedTerminals( pools[7].count, false );
+
+    // Resolve 92-byte USED_DECALs to their 80-byte symbol definitions. In v9
+    // definition index is u16 at +48; terminal count/start are +42/+44.
+    for( size_t record = 0; record < decals.size(); ++record )
+    {
+        const size_t offset = aControllers.offsets[6] + record * 92;
+        const uint16_t definitionRecord = aCursor.U16At( offset + 48 );
+        const uint16_t terminalCount = aCursor.U16At( offset + 42 );
+        const uint16_t terminalStart = aCursor.U16At( offset + 44 );
+
+        if( definitionRecord == 0xFFFF )
+            continue;
+
+        SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version, wxS( "used decal" ),
+                                             7, record, offset, 92, static_cast<int>( aSheetIndex ) );
+
+        if( definitionRecord >= aDefinitionsByRecord.size() )
+            throwDecodeError( source, wxS( "v9 used-decal definition index is out of range" ) );
+
+        if( terminalStart > pools[7].count || terminalCount > pools[7].count - terminalStart )
+            throwDecodeError( source, wxS( "v9 used-decal terminal slice leaves controller 8" ) );
+
+        MODEL_SYMBOL_DEFINITION* definition = aDefinitionsByRecord[definitionRecord];
+
+        if( !definition )
+            continue;
+
+        decals[record] = definition;
+        // Symbols with multiple USED_DECAL aliases must not duplicate their
+        // physical terminal objects. For this fixture there are no such cases.
+        if( !definition->pins.empty() && terminalCount != 0 )
+            throwDecodeError( source, wxS( "v9 symbol terminal slice is claimed twice" ) );
+
+        for( size_t pin = 0; pin < terminalCount; ++pin )
+        {
+            const size_t terminalRecord = terminalStart + pin;
+            const size_t terminalOffset = aControllers.offsets[7] + terminalRecord * TERMINAL_BYTES;
+            SOURCE_PROVENANCE pinSource = sourceAt(
+                    aSourceName, aModel.version, wxS( "symbol pin" ), 8, terminalRecord,
+                    terminalOffset, TERMINAL_BYTES, static_cast<int>( aSheetIndex ) );
+
+            if( claimedTerminals[terminalRecord] )
+                throwDecodeError( pinSource, wxS( "v9 terminal belongs to multiple decals" ) );
+
+            claimedTerminals[terminalRecord] = true;
+            MODEL_PIN_DEFINITION definitionPin;
+            definitionPin.id = PIN_ID( aLayout.pinIdBase + terminalRecord );
+            definitionPin.source = pinSource;
+            definitionPin.position = {
+                    decodeTerminalCoordinate( aCursor.U16At( terminalOffset + 2 ) ),
+                    decodeTerminalCoordinate( aCursor.U16At( terminalOffset + 4 ) ), pinSource };
+            definitionPin.numberOffset = {
+                    decodeLocalCoordinate( aCursor.U16At( terminalOffset + 6 ) ),
+                    decodeLocalCoordinate( aCursor.U16At( terminalOffset + 8 ) ), pinSource };
+            definitionPin.nameOffset = {
+                    decodeLocalCoordinate( aCursor.U16At( terminalOffset + 10 ) ),
+                    decodeLocalCoordinate( aCursor.U16At( terminalOffset + 12 ) ), pinSource };
+            const uint16_t presentationFlags = aCursor.U16At( terminalOffset + 22 );
+            const uint16_t visibilityFlags = aCursor.U16At( terminalOffset + 24 );
+            definitionPin.presentationFlags = presentationFlags;
+            definitionPin.visibilityAndNumberPresentationFlags = visibilityFlags;
+            definitionPin.xym = ( presentationFlags & 0x0006 ) >> 1;
+            definitionPin.angle = ( presentationFlags & 0x0001 ) ? 900 : 0;
+            definitionPin.numberAngle = ( presentationFlags & 0x0100 ) ? 900 : 0;
+            definitionPin.nameAngle = ( visibilityFlags & 0x0001 ) ? 900 : 0;
+            definitionPin.presentation.source = pinSource;
+            definitionPin.presentation.visible = true;
+            definitionPin.namePresentation.source = pinSource;
+            definitionPin.numberPresentation.source = pinSource;
+
+            // The pin-decal vector/line-body and text metrics require the
+            // v9-specific USED_DECAL field map; do not synthesize geometry.
+            const uint16_t pinDecalHandle = aCursor.U16At( terminalOffset );
+
+            if( pinDecalHandle != 0xFFFF )
+            {
+                if( pinDecalHandle >= decals.size() )
+                    throwDecodeError( pinSource, wxS( "v9 terminal pin-decal handle is out of range" ) );
+
+                SOURCE_PROVENANCE decalNameSource = sourceAt(
+                        aSourceName, aModel.version, wxS( "pin decal" ), 7, pinDecalHandle,
+                        aControllers.offsets[6] + pinDecalHandle * 92, 40,
+                        static_cast<int>( aSheetIndex ) );
+                definitionPin.decalName = decodeFixedString(
+                        aBytes, decalNameSource.absoluteOffset, 40, decalNameSource,
+                        aModel.diagnostics );
+            }
+
+            definition->pins.push_back( std::move( definitionPin ) );
+            ++counts.terminals;
+        }
+    }
+
+    // v9 PARTTYPE keeps the 76-byte record. +44/+48/+52 are the gate,
+    // logical-pin and signal-pin slice starts. Counts +64/+66/+68 correspond
+    // to gates/signals/local pin-number aliases (rather than the v13 fields).
+    aModel.partTypes.reserve( aModel.partTypes.size() + pools[8].count );
+    size_t specialNameCursor = 0;
+
+    for( size_t record = 0; record < pools[8].count; ++record )
+    {
+        const size_t offset = aControllers.offsets[8] + record * PART_TYPE_BYTES;
+        SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version, wxS( "part type" ),
+                                             9, record, offset, PART_TYPE_BYTES,
+                                             static_cast<int>( aSheetIndex ) );
+        const uint32_t gateStart = aCursor.U32At( offset + 44 );
+        const uint32_t pinStart = aCursor.U32At( offset + 48 );
+        const uint32_t signalStart = aCursor.U32At( offset + 52 );
+        const uint32_t gateCount = aCursor.U16At( offset + 64 );
+        const uint32_t signalCount = aCursor.U16At( offset + 66 );
+        const uint32_t specialNameCount = aCursor.U16At( offset + 68 );
+        const uint32_t gateEnd = record + 1 < pools[8].count
+                ? aCursor.U32At( offset + PART_TYPE_BYTES + 44 ) : pools[9].count;
+        const uint32_t pinEnd = record + 1 < pools[8].count
+                ? aCursor.U32At( offset + PART_TYPE_BYTES + 48 ) : pools[10].count;
+        const uint32_t signalEnd = record + 1 < pools[8].count
+                ? aCursor.U32At( offset + PART_TYPE_BYTES + 52 ) : pools[11].count;
+
+        if( gateStart > gateEnd || gateEnd > pools[9].count
+            || pinStart > pinEnd || pinEnd > pools[10].count
+            || signalStart > signalEnd || signalEnd > pools[11].count
+            || gateCount != gateEnd - gateStart || signalCount != signalEnd - signalStart
+            || specialNameCursor > pools[12].count
+            || specialNameCount > pools[12].count - specialNameCursor )
+        {
+            throwDecodeError( source, wxS( "v9 PARTTYPE gate/pin/signal/name ownership mismatch" ) );
+        }
+
+        MODEL_PART_TYPE part;
+        part.id = PART_TYPE_ID( aLayout.partIdBase + record );
+        part.source = source;
+        SOURCE_PROVENANCE nameSource = source;
+        nameSource.length = 44;
+        part.name = decodeFixedString( aBytes, offset, 44, nameSource, aModel.diagnostics );
+        size_t logicalPinCursor = pinStart;
+        uint32_t unit = 0;
+
+        for( uint32_t gateRecord = gateStart; gateRecord < gateEnd; ++gateRecord )
+        {
+            const size_t gateOffset = aControllers.offsets[9] + gateRecord * GATE_BYTES;
+            SOURCE_PROVENANCE gateSource = sourceAt(
+                    aSourceName, aModel.version, wxS( "gate" ), 10, gateRecord,
+                    gateOffset, GATE_BYTES, static_cast<int>( aSheetIndex ) );
+            MODEL_GATE gate;
+            gate.id = GATE_ID( aLayout.gateIdBase + gateRecord );
+            gate.source = gateSource;
+            gate.unit = ++unit;
+            const uint16_t pinCount = aCursor.U16At( gateOffset + 8 );
+            const uint16_t primaryHandle = aCursor.U16At( gateOffset );
+
+            if( primaryHandle >= decals.size() || !decals[primaryHandle] )
+                throwDecodeError( gateSource, wxS( "v9 gate primary decal is unresolved" ) );
+
+            MODEL_SYMBOL_DEFINITION& definition = *decals[primaryHandle];
+            gate.definition = { definition.id, gateSource };
+
+            if( pinCount != definition.pins.size() || logicalPinCursor > pinEnd
+                || pinCount > pinEnd - logicalPinCursor )
+                throwDecodeError( gateSource, wxS( "v9 gate pin count disagrees with selected decal" ) );
+
+            for( size_t alternate = 1; alternate < 4; ++alternate )
+            {
+                const uint16_t alternateHandle = aCursor.U16At( gateOffset + alternate * 2 );
+
+                if( alternateHandle == 0xFFFF )
+                    continue;
+
+                if( alternateHandle >= decals.size() || !decals[alternateHandle]
+                    || decals[alternateHandle]->pins.size() != pinCount )
+                    throwDecodeError( gateSource, wxS( "v9 alternate decal is invalid" ) );
+
+                gate.alternateDefinitions.push_back( { decals[alternateHandle]->id, gateSource } );
+            }
+
+            for( size_t pinOrdinal = 0; pinOrdinal < pinCount; ++pinOrdinal, ++logicalPinCursor )
+            {
+                const size_t pinOffset = aControllers.offsets[10] + logicalPinCursor * 8;
+                SOURCE_PROVENANCE pinSource = sourceAt(
+                        aSourceName, aModel.version, wxS( "logical pin" ), 11,
+                        logicalPinCursor, pinOffset, 8, static_cast<int>( aSheetIndex ) );
+                const uint16_t rawNumber = aCursor.U16At( pinOffset + 4 );
+                SOURCE_STRING number;
+
+                if( specialNameCount != 0 )
+                {
+                    if( rawNumber == 0 || rawNumber > specialNameCount )
+                        throwDecodeError( pinSource, wxS( "v9 special pin number index is out of range" ) );
+
+                    const size_t aliasOffset = aControllers.offsets[12]
+                            + ( specialNameCursor + rawNumber - 1 ) * 8;
+                    SOURCE_PROVENANCE aliasSource = sourceAt(
+                            aSourceName, aModel.version, wxS( "pin-number alias" ), 13,
+                            specialNameCursor + rawNumber - 1, aliasOffset, 8,
+                            static_cast<int>( aSheetIndex ) );
+                    number = decodeFixedString( aBytes, aliasOffset, 8, aliasSource, aModel.diagnostics );
+                }
+                else
+                {
+                    number.source = pinSource;
+                    number.text = wxString::Format( wxS( "%u" ), rawNumber );
+                }
+
+                MODEL_PIN_DEFINITION& definitionPin = definition.pins[pinOrdinal];
+
+                if( definitionPin.number.text.IsEmpty() )
+                    definitionPin.number = number;
+
+                const uint8_t rawType = aCursor.U8At( pinOffset + 7 );
+                const uint32_t electricalType = pinElectricalType( rawType, pinSource, aModel.diagnostics );
+                definitionPin.electricalType = electricalType;
+                MODEL_GATE_PIN logicalPin;
+                logicalPin.source = pinSource;
+                logicalPin.definitionPin = { definitionPin.id, pinSource };
+                logicalPin.number = std::move( number );
+                logicalPin.name = definitionPin.name;
+                logicalPin.electricalType = electricalType;
+                logicalPin.swapGroup = aCursor.U8At( pinOffset + 6 );
+                gate.pins.push_back( { definitionPin.id, pinSource } );
+                gate.logicalPins.push_back( std::move( logicalPin ) );
+                ++counts.gatePins;
+            }
+
+            part.gates.push_back( std::move( gate ) );
+            ++counts.gates;
+        }
+
+        if( logicalPinCursor != pinEnd )
+            throwDecodeError( source, wxS( "v9 PARTTYPE has unclaimed logical pins" ) );
+
+        // A separate v9 signal-pin mapping pass is needed to interpret the
+        // 52-byte SIGPIN payload. Verify its ownership but do not fabricate
+        // potentially wrong signal-to-net associations.
+        counts.signalPins += signalCount;
+        specialNameCursor += specialNameCount;
+        aModel.partTypes.push_back( std::move( part ) );
+        ++counts.partTypes;
+    }
+
+    if( specialNameCursor != pools[12].count )
+        throwDecodeError( aModel.source, wxS( "v9 unclaimed special pin-number aliases" ) );
+
+    for( bool claimed : claimedTerminals )
+    {
+        if( !claimed )
+            throwDecodeError( aModel.source, wxS( "v9 unclaimed symbol terminal record" ) );
+    }
+
+    return counts;
+}
+
+// PADS Logic 0x0009 Stage 5. Placed schematic objects are not just the
+// v13 layouts with their strides changed: all offsets here are explicit v9
+// offsets. Group attributes and placement pin presentation remain bounded.
+struct LEGACY_V9_PLACEMENT_COUNTS
+{
+    size_t placements = 0;
+    size_t pins = 0;
+    size_t attributeFields = 0;
+    size_t unboundCustomFields = 0;
+    size_t reusedGateUnits = 0;
+};
+
+static LEGACY_V9_PLACEMENT_COUNTS decodeLegacyV9Placements(
+        const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
+        const PADS_SCH_SDB& aSdb, const SHEET_CONTROLLERS& aControllers,
+        size_t aSheetIndex, const wxString& aSourceName, PADS_SCH_MODEL& aModel )
+{
+    LEGACY_V9_PLACEMENT_COUNTS counts;
+    const auto& pools = aControllers.pools;
+    requireFixedController( aControllers, 15, 128, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 16, 12, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 17, 20, aSourceName, aModel.version, aSheetIndex );
+
+    const SCH_SDB_POOL& groupPool = aSdb.Pools()[6];
+    const SCH_SDB_POOL& attributePool = aSdb.Pools()[7];
+    const SCH_SDB_POOL& attributeHeap = aSdb.Pools()[2];
+
+    if( uint64_t( groupPool.count ) * PLACEMENT_GROUP_BYTES != groupPool.usedBytes
+        || uint64_t( attributePool.count ) * ATTRIBUTE_OFFSET_BYTES != attributePool.usedBytes )
+        throwDecodeError( aModel.source, wxS( "v9 component-group/attribute directory stride mismatch" ) );
+
+    const size_t groupBase = outerControllerOffset( aSdb, 6 );
+    const size_t attributeBase = outerControllerOffset( aSdb, 7 );
+    const size_t attributeHeapBase = outerControllerOffset( aSdb, 2 );
+
+    auto attribute = [&]( size_t aRecord, bool aRequireValue )
+            -> std::pair<SOURCE_STRING, SOURCE_STRING>
+    {
+        if( aRecord >= attributePool.count )
+            throwDecodeError( aModel.source, wxS( "v9 attribute record outside outer controller 7" ) );
+
+        const size_t recordOffset = attributeBase + aRecord * ATTRIBUTE_OFFSET_BYTES;
+        const uint32_t stringOffset = aCursor.U32At( recordOffset );
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "component attribute" ), 7,
+                aRecord, recordOffset, ATTRIBUTE_OFFSET_BYTES, -1 );
+
+        if( stringOffset >= attributeHeap.usedBytes )
+            throwDecodeError( source, wxS( "v9 attribute string offset outside outer controller 2" ) );
+
+        const size_t start = attributeHeapBase + stringOffset;
+        const size_t limit = attributeHeapBase + attributeHeap.usedBytes;
+        size_t end = start;
+
+        while( end < limit && aBytes[end] != 0 )
+            ++end;
+
+        if( end == limit )
+            throwDecodeError( source, wxS( "v9 attribute string is not NUL terminated" ) );
+
+        size_t separator = start;
+
+        while( separator < end && aBytes[separator] != 1 )
+            ++separator;
+
+        if( aRequireValue && separator == end )
+            throwDecodeError( source, wxS( "v9 component field lacks name/value separator" ) );
+
+        SOURCE_PROVENANCE nameSource = source;
+        nameSource.absoluteOffset = start;
+        nameSource.length = separator - start;
+        SOURCE_STRING name = PADS_SCH_BINARY_PARSER::DecodeString(
+                { aBytes.begin() + start, aBytes.begin() + separator }, DEFAULT_CODE_PAGE,
+                nameSource, aModel.diagnostics );
+
+        SOURCE_STRING value;
+
+        if( separator < end )
+        {
+            SOURCE_PROVENANCE valueSource = source;
+            valueSource.absoluteOffset = separator + 1;
+            valueSource.length = end - separator - 1;
+            value = PADS_SCH_BINARY_PARSER::DecodeString(
+                    { aBytes.begin() + separator + 1, aBytes.begin() + end },
+                    DEFAULT_CODE_PAGE, valueSource, aModel.diagnostics );
+        }
+
+        return { std::move( name ), std::move( value ) };
+    };
+
+    uint32_t pinCursor = 0;
+    uint32_t fieldCursor = 0;
+    aModel.placements.reserve( aModel.placements.size() + pools[14].count );
+
+    for( size_t record = 0; record < pools[14].count; ++record )
+    {
+        const size_t offset = aControllers.offsets[14] + record * 128;
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "placement" ), 15, record,
+                offset, 128, static_cast<int>( aSheetIndex ) );
+
+        const uint16_t partHandle = aCursor.U16At( offset + 0x3A );
+        const uint16_t decalHandle = aCursor.U16At( offset + 0x3C );
+        const uint16_t rawUnit = aCursor.U16At( offset + 0x42 );
+        const uint32_t startPin = aCursor.U32At( offset + 0x0C );
+        const uint16_t countPins = aCursor.U16At( offset + 0x44 );
+        const uint16_t countFields = aCursor.U16At( offset + 0x46 );
+        const uint32_t groupHandle = aCursor.U32At( offset + 0x14 );
+
+        if( partHandle >= pools[8].count || decalHandle >= pools[6].count
+            || groupHandle >= groupPool.count )
+            throwDecodeError( source, wxS( "v9 placement part/decal/group reference out of range" ) );
+
+        if( startPin != pinCursor || pinCursor > pools[15].count
+            || countPins > pools[15].count - pinCursor
+            || fieldCursor > pools[16].count
+            || countFields > pools[16].count - fieldCursor )
+            throwDecodeError( source, wxS( "v9 placement pin/field slice is not contiguous" ) );
+
+        const uint16_t definitionRecord = aCursor.U16At(
+                aControllers.offsets[6] + decalHandle * 92 + 48 );
+        auto part = std::ranges::find_if( aModel.partTypes,
+                [&]( const MODEL_PART_TYPE& aPart )
+                {
+                    return aPart.source.sheet == static_cast<int>( aSheetIndex )
+                           && aPart.source.recordIndex == partHandle;
+                } );
+        auto definition = std::ranges::find_if( aModel.definitions,
+                [&]( const MODEL_SYMBOL_DEFINITION& aDefinition )
+                {
+                    return aDefinition.source.sheet == static_cast<int>( aSheetIndex )
+                           && aDefinition.source.recordIndex == definitionRecord;
+                } );
+
+        if( part == aModel.partTypes.end() || definition == aModel.definitions.end()
+            || countPins != definition->pins.size() )
+            throwDecodeError( source, wxS( "v9 placed decal/pin/part semantic reference mismatch" ) );
+
+        // The source unit ordinal is NOT always the index in part.gates:
+        // PADS connector choices can be reused across many physical units.
+        // PADS_V9_GATE_UNIT_SELECTION_V17: however, different *logical gates*
+        // may deliberately share the exact same decal (e.g., SWBIP32974
+        // A: pins 1-3, B: pins 4-6). In that case the authored unit must
+        // select the matching gate, not the first graphical match.
+        // Keep the decal-only fallback for connectors with reused graphics;
+        // materializeLegacyV9GateUnits() resolves their physical units later.
+        const MODEL_GATE* matchingGate = nullptr;
+
+        for( const MODEL_GATE& gate : part->gates )
+        {
+            const bool primary = gate.definition.id == definition->id;
+            const bool alternate = std::ranges::any_of(
+                    gate.alternateDefinitions,
+                    [&]( const DEFINITION_REFERENCE& aRef ) { return aRef.id == definition->id; } );
+
+            if( primary || alternate )
+            {
+                if( gate.unit == static_cast<uint32_t>( rawUnit ) + 1 )
+                {
+                    matchingGate = &gate;
+                    break;
+                }
+
+                if( !matchingGate )
+                    matchingGate = &gate;
+            }
+        }
+
+        if( !matchingGate )
+            throwDecodeError( source, wxS( "v9 selected placement decal is absent from its PARTTYPE gates" ) );
+
+        const size_t groupOffset = groupBase + groupHandle * PLACEMENT_GROUP_BYTES;
+        const uint32_t attributeStart = aCursor.U32At( groupOffset );
+        const uint16_t attributeCount = aCursor.U16At( groupOffset + 20 );
+
+        if( attributeCount < 2 || attributeStart > attributePool.count
+            || attributeCount > attributePool.count - attributeStart )
+            throwDecodeError( source, wxS( "v9 placement group attribute slice out of range" ) );
+
+        const SOURCE_STRING groupPartName = attribute( attributeStart + 1, false ).first;
+
+        if( groupPartName.text != part->name.text )
+            throwDecodeError( source, wxS( "v9 placement group PARTTYPE does not match placement handle" ) );
+
+        MODEL_PLACEMENT placement;
+        placement.id = PLACEMENT_ID( static_cast<uint32_t>( aSheetIndex * 0x100000 + record + 1 ) );
+        placement.source = source;
+        placement.sheet = { aModel.sheets[aSheetIndex].id, source };
+        placement.partType = { part->id, source };
+        placement.definition = { definition->id, source };
+        placement.gate = GATE_REFERENCE{ matchingGate->id, source };
+        placement.unit = rawUnit + 1;
+        placement.position = { decodeCoordinate( aCursor.U16At( offset + 0x18 ) ),
+                               decodeCoordinate( aCursor.U16At( offset + 0x1A ) ), source };
+        placement.angle = NormalizeAngle( aCursor.U16At( offset + 0x1C ) );
+        placement.mirrorFlags = aCursor.U16At( offset + 0x1E );
+        placement.mirrored = placement.mirrorFlags != 0;
+        placement.itemVisibilityFlags = aCursor.U8At( offset + 0x7F );
+        placement.referenceVisible = ( placement.itemVisibilityFlags & 1 ) == 0;
+        placement.partTypeVisible = ( placement.itemVisibilityFlags & 2 ) == 0;
+        placement.pinNamesVisible = ( placement.itemVisibilityFlags & 8 ) == 0;
+        // PADS item-visibility flags use hide semantics here, matching
+        // the ASCII placement representation: 0x08 hides pin names and
+        // 0x10 hides pin numbers. Keep the logical pin number itself even
+        // when hidden (for example A/K on diode gate/decal mappings).
+        placement.pinNumbersVisible = ( placement.itemVisibilityFlags & 0x10 ) == 0;
+
+        if( placement.angle % 900 != 0 || placement.mirrorFlags > 3 )
+            throwDecodeError( source, wxS( "v9 placement has unsupported transform" ) );
+
+        SOURCE_PROVENANCE referenceSource = source;
+        referenceSource.absoluteOffset += 0x56;
+        referenceSource.length = 40;
+        placement.reference = decodeFixedString(
+                aBytes, offset + 0x56, 40, referenceSource, aModel.diagnostics );
+
+        if( placement.reference.text.IsEmpty() )
+            throwDecodeError( source, wxS( "v9 placement has empty reference" ) );
+
+        if( rawUnit >= part->gates.size() )
+            ++counts.reusedGateUnits;
+
+        placement.properties.push_back( sourceProperty(
+                wxS( "v9_raw_gate_ordinal" ), wxString::Format( wxS( "%u" ), rawUnit ), source ) );
+        placement.properties.push_back( sourceProperty(
+                wxS( "component_group_handle" ), wxString::Format( wxS( "%u" ), groupHandle ), source ) );
+        placement.properties.push_back( sourceProperty(
+                wxS( "decal_handle" ), wxString::Format( wxS( "%u" ), decalHandle ), source ) );
+
+        for( uint16_t pin = 0; pin < countPins; ++pin )
+        {
+            const size_t pinOffset = aControllers.offsets[15] + ( pinCursor + pin ) * 12;
+            SOURCE_PROVENANCE pinSource = sourceAt( aSourceName, aModel.version, wxS( "placed pin" ),
+                    16, pinCursor + pin, pinOffset, 12, static_cast<int>( aSheetIndex ) );
+            const uint16_t pinOrdinal = aCursor.U16At( pinOffset + 4 );
+
+            if( pinOrdinal != pin || pinOrdinal >= definition->pins.size() )
+                throwDecodeError( pinSource, wxS( "v9 placed-pin ordinal does not match selected decal" ) );
+
+            PLACED_PIN_REFERENCE placedPin{ definition->pins[pinOrdinal].id, pinSource };
+            placedPin.numberOffset = {
+                    static_cast<int64_t>( static_cast<int16_t>( aCursor.U16At( pinOffset + 6 ) ) ) * 2,
+                    static_cast<int64_t>( static_cast<int16_t>( aCursor.U16At( pinOffset + 8 ) ) ) * 2,
+                    pinSource };
+            placedPin.numberPresentationFlags = aCursor.U16At( pinOffset + 10 );
+            placedPin.numberAngle = ( placedPin.numberPresentationFlags & 1 ) ? 900 : 0;
+            placedPin.numberJustification = terminalJustification(
+                    ( placedPin.numberPresentationFlags >> 4 ) & 15, placedPin.numberAngle != 0 );
+            placedPin.hasNumberPlacement = true;
+            placement.pins.push_back( std::move( placedPin ) );
+            ++counts.pins;
+        }
+
+        pinCursor += countPins;
+
+        // Inline REF-DES and PART-TYPE have the v13 layout shifted by eight
+        // bytes. Text font metadata requires further v9 font inspection.
+        auto inlineField = [&]( const wxString& aName, const SOURCE_STRING& aValue,
+                                bool aVisible, size_t aPosition, size_t aAngle,
+                                size_t aHeight, size_t aWidth )
+        {
+            SOURCE_PROVENANCE fieldSource = source;
+            fieldSource.objectClass = wxS( "inline placement field" );
+            fieldSource.absoluteOffset += aPosition;
+            fieldSource.length = 8;
+            MODEL_FIELD field;
+            field.source = fieldSource;
+            field.name.text = aName;
+            field.name.source = fieldSource;
+            field.value = aValue;
+            field.position = { decodeLocalCoordinate( aCursor.U16At( offset + aPosition ) ),
+                               decodeLocalCoordinate( aCursor.U16At( offset + aPosition + 2 ) ), fieldSource };
+            field.angle = NormalizeAngle( aCursor.U16At( offset + aAngle ) );
+            field.presentation.source = fieldSource;
+            field.visible = aVisible;
+            field.presentation.visible = aVisible;
+            field.presentation.height = int64_t( aCursor.U16At( offset + aHeight ) ) * 2;
+            field.presentation.width = int64_t( aCursor.U8At( offset + aWidth ) ) * 2;
+            const uint16_t justification = rotatedFieldJustification(
+                    aCursor.U16At( offset + aAngle + 2 ), field.angle );
+            field.presentation.horizontalJustification = horizontalJustification( justification );
+            field.presentation.verticalJustification = verticalJustification( justification );
+            placement.fields.push_back( std::move( field ) );
+        };
+
+        inlineField( wxS( "REF-DES" ), placement.reference, placement.referenceVisible,
+                     0x20, 0x24, 0x48, 0x50 );
+        inlineField( wxS( "PART-TYPE" ), part->name, placement.partTypeVisible,
+                     0x28, 0x2C, 0x4A, 0x51 );
+
+        // Preserve source component attributes, including empty values and
+        // PCB DECAL. Presentation-only records are not synthetic attributes.
+        for( uint16_t index = 2; index < attributeCount; ++index )
+        {
+            auto [name, value] = attribute( attributeStart + index, true );
+            MODEL_FIELD field;
+            field.source = name.source;
+            field.name = std::move( name );
+            field.value = std::move( value );
+            field.visible = false;
+            field.presentation.source = field.source;
+            field.presentation.visible = false;
+            placement.fields.push_back( std::move( field ) );
+            ++counts.attributeFields;
+        }
+
+        for( uint16_t field = 0; field < countFields; ++field, ++fieldCursor )
+        {
+            const size_t fieldOffset = aControllers.offsets[16] + fieldCursor * 20;
+            SOURCE_PROVENANCE fieldSource = sourceAt( aSourceName, aModel.version,
+                    wxS( "custom placement field" ), 17, fieldCursor, fieldOffset,
+                    20, static_cast<int>( aSheetIndex ) );
+            const uint16_t attributeIndex = aCursor.U16At( fieldOffset + 12 );
+
+            if( attributeIndex == 0xFFFF )
+            {
+                ++counts.unboundCustomFields;
+                continue;
+            }
+
+            if( attributeIndex >= attributeCount )
+                throwDecodeError( fieldSource, wxS( "v9 custom field attribute index out of range" ) );
+
+            // Group attributes are already in placement.fields above; a
+            // bound field supplies their local text presentation/visibility.
+            auto [name, value] = attribute( attributeStart + attributeIndex, true );
+            auto entry = std::ranges::find_if( placement.fields,
+                    [&]( const MODEL_FIELD& aField ) { return aField.name.text == name.text; } );
+
+            if( entry == placement.fields.end() )
+                throwDecodeError( fieldSource, wxS( "v9 bound custom field is not a group attribute" ) );
+
+            entry->position = {
+                    decodeLocalCoordinate( aCursor.U16At( fieldOffset + 4 ) ),
+                    decodeLocalCoordinate( aCursor.U16At( fieldOffset + 6 ) ), fieldSource };
+            entry->angle = NormalizeAngle( aCursor.U16At( fieldOffset + 8 ) );
+            entry->presentation.source = fieldSource;
+            entry->presentation.height = int64_t( aCursor.U16At( fieldOffset + 14 ) ) * 2;
+            entry->presentation.width = int64_t( aCursor.U8At( fieldOffset + 16 ) ) * 2;
+            entry->visible = ( aCursor.U8At( fieldOffset + 17 ) & 8 ) == 0;
+            entry->presentation.visible = entry->visible;
+        }
+
+        aModel.placements.push_back( std::move( placement ) );
+        ++counts.placements;
+    }
+
+    if( pinCursor != pools[15].count || fieldCursor != pools[16].count )
+        throwDecodeError( aModel.source, wxS( "v9 placed pin / custom field ownership is incomplete" ) );
+
+    return counts;
+}
+
+// PADS Logic binary v0x0009 Stage 6. No v0x000D layout reinterpretation:
+// v9 retains 40-byte CONNECTION, 8-byte vertex, 12-byte junction and 32-byte
+// off-page records, but NETNAMES is 40 (not 48) bytes. Links are always typed
+// handles; a wire endpoint referencing a placement must resolve to precisely
+// one real transformed pin, not merely a nearby coordinate.
+struct LEGACY_V9_CONNECTIVITY_COUNTS
+{
+    size_t nets = 0;
+    size_t wires = 0;
+    size_t vertices = 0;
+    size_t pinEndpoints = 0;
+    size_t junctions = 0;
+    size_t offpages = 0;
+    size_t netNames = 0;
+};
+
+static LEGACY_V9_CONNECTIVITY_COUNTS decodeLegacyV9Connectivity(
+        const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
+        const PADS_SCH_SDB& aSdb, const SHEET_CONTROLLERS& aControllers,
+        size_t aSheetIndex, const wxString& aSourceName, PADS_SCH_MODEL& aModel )
+{
+    LEGACY_V9_CONNECTIVITY_COUNTS counts;
+    const auto& pools = aControllers.pools;
+    requireFixedController( aControllers, 18, BUS_RECORD_BYTES, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 19, JUNCTION_RECORD_BYTES, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 20, OFFPAGE_RECORD_BYTES, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 21, CONNECTION_RECORD_BYTES, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 22, CONNECTION_VERTEX_BYTES, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 23, 40, aSourceName, aModel.version, aSheetIndex );
+
+    if( pools[17].count != 0 )
+        throwDecodeError( aModel.source, wxS( "v9 bus decoding requires a separate semantic pass" ) );
+
+    const SCH_SDB_POOL& membershipPool = aSdb.Pools()[4];
+    const SCH_SDB_POOL& netPool = aSdb.Pools()[8];
+
+    if( uint64_t( membershipPool.count ) * NET_MEMBERSHIP_BYTES != membershipPool.usedBytes
+        || uint64_t( netPool.count ) * NET_RECORD_BYTES != netPool.usedBytes )
+        throwDecodeError( aModel.source, wxS( "v9 global net/membership stride mismatch" ) );
+
+    const size_t membershipBase = outerControllerOffset( aSdb, 4 );
+    const size_t netBase = outerControllerOffset( aSdb, 8 );
+    const size_t offpageBase = aControllers.offsets[19];
+    const size_t junctionBase = aControllers.offsets[18];
+    const size_t connectionBase = aControllers.offsets[20];
+    const size_t vertexBase = aControllers.offsets[21];
+    const size_t nameBase = aControllers.offsets[22];
+
+    // Each active global net is mapped to its actual sheet membership. The
+    // old SDB contains tombstone records that must never become KiCad nets.
+    constexpr size_t NO_NET = static_cast<size_t>( -1 );
+    std::vector<size_t> netByHandle( netPool.count, NO_NET );
+    std::vector<bool> tombstone( netPool.count, false );
+    std::vector<bool> claimedMembership( membershipPool.count, false );
+    aModel.nets.reserve( aModel.nets.size() + netPool.count );
+
+    for( size_t record = 0; record < netPool.count; ++record )
+    {
+        const size_t offset = netBase + record * NET_RECORD_BYTES;
+        SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version, wxS( "global net" ),
+                                             8, record, offset, NET_RECORD_BYTES, -1 );
+        const uint32_t membershipStart = aCursor.U32At( offset + 4 );
+        const uint16_t membershipCount = aCursor.U16At( offset + 16 );
+        const uint16_t aliasCount = aCursor.U16At( offset + 18 );
+        tombstone[record] = membershipCount == 0xFFFF;
+
+        if( tombstone[record] )
+            continue;
+
+        if( aliasCount != 0 )
+            throwDecodeError( source, wxS( "v9 bus alias net requires separate semantic decoder" ) );
+
+        if( membershipStart > membershipPool.count
+            || membershipCount > membershipPool.count - membershipStart )
+            throwDecodeError( source, wxS( "v9 global net sheet-membership slice out of range" ) );
+
+        SOURCE_PROVENANCE nameSource = source;
+        nameSource.absoluteOffset += 24;
+        nameSource.length = 56;
+        const SOURCE_STRING name = decodeFixedString(
+                aBytes, nameSource.absoluteOffset, 56, nameSource, aModel.diagnostics );
+
+        for( size_t index = 0; index < membershipCount; ++index )
+        {
+            const size_t membershipRecord = membershipStart + index;
+            const uint16_t sheet = aCursor.U16At( membershipBase + membershipRecord * NET_MEMBERSHIP_BYTES );
+
+            if( sheet >= aModel.sheets.size() || claimedMembership[membershipRecord] )
+                throwDecodeError( source, wxS( "v9 net sheet membership is invalid or claimed twice" ) );
+
+            claimedMembership[membershipRecord] = true;
+
+            if( sheet != aSheetIndex )
+                continue;
+
+            if( netByHandle[record] != NO_NET )
+                throwDecodeError( source, wxS( "v9 net has multiple memberships on one sheet" ) );
+
+            SOURCE_PROVENANCE membershipSource = sourceAt(
+                    aSourceName, aModel.version, wxS( "net sheet membership" ), 4,
+                    membershipRecord, membershipBase + membershipRecord * NET_MEMBERSHIP_BYTES,
+                    NET_MEMBERSHIP_BYTES, static_cast<int>( aSheetIndex ) );
+            MODEL_NET net;
+            net.id = NET_ID( static_cast<uint32_t>( membershipRecord ) );
+            net.source = source;
+            net.source.sheet = static_cast<int>( aSheetIndex );
+            net.sheet = { aModel.sheets[aSheetIndex].id, membershipSource };
+            net.name = name;
+            net.properties.push_back( sourceProperty(
+                    wxS( "global_net_record" ), wxString::Format( wxS( "%zu" ), record ), source ) );
+            netByHandle[record] = aModel.nets.size();
+            aModel.nets.push_back( std::move( net ) );
+            ++counts.nets;
+        }
+    }
+
+    // Connection records own consecutive, non-overlapping vertex slices.
+    std::vector<uint32_t> starts( pools[20].count + 1 );
+    std::vector<uint32_t> ownerNet( pools[20].count );
+    std::vector<std::array<uint16_t, 2>> handles( pools[20].count );
+    std::vector<std::vector<size_t>> offBacklinks( pools[19].count );
+    std::vector<std::vector<size_t>> junctionBacklinks( pools[18].count );
+
+    for( size_t record = 0; record < pools[20].count; ++record )
+    {
+        const size_t offset = connectionBase + record * CONNECTION_RECORD_BYTES;
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "connection" ), 21, record,
+                offset, CONNECTION_RECORD_BYTES, static_cast<int>( aSheetIndex ) );
+        starts[record] = aCursor.U32At( offset + 4 );
+        ownerNet[record] = aCursor.U32At( offset + 8 );
+        handles[record] = { aCursor.U16At( offset + 12 ), aCursor.U16At( offset + 14 ) };
+        const uint16_t marker = aCursor.U16At( offset + 34 );
+        const uint8_t status = marker & 0xFF;
+
+        if( ownerNet[record] >= netByHandle.size() || tombstone[ownerNet[record]]
+            || netByHandle[ownerNet[record]] == NO_NET )
+            throwDecodeError( source, wxS( "v9 connection targets missing/tombstoned net" ) );
+
+        if( marker >> 8 < 2 || marker >> 8 > 6
+            || ( status != 0 && status != 0xFC && status != 0xFD ) )
+            throwDecodeError( source, wxS( "v9 unknown connection object-class marker" ) );
+
+        // Nonuniform wire lengths are normal. Strict ordering plus the
+        // second pass enforces full and nonoverlapping vertex ownership.
+        if( record == 0 ? starts[record] != 0 : starts[record] <= starts[record - 1] )
+            throwDecodeError( source, wxS( "v9 connection vertex starts are not ordered" ) );
+    }
+
+    starts.back() = pools[21].count;
+
+    for( size_t record = 0; record < pools[20].count; ++record )
+    {
+        const size_t offset = connectionBase + record * CONNECTION_RECORD_BYTES;
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "connection" ), 21, record,
+                offset, CONNECTION_RECORD_BYTES, static_cast<int>( aSheetIndex ) );
+        const uint32_t start = starts[record];
+        const uint32_t end = starts[record + 1];
+
+        if( start >= end || end > pools[21].count || end - start < 2 )
+            throwDecodeError( source, wxS( "v9 connection vertex ownership is invalid" ) );
+
+        MODEL_CONNECTION connection;
+        connection.source = source;
+        connection.vertices.reserve( end - start );
+
+        for( size_t vertex = start; vertex < end; ++vertex )
+        {
+            const size_t vertexOffset = vertexBase + vertex * CONNECTION_VERTEX_BYTES;
+            SOURCE_PROVENANCE vertexSource = sourceAt(
+                    aSourceName, aModel.version, wxS( "connection vertex" ), 22,
+                    vertex, vertexOffset, CONNECTION_VERTEX_BYTES, static_cast<int>( aSheetIndex ) );
+
+            if( aCursor.U32At( vertexOffset ) != 0 )
+                throwDecodeError( vertexSource, wxS( "v9 connection vertex has nonzero padding" ) );
+
+            connection.vertices.push_back( {
+                    decodeCoordinate( aCursor.U16At( vertexOffset + 4 ) ),
+                    decodeCoordinate( aCursor.U16At( vertexOffset + 6 ) ), vertexSource } );
+            ++counts.vertices;
+        }
+
+        for( size_t endpoint = 0; endpoint < 2; ++endpoint )
+        {
+            const uint16_t raw = handles[record][endpoint];
+            const uint16_t objectClass = raw >> 12;
+            const uint16_t objectRecord = raw & 0x0FFF;
+            const SOURCE_POINT& wirePoint = endpoint == 0 ? connection.vertices.front()
+                                                            : connection.vertices.back();
+            SOURCE_PROVENANCE endpointSource = source;
+            endpointSource.objectClass = wxS( "connection endpoint" );
+            endpointSource.absoluteOffset += 12 + endpoint * 2;
+            endpointSource.length = 2;
+            MODEL_CONNECTION_ENDPOINT decoded;
+            decoded.source = endpointSource;
+            decoded.point = wirePoint;
+
+            if( objectClass == 0 )
+            {
+                auto placement = std::ranges::find_if( aModel.placements,
+                        [&]( const MODEL_PLACEMENT& aPlacement )
+                        {
+                            return aPlacement.source.sheet == static_cast<int>( aSheetIndex )
+                                   && aPlacement.source.recordIndex == objectRecord;
+                        } );
+
+                if( placement == aModel.placements.end() )
+                    throwDecodeError( endpointSource, wxS( "v9 connection placement endpoint unresolved" ) );
+
+                const PIN_REFERENCE* matchingPin = nullptr;
+
+                for( const PIN_REFERENCE& placedPin : placement->pins )
+                {
+                    const MODEL_PIN_DEFINITION* definitionPin = nullptr;
+
+                    for( const MODEL_SYMBOL_DEFINITION& definition : aModel.definitions )
+                    {
+                        auto found = std::ranges::find(
+                                definition.pins, placedPin.id, &MODEL_PIN_DEFINITION::id );
+
+                        if( found != definition.pins.end() )
+                        {
+                            definitionPin = &*found;
+                            break;
+                        }
+                    }
+
+                    if( !definitionPin )
+                        throwDecodeError( placedPin.source, wxS( "v9 placed pin has no definition" ) );
+
+                    const auto position = transformedPinPosition( *placement, *definitionPin );
+
+                    if( position.first != wirePoint.x || position.second != wirePoint.y )
+                        continue;
+
+                    if( matchingPin )
+                        throwDecodeError( endpointSource, wxS( "v9 connection is ambiguous between placement pins" ) );
+
+                    matchingPin = &placedPin;
+                }
+
+                if( !matchingPin )
+                    throwDecodeError( endpointSource, wxS( "v9 connection has no pin at wire endpoint" ) );
+
+                decoded.kind = MODEL_ENDPOINT_KIND::PIN;
+                decoded.placement = PLACEMENT_REFERENCE{ placement->id, endpointSource };
+                decoded.pin = PIN_REFERENCE{ matchingPin->id, endpointSource };
+                ++counts.pinEndpoints;
+            }
+            else if( objectClass == 2 || objectClass == 3 )
+            {
+                if( endpoint == 1 && handles[record][0] == raw )
+                    throwDecodeError( endpointSource, wxS( "v9 repeated typed endpoint in same wire" ) );
+
+                const bool isOffpage = objectClass == 2;
+                const size_t count = isOffpage ? pools[19].count : pools[18].count;
+                const size_t objectBase = isOffpage ? offpageBase : junctionBase;
+                const size_t objectStride = isOffpage ? OFFPAGE_RECORD_BYTES : JUNCTION_RECORD_BYTES;
+                const size_t objectX = isOffpage ? 22 : 4;
+                const size_t objectY = isOffpage ? 24 : 6;
+
+                if( objectRecord >= count )
+                    throwDecodeError( endpointSource, wxS( "v9 offpage/junction endpoint out of range" ) );
+
+                const size_t objectOffset = objectBase + objectRecord * objectStride;
+
+                if( decodeCoordinate( aCursor.U16At( objectOffset + objectX ) ) != wirePoint.x
+                    || decodeCoordinate( aCursor.U16At( objectOffset + objectY ) ) != wirePoint.y )
+                    throwDecodeError( endpointSource, wxS( "v9 typed endpoint position does not match wire vertex" ) );
+
+                if( isOffpage )
+                    offBacklinks[objectRecord].push_back( record );
+                else
+                    junctionBacklinks[objectRecord].push_back( record );
+
+                decoded.kind = MODEL_ENDPOINT_KIND::POINT;
+            }
+            else
+            {
+                throwDecodeError( endpointSource, wxS( "v9 unknown connection endpoint object class" ) );
+            }
+
+            decoded.properties.push_back( sourceProperty(
+                    wxS( "raw_endpoint_handle" ), wxString::Format( wxS( "%u" ), raw ), endpointSource ) );
+            const size_t relationshipOffset = offset + 16 + endpoint * 4;
+            SOURCE_PROVENANCE relationshipSource = endpointSource;
+            relationshipSource.absoluteOffset = relationshipOffset;
+            relationshipSource.length = 4;
+            SOURCE_PROPERTY relationshipProperty = sourceProperty(
+                    wxS( "raw_endpoint_relationship" ),
+                    wxString::Format( wxS( "%u" ), aCursor.U32At( relationshipOffset ) ), relationshipSource );
+            relationshipProperty.disposition = PROPERTY_DISPOSITION::PRESERVED;
+            decoded.properties.push_back( std::move( relationshipProperty ) );
+            connection.endpoints.push_back( std::move( decoded ) );
+        }
+
+        connection.properties.push_back( sourceProperty(
+                wxS( "raw_connection_marker" ),
+                wxString::Format( wxS( "%u" ), aCursor.U16At( offset + 34 ) ), source ) );
+        aModel.nets[netByHandle[ownerNet[record]]].connections.push_back( std::move( connection ) );
+        ++counts.wires;
+    }
+
+    if( pools[20].count == 0 && pools[21].count != 0 )
+        throwDecodeError( aModel.source, wxS( "v9 unowned connection vertices" ) );
+
+    // Typed endpoints must reference their owner connection, and every
+    // junction/off-page backlink must remain on the same global net.
+    for( size_t record = 0; record < pools[18].count; ++record )
+    {
+        const size_t offset = junctionBase + record * JUNCTION_RECORD_BYTES;
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "junction" ), 19, record,
+                offset, JUNCTION_RECORD_BYTES, static_cast<int>( aSheetIndex ) );
+        const uint16_t connectionHandle = aCursor.U16At( offset + 8 );
+        // PADS v0x0009 junction class is the low byte of the raw marker.
+        // Observed high bytes include 00, FF, 45, 54, 32 and 02. Their
+        // semantics are unknown, so preserve the original 16-bit word.
+        const uint16_t rawClassMarker = aCursor.U16At( offset + 10 );
+        const uint8_t  junctionClass = rawClassMarker & 0xFF;
+
+        if( rawClassMarker != 0 && junctionClass != 0xFC && junctionClass != 0xFD )
+            throwDecodeError( source, wxS( "v9 junction has unknown class marker" ) );
+
+        if( connectionHandle >= pools[20].count
+            || std::ranges::find( junctionBacklinks[record], connectionHandle ) == junctionBacklinks[record].end() )
+            throwDecodeError( source, wxS( "v9 junction backlink does not resolve to its wire" ) );
+
+        for( size_t backlink : junctionBacklinks[record] )
+        {
+            if( ownerNet[backlink] != ownerNet[connectionHandle] )
+                throwDecodeError( source, wxS( "v9 junction joins different nets" ) );
+        }
+
+        MODEL_JUNCTION junction;
+        junction.source = source;
+        junction.sheet = { aModel.sheets[aSheetIndex].id, source };
+        junction.position = {
+                decodeCoordinate( aCursor.U16At( offset + 4 ) ),
+                decodeCoordinate( aCursor.U16At( offset + 6 ) ), source };
+        SOURCE_PROVENANCE markerSource = source;
+        markerSource.absoluteOffset += 10;
+        markerSource.length = 2;
+        SOURCE_PROPERTY markerProperty = sourceProperty(
+                wxS( "raw_junction_class_marker" ),
+                wxString::Format( wxS( "%u" ), rawClassMarker ), markerSource );
+        markerProperty.disposition = PROPERTY_DISPOSITION::PRESERVED;
+        junction.properties.push_back( std::move( markerProperty ) );
+        aModel.junctions.push_back( std::move( junction ) );
+        ++counts.junctions;
+    }
+
+    // v9 OFFPAGE records use a decal+connection handle and the same
+    // angle/mirror fields as the later versions.
+    for( size_t record = 0; record < pools[19].count; ++record )
+    {
+        const size_t offset = offpageBase + record * OFFPAGE_RECORD_BYTES;
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "off-page reference" ), 20, record,
+                offset, OFFPAGE_RECORD_BYTES, static_cast<int>( aSheetIndex ) );
+        const uint16_t decalHandle = aCursor.U16At( offset + 4 );
+        const uint16_t connectionHandle = aCursor.U16At( offset + 8 );
+        const uint8_t variant = aCursor.U8At( offset + 30 );
+        const uint16_t mirror = aCursor.U16At( offset + 28 );
+
+        // Only the low two mirror bits have verified geometric meaning.
+        // Other bits exist in real v9 files and are preserved below.
+        const uint16_t knownMirrorFlags = mirror & uint16_t{ 3 };
+
+        if( decalHandle >= pools[6].count || connectionHandle >= pools[20].count )
+            throwDecodeError( source, wxS( "v9 off-page decal/connection handle invalid" ) );
+
+        if( std::ranges::find( offBacklinks[record], connectionHandle ) == offBacklinks[record].end() )
+            throwDecodeError( source, wxS( "v9 off-page backlink does not point to its connection" ) );
+
+        for( size_t backlink : offBacklinks[record] )
+        {
+            if( ownerNet[backlink] != ownerNet[connectionHandle] )
+                throwDecodeError( source, wxS( "v9 off-page joins different nets" ) );
+        }
+
+        const size_t decalOffset = aControllers.offsets[6] + decalHandle * 92;
+        SOURCE_PROVENANCE decalSource = sourceAt(
+                aSourceName, aModel.version, wxS( "used decal" ), 7, decalHandle,
+                decalOffset, 92, static_cast<int>( aSheetIndex ) );
+        const uint16_t definitionRecord = aCursor.U16At( decalOffset + 48 );
+
+        if( definitionRecord >= pools[2].count )
+            throwDecodeError( decalSource, wxS( "v9 off-page decal definition handle invalid" ) );
+
+        const DEFINITION_ID definitionId(
+                static_cast<uint32_t>( aSheetIndex * 0x100000 + 1 + definitionRecord ) );
+        auto definition = std::ranges::find(
+                aModel.definitions, definitionId, &MODEL_SYMBOL_DEFINITION::id );
+
+        if( definition == aModel.definitions.end() )
+            throwDecodeError( decalSource, wxS( "v9 off-page decal definition was not decoded" ) );
+
+        MODEL_LABEL label;
+        label.source = source;
+        label.sheet = { aModel.sheets[aSheetIndex].id, source };
+        label.text = aModel.nets[netByHandle[ownerNet[connectionHandle]]].name;
+        label.position = {
+                decodeCoordinate( aCursor.U16At( offset + 22 ) ),
+                decodeCoordinate( aCursor.U16At( offset + 24 ) ), source };
+        label.decalName = decodeFixedString( aBytes, decalOffset, 40, decalSource, aModel.diagnostics );
+        label.symbolVariant = variant;
+        label.offpageBodyHeight = binaryOffPageBodyHeight( *definition );
+        for( const MODEL_FIELD& field : definition->fields )
+        {
+            if( field.name.text.CmpNoCase( wxS( "REF-DES" ) ) != 0 )
+                continue;
+
+            label.hasDefaultPresentation = true;
+            label.defaultTextOffset = field.position;
+            label.defaultAngle = field.angle;
+            label.defaultPresentation = field.presentation;
+            break;
+        }
+        label.presentation.source = source;
+        label.presentation.visible = false;
+
+        int authoredAngle = NormalizeAngle( aCursor.U16At( offset + 26 ) );
+
+        if( knownMirrorFlags & 1 )
+            authoredAngle = NormalizeAngle( 1800 - authoredAngle );
+
+        if( knownMirrorFlags & 2 )
+            authoredAngle = NormalizeAngle( -authoredAngle );
+
+        // OFFPAGE transforms its symbol. NETNAMES independently rotates its text.
+        label.symbolAngle = authoredAngle;
+        SOURCE_PROVENANCE mirrorSource = source;
+        mirrorSource.absoluteOffset += 28;
+        mirrorSource.length = 2;
+        SOURCE_PROPERTY mirrorProperty = sourceProperty(
+                wxS( "offpage_mirror_flags" ), wxString::Format( wxS( "%u" ), mirror ), mirrorSource );
+
+        if( mirror != knownMirrorFlags )
+        {
+            mirrorProperty.disposition = PROPERTY_DISPOSITION::UNSUPPORTED;
+            aModel.diagnostics.push_back( MakePropertyDiagnostic(
+                    RPT_SEVERITY_WARNING, mirrorProperty,
+                    wxS( "unsupported PADS v9 off-page mirror flag bits preserved" ) ) );
+        }
+
+        label.properties.push_back( std::move( mirrorProperty ) );
+        label.properties.push_back( sourceProperty(
+                wxS( "v9_authored_offpage_angle" ),
+                wxString::Format( wxS( "%u" ), aCursor.U16At( offset + 26 ) ), source ) );
+
+        bool recognizedKind = false;
+
+        for( const MODEL_PART_TYPE& part : aModel.partTypes )
+        {
+            if( part.source.sheet != static_cast<int>( aSheetIndex ) )
+                continue;
+
+            const bool hasDefinition = std::ranges::any_of( part.gates,
+                    [&]( const MODEL_GATE& gate )
+                    {
+                        return gate.definition.id == definitionId
+                            || std::ranges::any_of( gate.alternateDefinitions,
+                                   [&]( const DEFINITION_REFERENCE& ref )
+                                   {
+                                       return ref.id == definitionId;
+                                   } );
+                    } );
+
+            if( !hasDefinition )
+                continue;
+
+            if( part.name.text == wxS( "$GND_SYMS" ) )
+                label.kind = MODEL_LABEL_KIND::GROUND;
+            else if( part.name.text == wxS( "$PWR_SYMS" ) )
+                label.kind = MODEL_LABEL_KIND::POWER;
+            else if( part.name.text == wxS( "$OSR_SYMS" ) )
+                label.kind = MODEL_LABEL_KIND::GLOBAL;
+            else
+                throwDecodeError( decalSource, wxS( "v9 off-page decal belongs to unexpected PARTTYPE" ) );
+
+            recognizedKind = true;
+            break;
+        }
+
+        if( !recognizedKind )
+            throwDecodeError( decalSource, wxS( "v9 off-page decal has no owning special PARTTYPE" ) );
+
+        // PADS v9 power/ground CAEDECALs are drawn upright in their native
+        // coordinate frame. Their OFFPAGE mirror bits act in the *rotated*
+        // drawing frame: bit 0 reflects X (horizontal), bit 1 reflects Y.
+        // The REFIN/REFOUT convention has a different native direction and
+        // retains the separately verified OSR transform from Stage 8.
+        // Example: O20 (+12V, 90 deg, mirror 1) must point right (270 KiCad),
+        // while O4 (+12V, 90 deg, mirror 3) is already correctly at 270.
+        if( label.kind == MODEL_LABEL_KIND::POWER || label.kind == MODEL_LABEL_KIND::GROUND )
+        {
+            int powerAngle = NormalizeAngle( aCursor.U16At( offset + 26 ) );
+
+            if( mirror & 1 )
+                powerAngle = NormalizeAngle( -powerAngle );
+
+            if( mirror & 2 )
+                powerAngle = NormalizeAngle( 1800 - powerAngle );
+
+            label.symbolAngle = powerAngle;
+        }
+
+        label.properties.push_back( sourceProperty(
+                wxS( "offpage_variant" ), wxString::Format( wxS( "%u" ), variant ), source ) );
+        aModel.labels.push_back( std::move( label ) );
+        ++counts.offpages;
+    }
+
+    // In v9 NETNAMES has NO 8-byte v13 prefix: its net record is at +8,
+    // text offset at +12/+14, angle +16, justification +18 and the owning
+    // off-page typed handle at +30. Missing presentations remain invisible.
+    std::vector<bool> seenName( pools[19].count, false );
+
+    for( size_t record = 0; record < pools[22].count; ++record )
+    {
+        const size_t offset = nameBase + record * 40;
+        SOURCE_PROVENANCE source = sourceAt(
+                aSourceName, aModel.version, wxS( "net-name presentation" ), 23,
+                record, offset, 40, static_cast<int>( aSheetIndex ) );
+        const uint32_t globalHandle = aCursor.U32At( offset + 8 );
+        const uint16_t owner = aCursor.U16At( offset + 30 );
+        // PADS_V9_NETNAMES_PLACEMENT_OWNER_V15
+        // The v9 owner/child handles are at +30/+32 (v13 uses +38/+40).
+        // The owner may be an off-page (class 2) or a placed symbol (class 0).
+        const uint16_t childOrdinal = aCursor.U16At( offset + 32 );
+
+        if( globalHandle >= netByHandle.size() || tombstone[globalHandle]
+            || netByHandle[globalHandle] == NO_NET )
+            throwDecodeError( source, wxS( "v9 NETNAMES targets invalid/unresolved net" ) );
+
+        if( ( owner & 0xF000 ) == 0 )
+        {
+            // A NETNAME attached to a component pin is free text at the
+            // electrical endpoint, not an off-page label. Resolve by BOTH
+            // placement identity and pin identity on the owning net.
+            auto placement = std::ranges::find_if( aModel.placements,
+                    [&]( const MODEL_PLACEMENT& aPlacement )
+                    {
+                        return aPlacement.source.sheet == static_cast<int>( aSheetIndex )
+                               && aPlacement.source.recordIndex == owner;
+                    } );
+
+            if( placement == aModel.placements.end() )
+                throwDecodeError( source, wxS( "v9 NETNAMES placement owner is unresolved" ) );
+
+            if( childOrdinal >= placement->pins.size() )
+                throwDecodeError( source, wxS( "v9 NETNAMES placement pin ordinal out of range" ) );
+
+            const PIN_ID pinId = placement->pins[childOrdinal].id;
+            const MODEL_NET& net = aModel.nets[netByHandle[globalHandle]];
+            const MODEL_CONNECTION_ENDPOINT* matchingEndpoint = nullptr;
+
+            for( const MODEL_CONNECTION& connection : net.connections )
+            {
+                for( const MODEL_CONNECTION_ENDPOINT& endpoint : connection.endpoints )
+                {
+                    if( endpoint.kind != MODEL_ENDPOINT_KIND::PIN || !endpoint.placement
+                        || !endpoint.pin || endpoint.placement->id != placement->id
+                        || endpoint.pin->id != pinId )
+                        continue;
+
+                    if( matchingEndpoint )
+                        throwDecodeError( source, wxS( "v9 NETNAMES placement pin is ambiguous on net" ) );
+
+                    matchingEndpoint = &endpoint;
+                }
+            }
+
+            if( !matchingEndpoint )
+                throwDecodeError( source, wxS( "v9 NETNAMES placement pin is not on owning net" ) );
+
+            const int64_t dx = decodeLocalCoordinate( aCursor.U16At( offset + 12 ) );
+            const int64_t dy = decodeLocalCoordinate( aCursor.U16At( offset + 14 ) );
+            MODEL_TEXT text;
+            text.source = source;
+            text.sheet = { aModel.sheets[aSheetIndex].id, source };
+            text.text = net.name;
+            text.position = { matchingEndpoint->point.x + dx,
+                              matchingEndpoint->point.y + dy, source };
+            text.angle = NormalizeAngle( aCursor.U16At( offset + 16 ) );
+            text.presentation.source = source;
+            text.presentation.visible = true;
+            // Match current v9 NETNAMES assumptions. Actual per-file defaults
+            // are not yet decoded; adjust all v9 NETNAMES together later.
+            text.presentation.height = 200;
+            text.presentation.width = 20;
+            const uint16_t justification = aCursor.U16At( offset + 18 );
+            text.presentation.horizontalJustification = horizontalJustification( justification );
+            text.presentation.verticalJustification = verticalJustification( justification );
+            text.properties.push_back( sourceProperty(
+                    wxS( "v9_netname_placement_owner" ),
+                    wxString::Format( wxS( "%u,%u" ), owner, childOrdinal ), source ) );
+            text.properties.push_back( sourceProperty(
+                    wxS( "v9_netname_text_offset" ),
+                    wxString::Format( wxS( "%lld,%lld" ), dx, dy ), source ) );
+            SOURCE_PROPERTY assumedMetrics = sourceProperty(
+                    wxS( "v9_netname_metrics_from_ascii_defaults" ), wxS( "100,10 mil" ), source );
+            assumedMetrics.disposition = PROPERTY_DISPOSITION::APPROXIMATE;
+            text.properties.push_back( std::move( assumedMetrics ) );
+            aModel.texts.push_back( std::move( text ) );
+            ++counts.netNames;
+            continue;
+        }
+
+        const size_t offpageRecord = owner & 0x0FFF;
+
+        if( ( owner & 0xF000 ) != 0x2000 || offpageRecord >= pools[19].count
+            || seenName[offpageRecord] )
+            throwDecodeError( source, wxS( "v9 NETNAMES has invalid/duplicate off-page owner" ) );
+
+        const uint16_t connectionHandle = aCursor.U16At( offpageBase + offpageRecord * 32 + 8 );
+
+        if( ownerNet[connectionHandle] != globalHandle )
+            throwDecodeError( source, wxS( "v9 NETNAMES does not belong to off-page connection net" ) );
+
+        auto label = std::ranges::find_if( aModel.labels,
+                [&]( const MODEL_LABEL& aLabel )
+                {
+                    return aLabel.source.sheet == static_cast<int>( aSheetIndex )
+                           && aLabel.source.controller == 20
+                           && aLabel.source.recordIndex == offpageRecord;
+                } );
+
+        if( label == aModel.labels.end() )
+            throwDecodeError( source, wxS( "v9 NETNAMES owner label is absent" ) );
+
+        seenName[offpageRecord] = true;
+        label->textOffset = {
+                decodeLocalCoordinate( aCursor.U16At( offset + 12 ) ),
+                decodeLocalCoordinate( aCursor.U16At( offset + 14 ) ), source };
+        label->hasNetNamePresentation = true;
+        label->angle = NormalizeAngle( aCursor.U16At( offset + 16 ) );
+        label->presentation.source = source;
+        label->presentation.visible = true;
+        // The legacy v0x0009 NETNAMES record omits its default text metrics.
+        // Preserve the authored 100/10-mil NETNAMESIZE from the matching ASCII
+        // export (in half-mils here). The builder performs Stroke font scaling
+        // once for POWER/GROUND VALUE fields and other schematic text.
+        // Do not pre-shrink POWER/GROUND to 60 mil: it would be scaled twice.
+        label->presentation.height = 200;
+        label->presentation.width = 20;
+        const uint16_t justification = aCursor.U16At( offset + 18 );
+        label->presentation.horizontalJustification = horizontalJustification( justification );
+        label->presentation.verticalJustification = verticalJustification( justification );
+        label->properties.push_back( sourceProperty(
+                wxS( "v9_netname_text_angle" ),
+                wxString::Format( wxS( "%u" ), aCursor.U16At( offset + 16 ) ), source ) );
+        SOURCE_PROPERTY assumedMetrics = sourceProperty(
+                wxS( "v9_netname_metrics_from_ascii_defaults" ), wxS( "100,10 mil" ), source );
+        assumedMetrics.disposition = PROPERTY_DISPOSITION::APPROXIMATE;
+        label->properties.push_back( std::move( assumedMetrics ) );
+        ++counts.netNames;
+    }
+
+    return counts;
+}
+
+// v0x0009 legacy record completion. The old sheet text controller consists
+// of 28-byte records (not v13's 32 bytes). The 92-byte USED_DECAL header
+// contains REF-DES / PART-TYPE local presentation, pin-size defaults and
+// an independent definition pointer. Never reinterpret it as a 108-byte v13
+// decal: its fields are not aligned with those of the newer format.
+struct LEGACY_V9_FINAL_COUNTS
+{
+    size_t signalPins = 0;
+    size_t standardFields = 0;
+    size_t embeddedTexts = 0;
+    size_t pageTexts = 0;
+    size_t worksheets = 0;
+    size_t placeholders = 0;
+    size_t preservedTexts = 0;
+    size_t resolvedPinBodies = 0;
+};
+
+static LEGACY_V9_FINAL_COUNTS decodeLegacyV9FinalDetails(
+        const std::vector<uint8_t>& aBytes, const PADS_IO::BINARY_CURSOR& aCursor,
+        const SHEET_CONTROLLERS& aControllers, size_t aSheetIndex,
+        const wxString& aSourceName, PADS_SCH_MODEL& aModel )
+{
+    LEGACY_V9_FINAL_COUNTS counts;
+    const auto& pools = aControllers.pools;
+    requireFixedController( aControllers, 1, 28, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 7, 92, aSourceName, aModel.version, aSheetIndex );
+    requireFixedController( aControllers, 12, 52, aSourceName, aModel.version, aSheetIndex );
+    const size_t textBase = aControllers.offsets[0];
+    const size_t heapBase = aControllers.offsets[1];
+    const uint32_t heapSize = pools[1].usedBytes;
+    const size_t decalBase = aControllers.offsets[6];
+    const size_t defBase = aControllers.offsets[2];
+    const size_t partBase = aControllers.offsets[8];
+    const size_t signalBase = aControllers.offsets[11];
+
+    // SIGPIN in v9: u16 physical pin number, one-byte legacy '2' marker,
+    // then a 49-byte NUL-terminated default net name. The 10 records in the fixture belong to $GND_SYMS and
+    // $PWR_SYMS; don't fabricate instance overrides from these defaults.
+    std::vector<bool> claimedSignals( pools[11].count, false );
+
+    for( MODEL_PART_TYPE& part : aModel.partTypes )
+    {
+        if( part.source.sheet != static_cast<int>( aSheetIndex ) )
+            continue;
+
+        const size_t partOffset = partBase + part.source.recordIndex * PART_TYPE_BYTES;
+        const uint32_t first = aCursor.U32At( partOffset + 52 );
+        const uint16_t count = aCursor.U16At( partOffset + 66 );
+
+        if( first > pools[11].count || count > pools[11].count - first )
+            throwDecodeError( part.source, wxS( "v9 SIGPIN slice leaves controller 12" ) );
+
+        for( size_t index = 0; index < count; ++index )
+        {
+            const size_t record = first + index;
+            const size_t offset = signalBase + record * 52;
+            SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version,
+                    wxS( "signal pin" ), 12, record, offset, 52, static_cast<int>( aSheetIndex ) );
+
+            if( claimedSignals[record] )
+                throwDecodeError( source, wxS( "v9 SIGPIN record claimed twice" ) );
+
+            claimedSignals[record] = true;
+            MODEL_SIGNAL_PIN pin;
+            pin.source = source;
+            pin.number.source = source;
+            pin.number.text = wxString::Format( wxS( "%u" ), aCursor.U16At( offset ) );
+            SOURCE_PROVENANCE nameSource = source;
+            if( aCursor.U8At( offset + 2 ) != '2' )
+                throwDecodeError( source, wxS( "v9 SIGPIN has unrecognized name-prefix marker" ) );
+
+            nameSource.absoluteOffset += 3;
+            nameSource.length = 49;
+            pin.name = decodeFixedString( aBytes, offset + 3, 49, nameSource, aModel.diagnostics );
+
+            if( pin.number.text.IsEmpty() || pin.name.text.IsEmpty() )
+                throwDecodeError( source, wxS( "v9 SIGPIN has empty physical pin or net name" ) );
+
+            part.signalPins.push_back( std::move( pin ) );
+            ++counts.signalPins;
+        }
+    }
+
+    if( std::ranges::any_of( claimedSignals, []( bool claimed ) { return !claimed; } ) )
+        throwDecodeError( aModel.source, wxS( "v9 unowned SIGPIN record" ) );
+
+    // Each non-tombstoned used decal owns two standard text fields and its
+    // terminal text metrics. +54/+62 store the field X/Y; the four u16s at
+    // +70..+76 store text heights, while packed bytes at +78/+80 store widths.
+    std::vector<bool> visitedDefinition( pools[2].count, false );
+
+    for( size_t record = 0; record < pools[6].count; ++record )
+    {
+        const size_t usedOffset = decalBase + record * 92;
+        const uint16_t definitionRecord = aCursor.U16At( usedOffset + 48 );
+
+        if( definitionRecord == 0xFFFF )
+            continue;
+
+        if( definitionRecord >= pools[2].count )
+            throwDecodeError( aModel.source, wxS( "v9 standard-field definition index is invalid" ) );
+
+        auto definition = std::ranges::find_if( aModel.definitions,
+                [&]( const MODEL_SYMBOL_DEFINITION& d )
+                {
+                    return d.source.sheet == static_cast<int>( aSheetIndex )
+                           && d.source.recordIndex == definitionRecord;
+                } );
+
+        if( definition == aModel.definitions.end() )
+            continue;
+
+        if( visitedDefinition[definitionRecord] )
+        {
+            // A second decal may alias the same definition, but its standard
+            // text presentation must not produce duplicate default fields.
+            continue;
+        }
+
+        visitedDefinition[definitionRecord] = true;
+
+        for( size_t standard = 0; standard < 2; ++standard )
+        {
+            const size_t posOffset = usedOffset + 54 + standard * 8;
+            SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version,
+                    wxS( "standard definition field" ), 7, record,
+                    posOffset, 8, static_cast<int>( aSheetIndex ) );
+            MODEL_FIELD field;
+            field.source = source;
+            field.name.source = source;
+            field.name.text = standard == 0 ? wxS( "REF-DES" ) : wxS( "PART-TYPE" );
+            field.position = { decodeLocalCoordinate( aCursor.U16At( posOffset ) ),
+                               decodeLocalCoordinate( aCursor.U16At( posOffset + 2 ) ), source };
+            field.angle = NormalizeAngle( aCursor.U16At( posOffset + 4 ) );
+            const uint16_t justification = aCursor.U16At( posOffset + 6 );
+            field.presentation.source = source;
+            field.presentation.horizontalJustification = horizontalJustification( justification );
+            field.presentation.verticalJustification = verticalJustification( justification );
+            field.presentation.height = int64_t( aCursor.U16At( usedOffset + 70 + standard * 2 ) ) * 2;
+            field.presentation.width = int64_t( aCursor.U8At( usedOffset + 78 + standard ) ) * 2;
+            field.presentation.font = decodedDefinitionFont( -1, source );
+            field.presentation.visible = true;
+            field.visible = true;
+            definition->fields.push_back( std::move( field ) );
+            ++counts.standardFields;
+        }
+
+        for( MODEL_PIN_DEFINITION& pin : definition->pins )
+        {
+            const size_t terminalOffset = pin.source.absoluteOffset;
+            pin.numberPresentation.height = int64_t( aCursor.U16At( usedOffset + 74 ) ) * 2;
+            pin.namePresentation.height = int64_t( aCursor.U16At( usedOffset + 76 ) ) * 2;
+            pin.numberPresentation.width = int64_t( aCursor.U8At( usedOffset + 80 ) ) * 2;
+            pin.namePresentation.width = int64_t( aCursor.U8At( usedOffset + 81 ) ) * 2;
+            // In legacy v9 the terminal presentation bit 0x2000 is the
+            // PART/CAEDECAL default for displaying the pin number.
+            pin.numberPresentation.visible = pin.numberPresentation.height != 0
+                    && ( pin.presentationFlags & 0x2000 ) != 0;
+            pin.namePresentation.visible = pin.namePresentation.height != 0
+                    && ( pin.visibilityAndNumberPresentationFlags & 0x8000 ) == 0;
+            pin.numberJustification = terminalJustification(
+                    ( pin.presentationFlags >> 12 ) & 0xF, pin.numberAngle != 0 );
+            pin.nameJustification = terminalJustification(
+                    ( pin.visibilityAndNumberPresentationFlags >> 4 ) & 0xF,
+                    pin.nameAngle != 0 );
+            pin.numberPresentation.font = decodedDefinitionFont( -1, pin.source );
+            pin.namePresentation.font = decodedDefinitionFont( -1, pin.source );
+            const uint16_t handle = aCursor.U16At( terminalOffset );
+
+            if( handle == 0xFFFF )
+                continue;
+
+            if( handle >= pools[6].count )
+                throwDecodeError( pin.source, wxS( "v9 pin decal handle outside controller 7" ) );
+
+            const size_t pinUsedOffset = decalBase + handle * 92;
+            const uint16_t pinDefinitionRecord = aCursor.U16At( pinUsedOffset + 48 );
+            auto pinDefinition = std::ranges::find_if( aModel.definitions,
+                    [&]( const MODEL_SYMBOL_DEFINITION& d )
+                    {
+                        return d.source.sheet == static_cast<int>( aSheetIndex )
+                               && d.source.recordIndex == pinDefinitionRecord;
+                    } );
+
+            if( pinDefinition == aModel.definitions.end() )
+                throwDecodeError( pin.source, wxS( "v9 pin decal does not resolve to a graphic definition" ) );
+
+            int64_t bestDistanceSquared = 0;
+            SOURCE_POINT bestVector;
+            int64_t bestStrokeWidth = 0;
+            MODEL_LINE_STYLE bestLineStyle = MODEL_LINE_STYLE::DEFAULT;
+
+            for( const MODEL_GRAPHIC& graphic : pinDefinition->graphics )
+            {
+                if( graphic.kind != MODEL_GRAPHIC_KIND::LINE
+                    && graphic.kind != MODEL_GRAPHIC_KIND::POLYLINE )
+                    continue;
+
+                const bool containsOrigin = std::ranges::any_of( graphic.points,
+                        []( const SOURCE_POINT& point )
+                        {
+                            return point.x == 0 && point.y == 0;
+                        } );
+
+                if( !containsOrigin )
+                    continue;
+
+                for( const SOURCE_POINT& point : graphic.points )
+                {
+                    const int64_t distance = point.x * point.x + point.y * point.y;
+
+                    if( distance > bestDistanceSquared )
+                    {
+                        bestDistanceSquared = distance;
+                        bestVector = point;
+                        bestStrokeWidth = graphic.strokeWidth;
+                        bestLineStyle = graphic.lineStyle;
+                    }
+                }
+            }
+
+            if( bestDistanceSquared == 0 )
+                throwDecodeError( pin.source, wxS( "v9 pin decal has no drawable root vector" ) );
+
+            pin.pinDecalVector = bestVector;
+            pin.pinDecalStrokeWidth = bestStrokeWidth;
+            pin.pinDecalLineStyle = bestLineStyle;
+            pin.length = int64_t( std::llround( std::sqrt( double( bestDistanceSquared ) ) ) );
+            pin.pinDecalGeometryResolved = true;
+            const wxString name = pinDefinition->name.text;
+            const bool inverted = name == wxS( "PINB" ) || name == wxS( "PINORB" )
+                    || name == wxS( "PCLKB" ) || name == wxS( "PINIEB" );
+            const bool clock = name == wxS( "PCLK" ) || name == wxS( "PCLKB" );
+            pin.graphicStyle = ( inverted ? 1U : 0U ) | ( clock ? 2U : 0U );
+            ++counts.resolvedPinBodies;
+        }
+    }
+
+    // Claim page text through its owner-linked predecessor chain, not by
+    // treating every controller-1 record as a standalone free text. Reserve
+    // the free-text records already materialized by Stage 3.
+    std::vector<bool> usedText( pools[0].count, false );
+
+    for( size_t record = 0; record < pools[0].count; ++record )
+    {
+        const size_t offset = textBase + record * 28;
+
+        if( aCursor.U16At( offset + 20 ) == aCursor.U16At( offset + 22 ) )
+            usedText[record] = true;
+    }
+
+    auto makeTextGraphic = [&]( size_t record, const wxString& className )
+    {
+        const size_t offset = textBase + record * 28;
+        SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version,
+                className, 1, record, offset, 28, static_cast<int>( aSheetIndex ) );
+        const uint32_t stringOffset = aCursor.U32At( offset + 4 );
+        const uint16_t stringBytes = aCursor.U16At( offset + 16 );
+
+        if( stringOffset > heapSize || stringBytes == 0
+            || stringBytes > heapSize - stringOffset
+            || aBytes[heapBase + stringOffset + stringBytes - 1] != 0 )
+            throwDecodeError( source, wxS( "v9 owned text leaves controller 2 string heap" ) );
+
+        SOURCE_PROVENANCE stringSource = sourceAt(
+                aSourceName, aModel.version, className + wxS( " string" ), 2,
+                record, heapBase + stringOffset, stringBytes - 1, static_cast<int>( aSheetIndex ) );
+        MODEL_GRAPHIC graphic;
+        graphic.source = source;
+        graphic.kind = MODEL_GRAPHIC_KIND::TEXT;
+        graphic.text = PADS_SCH_BINARY_PARSER::DecodeString(
+                { aBytes.begin() + stringSource.absoluteOffset,
+                  aBytes.begin() + stringSource.absoluteOffset + stringSource.length },
+                DEFAULT_CODE_PAGE, stringSource, aModel.diagnostics );
+        graphic.points.push_back( { decodeLocalCoordinate( aCursor.U16At( offset + 8 ) ),
+                                    decodeLocalCoordinate( aCursor.U16At( offset + 10 ) ), source } );
+        graphic.angle = NormalizeAngle( aCursor.U16At( offset + 12 ) );
+        graphic.presentation.source = source;
+        graphic.presentation.height = int64_t( aCursor.U16At( offset + 18 ) ) * 2;
+        graphic.presentation.width = int64_t( aCursor.U16At( offset + 26 ) ) * 2;
+        graphic.presentation.font = decodedDefinitionFont( -1, source );
+        const uint16_t justification = rotatedFieldJustification(
+                aCursor.U16At( offset + 14 ), graphic.angle );
+        graphic.presentation.horizontalJustification = horizontalJustification( justification );
+        graphic.presentation.verticalJustification = verticalJustification( justification );
+        return graphic;
+    };
+
+    auto claimText = [&]( size_t record, const SOURCE_PROVENANCE& source )
+    {
+        if( record >= usedText.size() || usedText[record] )
+            throwDecodeError( source, wxS( "v9 text record has duplicate/missing owner" ) );
+
+        usedText[record] = true;
+    };
+
+    // Each class-zero page graphics group can own a circular predecessor
+    // chain. SIZEB is a genuine worksheet: 34 paths + 35 text labels.
+    for( size_t record = 0; record < pools[2].count; ++record )
+    {
+        const size_t offset = defBase + record * SYMBOL_RECORD_BYTES;
+
+        if( aCursor.U8At( offset + 0x29 ) != 0 )
+            continue;
+
+        const uint16_t count = aCursor.U16At( offset + 64 );
+        const uint16_t last = aCursor.U16At( offset + 66 );
+
+        if( count == 0 )
+            continue;
+
+        SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version,
+                wxS( "page graphic group" ), 3, record, offset, SYMBOL_RECORD_BYTES,
+                static_cast<int>( aSheetIndex ) );
+
+        if( count > pools[0].count || last >= pools[0].count )
+            throwDecodeError( source, wxS( "v9 page graphic text ownership is invalid" ) );
+
+        std::vector<size_t> records( count );
+        size_t current = last;
+
+        for( size_t i = count; i != 0; --i )
+        {
+            claimText( current, source );
+            records[i - 1] = current;
+
+            if( i != 1 )
+            {
+                current = aCursor.U16At( textBase + current * 28 + 20 );
+
+                if( current >= pools[0].count )
+                    throwDecodeError( source, wxS( "v9 page graphic predecessor out of range" ) );
+            }
+        }
+
+        SOURCE_PROVENANCE nameSource = source;
+        nameSource.length = 38;
+        const SOURCE_STRING name = decodeFixedString(
+                aBytes, offset, 38, nameSource, aModel.diagnostics );
+        const int64_t originX = decodeCoordinate( aCursor.U16At( offset + 60 ) );
+        const int64_t originY = decodeCoordinate( aCursor.U16At( offset + 62 ) );
+
+        for( size_t textRecord : records )
+        {
+            MODEL_GRAPHIC graphic = makeTextGraphic( textRecord, wxS( "page text" ) );
+            graphic.points[0].x += originX;
+            graphic.points[0].y += originY;
+            graphic.properties.push_back( sourceProperty(
+                    wxS( "page_graphic_group" ), name.text, source ) );
+            aModel.graphics.push_back( {
+                    graphic.source, { aModel.sheets[aSheetIndex].id, graphic.source },
+                    std::move( graphic ) } );
+            ++counts.pageTexts;
+        }
+
+        // The existing v13 worksheet classifier recognizes >=30 graphics,
+        // >=30 texts, and grid/title anchors. Here preserve the same intent
+        // without relying on v13's record offsets.
+        size_t drawings = 0;
+        size_t texts = 0;
+        size_t numericMarkers = 0;
+        size_t alphabeticMarkers = 0;
+        bool titleAnchor = false;
+        bool sheetAnchor = false;
+        bool revisionAnchor = false;
+        auto belongs = [&]( const MODEL_PAGE_GRAPHIC& item )
+        {
+            if( item.sheet.id != aModel.sheets[aSheetIndex].id )
+                return false;
+
+            return std::ranges::any_of( item.graphic.properties,
+                    [&]( const SOURCE_PROPERTY& prop )
+                    {
+                        return prop.name.text == wxS( "page_graphic_group" )
+                                && prop.value.text == name.text;
+                    } );
+        };
+
+        for( const MODEL_PAGE_GRAPHIC& item : aModel.graphics )
+        {
+            if( !belongs( item ) )
+                continue;
+
+            if( item.graphic.kind != MODEL_GRAPHIC_KIND::TEXT )
+            {
+                ++drawings;
+                continue;
+            }
+
+            ++texts;
+            const wxString s = item.graphic.text.text.Upper();
+
+            if( s.length() == 1 && s[0] >= '0' && s[0] <= '9' )
+                ++numericMarkers;
+
+            if( s.length() == 1 && s[0] >= 'A' && s[0] <= 'Z' )
+                ++alphabeticMarkers;
+
+            titleAnchor |= s == wxS( "TITLE" ) || s.StartsWith( wxS( "TITLE:" ) );
+            sheetAnchor |= s.StartsWith( wxS( "SHEET:" ) );
+            revisionAnchor |= s == wxS( "REVISION" ) || s.StartsWith( wxS( "REV:" ) )
+                    || s.StartsWith( wxS( "REVISION " ) );
+        }
+
+        if( drawings >= 30 && texts >= 30 && numericMarkers >= 4
+            && alphabeticMarkers >= 4 && titleAnchor && sheetAnchor && revisionAnchor )
+        {
+            MODEL_WORKSHEET worksheet;
+            worksheet.source = source;
+            worksheet.sheet = { aModel.sheets[aSheetIndex].id, source };
+            worksheet.name = name;
+
+            for( auto it = aModel.graphics.begin(); it != aModel.graphics.end(); )
+            {
+                if( belongs( *it ) )
+                {
+                    worksheet.graphics.push_back( std::move( it->graphic ) );
+                    it = aModel.graphics.erase( it );
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            aModel.worksheets.push_back( std::move( worksheet ) );
+            ++counts.worksheets;
+        }
+    }
+
+    // Embedded text belongs to the symbol definition, not to the sheet.
+    for( MODEL_SYMBOL_DEFINITION& definition : aModel.definitions )
+    {
+        if( definition.source.sheet != static_cast<int>( aSheetIndex ) )
+            continue;
+
+        const size_t offset = defBase + definition.source.recordIndex * SYMBOL_RECORD_BYTES;
+        const uint16_t count = aCursor.U16At( offset + 64 );
+        const uint16_t last = aCursor.U16At( offset + 66 );
+
+        if( count == 0 )
+            continue;
+
+        if( count > pools[0].count || last >= pools[0].count )
+            throwDecodeError( definition.source, wxS( "v9 embedded text ownership out of range" ) );
+
+        std::vector<size_t> records( count );
+        size_t current = last;
+
+        for( size_t i = count; i != 0; --i )
+        {
+            claimText( current, definition.source );
+            records[i - 1] = current;
+
+            if( i != 1 )
+            {
+                current = aCursor.U16At( textBase + current * 28 + 20 );
+
+                if( current >= pools[0].count )
+                    throwDecodeError( definition.source, wxS( "v9 embedded text predecessor out of range" ) );
+            }
+        }
+
+        for( size_t textRecord : records )
+        {
+            definition.graphics.push_back( makeTextGraphic(
+                    textRecord, wxS( "embedded symbol text" ) ) );
+            ++counts.embeddedTexts;
+        }
+    }
+
+    // The unclaimed 28-byte entries in this generation are graphical field
+    // placeholders ('*') and a historical 'VALUE' field-name payload. The
+    // latter is retained with source provenance rather than silently lost.
+    for( size_t record = 0; record < usedText.size(); ++record )
+    {
+        if( usedText[record] )
+            continue;
+
+        const size_t offset = textBase + record * 28;
+        const uint32_t stringOffset = aCursor.U32At( offset + 4 );
+        const uint16_t stringBytes = aCursor.U16At( offset + 16 );
+        SOURCE_PROVENANCE source = sourceAt( aSourceName, aModel.version,
+                wxS( "legacy definition field placeholder" ), 1, record,
+                offset, 28, static_cast<int>( aSheetIndex ) );
+
+        if( stringOffset > heapSize || stringBytes == 0 || stringBytes > heapSize - stringOffset
+            || aBytes[heapBase + stringOffset + stringBytes - 1] != 0 )
+            throwDecodeError( source, wxS( "v9 placeholder text out of bounds" ) );
+
+        const SOURCE_STRING value = PADS_SCH_BINARY_PARSER::DecodeString(
+                { aBytes.begin() + heapBase + stringOffset,
+                  aBytes.begin() + heapBase + stringOffset + stringBytes - 1 },
+                DEFAULT_CODE_PAGE, source, aModel.diagnostics );
+
+        if( value.text == wxS( "*" ) )
+        {
+            ++counts.placeholders;
+            continue;
+        }
+
+        SOURCE_PROPERTY preserved = sourceProperty(
+                wxString::Format( wxS( "v9_unresolved_definition_text_%zu" ), record ),
+                value.text, source );
+        preserved.disposition = PROPERTY_DISPOSITION::PRESERVED;
+        aModel.settings.properties.push_back( preserved );
+        aModel.diagnostics.push_back( MakePropertyDiagnostic(
+                RPT_SEVERITY_WARNING, preserved,
+                wxS( "unlinked v9 definition-text record retained for review" ) ) );
+        ++counts.preservedTexts;
+    }
+
+    return counts;
+}
+
+// A v9 "CONN <visual choices> <physical pins>" PARTTYPE stores graphical
+// choices as gates, not a real physical unit table. KiCad needs exactly one
+// gate for every physical pin and a physical pin number on each unit. Derive
+// the authored unit/variant mapping from the placed connectors, preserving
+// their actual decal, and keep the old choices as provenance only.
+static size_t materializeLegacyV9GateUnits( const std::vector<uint8_t>& aBytes,
+                                              PADS_SCH_MODEL& aModel, size_t aSheetIndex )
+{
+    size_t created = 0;
+    uint32_t gateId = static_cast<uint32_t>( aSheetIndex * 0x100000 + 0x50000 );
+
+    // PADS_V9_PHYSICAL_CONNECTOR_VARIANTS_V16: Stage selected per-connector
+    // part types; append only after iteration to avoid invalidating part refs.
+    std::vector<MODEL_PART_TYPE> variantParts;
+    uint32_t variantPartId = static_cast<uint32_t>( aSheetIndex * 0x100000 + 0x60000 );
+
+    for( MODEL_PART_TYPE& part : aModel.partTypes )
+    {
+        if( part.source.sheet != static_cast<int>( aSheetIndex ) || part.gates.size() < 2 )
+            continue;
+
+        // The v9 PARTTYPE's final four characters hold its type ("CON", etc).
+        // Multi-pin ordinary symbols and the special ground/power packages
+        // are not connector unit tables and must not be rewritten here.
+        const size_t partTypeOffset = part.source.absoluteOffset;
+
+        if( aBytes[partTypeOffset + 70] != 'C' || aBytes[partTypeOffset + 71] != 'O'
+            || aBytes[partTypeOffset + 72] != 'N' )
+            continue;
+
+        if( !std::ranges::all_of( part.gates,
+                []( const MODEL_GATE& gate ) { return gate.pins.size() == 1; } ) )
+            continue;
+
+        std::map<uint32_t, const MODEL_PLACEMENT*> exemplar;
+        std::map<wxString, std::map<uint32_t, MODEL_PLACEMENT*>> connectorGroups;
+        size_t placementsOfPart = 0;
+
+        for( MODEL_PLACEMENT& placement : aModel.placements )
+        {
+            if( placement.source.sheet != static_cast<int>( aSheetIndex )
+                || placement.partType.id != part.id )
+                continue;
+
+            if( placement.pins.size() != 1 || !placement.gate || placement.unit == 0 )
+                throwDecodeError( placement.source,
+                                  wxS( "v9 connector placement does not have one physical pin" ) );
+
+            // IMPORTANT PADS v0x0009 SEMANTICS, not a malformed design:
+            // CONN PARTTYPE describes allowed graphical choices. Every
+            // *physical connector instance* selects its own decal, and
+            // J8-1=EXTIN versus J13-1=EXTOUT is a legitimate choice for
+            // the same CON\SIP\3P unit/pin number 1.
+            //
+            // PADS also uses alphabetic unit suffixes (J7-A/B) in addition
+            // to numeric suffixes (J13-1/2/3). Preserve both, validating
+            // against the explicit physical unit ordinal from the placement.
+            const wxString reference = placement.reference.text;
+            const int separator = reference.Find( '-', true );
+
+            if( separator <= 0 || static_cast<size_t>( separator + 1 ) >= reference.length() )
+                throwDecodeError( placement.source,
+                                  wxS( "v9 connector lacks physical unit reference suffix" ) );
+
+            const wxString suffix = reference.Mid( separator + 1 );
+            unsigned long numericUnit = 0;
+            const bool numericMatch = suffix.ToULong( &numericUnit )
+                                      && numericUnit == placement.unit;
+            const bool alphaMatch = placement.unit <= 26
+                                    && suffix == wxString::Format(
+                                               wxS( "%c" ),
+                                               static_cast<int>( 'A' + placement.unit - 1 ) );
+
+            if( !numericMatch && !alphaMatch )
+                throwDecodeError( placement.source,
+                                  wxS( "v9 connector reference/unit suffix mismatch" ) );
+
+            const wxString connectorRef = reference.Left( separator );
+
+            if( connectorRef.IsEmpty()
+                || !connectorGroups[connectorRef].emplace( placement.unit, &placement ).second )
+                throwDecodeError( placement.source,
+                                  wxS( "v9 connector has duplicate or invalid physical unit" ) );
+
+            exemplar.try_emplace( placement.unit, &placement );
+            ++placementsOfPart;
+        }
+
+        if( exemplar.empty() )
+            continue;
+
+        const uint32_t lastUnit = exemplar.rbegin()->first;
+
+        // The full connector is present in this fixture. A partial connector
+        // cannot tell us the missing physical pin numbers: reject rather than
+        // assign a graphical-choice ordinal as a physical pin number.
+        if( lastUnit != exemplar.size() )
+            throwDecodeError( part.source, wxS( "v9 connector has missing physical units" ) );
+
+        if( gateId > aSheetIndex * 0x100000 + 0xFFFFF - lastUnit )
+            throwDecodeError( part.source, wxS( "v9 connector gate identity range exhausted" ) );
+
+        std::vector<MODEL_GATE> physicalGates;
+        physicalGates.reserve( exemplar.size() );
+
+        for( const auto& [unit, placed] : exemplar )
+        {
+            const auto sourceGate = std::ranges::find( part.gates, placed->gate->id,
+                                                       &MODEL_GATE::id );
+
+            if( sourceGate == part.gates.end() )
+                throwDecodeError( placed->source, wxS( "v9 selected connector decal is unresolved" ) );
+
+            const auto definition = std::ranges::find(
+                    aModel.definitions, placed->definition.id, &MODEL_SYMBOL_DEFINITION::id );
+
+            if( definition == aModel.definitions.end() || definition->pins.size() != 1
+                || placed->pins[0].id != definition->pins[0].id )
+                throwDecodeError( placed->source, wxS( "v9 connector physical pin cannot resolve definition" ) );
+
+            MODEL_GATE physical = *sourceGate;
+            physical.id = GATE_ID( gateId++ );
+            physical.source = placed->source;
+            physical.unit = unit;
+            physical.definition = { definition->id, placed->source };
+            physical.alternateDefinitions.clear();
+            physical.decalGroupMembers.clear();
+            physical.connectorPins.clear();
+            physical.pins.clear();
+            physical.logicalPins.clear();
+            physical.pins.push_back( { placed->pins[0].id, placed->pins[0].source } );
+
+            MODEL_GATE_PIN logical;
+            logical.source = placed->pins[0].source;
+            logical.definitionPin = { placed->pins[0].id, placed->pins[0].source };
+            logical.number.source = logical.source;
+            logical.number.text = wxString::Format( wxS( "%u" ), unit );
+            logical.name = definition->pins[0].name;
+            logical.electricalType = definition->pins[0].electricalType;
+            physical.logicalPins.push_back( std::move( logical ) );
+            physical.properties.push_back( sourceProperty(
+                    wxS( "v9_original_graphical_gate" ),
+                    wxString::Format( wxS( "%u" ), sourceGate->id.Value() ), placed->source ) );
+            physicalGates.push_back( std::move( physical ) );
+        }
+
+        // The canonical physical gates match the first observed decal for
+        // each pin number. Different physical connectors may choose another
+        // allowed graphical decal for the same unit. One KiCad library symbol
+        // must contain the *whole* connector's selected body configuration:
+        // mixing canonical and selected units would split J13-1/-2/-3 into
+        // incompatible imported LIB_IDs.
+        std::vector<uint32_t> canonical;
+        canonical.reserve( physicalGates.size() );
+
+        for( const MODEL_GATE& unitGate : physicalGates )
+            canonical.push_back( unitGate.definition.id.Value() );
+
+        // Reuse one synthetic PARTTYPE for connectors with the same complete
+        // unit-to-definition mapping. Verify distinct emitted KiCad LIB_IDs
+        // after import: choosing an alternate decal must remain visible.
+        std::map<std::vector<uint32_t>, size_t> variantBySignature;
+
+        for( auto& [connectorRef, units] : connectorGroups )
+        {
+            std::vector<uint32_t> signature = canonical;
+
+            for( const auto& [unit, placed] : units )
+            {
+                if( unit == 0 || unit > signature.size() )
+                    throwDecodeError( placed->source,
+                                      wxS( "v9 connector unit leaves physical gate table" ) );
+
+                signature[unit - 1] = placed->definition.id.Value();
+            }
+
+            PART_TYPE_ID selectedPartId = part.id;
+            const std::vector<MODEL_GATE>* selectedGates = &physicalGates;
+
+            if( signature != canonical )
+            {
+                auto existing = variantBySignature.find( signature );
+
+                if( existing == variantBySignature.end() )
+                {
+                    if( variantPartId >= aSheetIndex * 0x100000 + 0x70000
+                        || gateId > aSheetIndex * 0x100000 + 0x60000 - physicalGates.size() )
+                        throwDecodeError( part.source,
+                                          wxS( "v9 connector variant identity range exhausted" ) );
+
+                    MODEL_PART_TYPE variant = part;
+                    variant.id = PART_TYPE_ID( variantPartId++ );
+                    variant.gates = physicalGates;
+                    // Trace the instance-selected graphics, not an invented
+                    // logical PARTTYPE or a changed physical pin number.
+                    variant.properties.push_back( sourceProperty(
+                            wxS( "v9_instance_selected_graphical_variant" ),
+                            connectorRef, part.source ) );
+
+                    for( MODEL_GATE& unitGate : variant.gates )
+                        unitGate.id = GATE_ID( gateId++ );
+
+                    for( const auto& [unit, placed] : units )
+                    {
+                        MODEL_GATE& unitGate = variant.gates[unit - 1];
+
+                        if( unitGate.definition.id == placed->definition.id )
+                            continue;
+
+                        // The placement was already checked against the PARTTYPE
+                        // choice table during decodeLegacyV9Placements(). Recheck
+                        // the provenance and the exact one-pin definition here.
+                        const auto sourceGate = std::ranges::find(
+                                part.gates, placed->gate->id, &MODEL_GATE::id );
+                        const auto definition = std::ranges::find(
+                                aModel.definitions, placed->definition.id,
+                                &MODEL_SYMBOL_DEFINITION::id );
+
+                        if( sourceGate == part.gates.end()
+                            || definition == aModel.definitions.end()
+                            || definition->pins.size() != 1
+                            || placed->pins.size() != 1
+                            || placed->pins[0].id != definition->pins[0].id
+                            || unitGate.logicalPins.size() != 1 )
+                            throwDecodeError( placed->source,
+                                              wxS( "v9 connector selected decal/pin mismatch" ) );
+
+                        unitGate.definition = { definition->id, placed->source };
+                        unitGate.pins.clear();
+                        unitGate.pins.push_back( { placed->pins[0].id, placed->pins[0].source } );
+                        MODEL_GATE_PIN& logical = unitGate.logicalPins.front();
+                        logical.definitionPin = { placed->pins[0].id, placed->pins[0].source };
+                        logical.name = definition->pins[0].name;
+                        logical.electricalType = definition->pins[0].electricalType;
+                        unitGate.properties.push_back( sourceProperty(
+                                wxS( "v9_selected_graphical_gate" ),
+                                wxString::Format( wxS( "%u" ), sourceGate->id.Value() ),
+                                placed->source ) );
+                    }
+
+                    const size_t newIndex = variantParts.size();
+                    created += variant.gates.size();
+                    variantParts.push_back( std::move( variant ) );
+                    variantBySignature.emplace( signature, newIndex );
+                    existing = variantBySignature.find( signature );
+                }
+
+                selectedPartId = variantParts[existing->second].id;
+                selectedGates = &variantParts[existing->second].gates;
+            }
+
+            for( const auto& [unit, placed] : units )
+            {
+                placed->partType = { selectedPartId, placed->source };
+                placed->gate = GATE_REFERENCE{ ( *selectedGates )[unit - 1].id,
+                                              placed->source };
+            }
+        }
+
+        part.gates = std::move( physicalGates );
+        created += part.gates.size();
+        static_cast<void>( placementsOfPart );
+    }
+
+    for( MODEL_PART_TYPE& variant : variantParts )
+        aModel.partTypes.push_back( std::move( variant ) );
+
+    return created;
+}
+static PADS_SCH_MODEL decodeLegacyV9GraphicsAndTexts( const std::vector<uint8_t>& aBytes,
+                                            const wxString& aSourceName, const PADS_SCH_SDB& aSdb )
+{
+    const PADS_IO::BINARY_CURSOR& cursor = aSdb.Cursor();
+    PADS_SCH_MODEL                model;
+    model.version = aSdb.Version();
+    model.subversion = cursor.U16At( 6 );
+    model.source = { aSourceName, model.version, wxS( "model" ), -1, 0, 0, aBytes.size(), -1 };
+    model.settings.codePage = DEFAULT_CODE_PAGE;
+
+    const std::vector<MODEL_FIELD> titleFields =
+            decodeDesignSettings( aBytes, cursor, aSdb, aSourceName, model );
+    decodeSheets( aBytes, cursor, aSdb, aSourceName, titleFields, model );
+
+    size_t   sheetIndex = 0;
+    size_t   linkedDecals = 0;
+    size_t   totalPieces = 0;
+    size_t   totalVertices = 0;
+    size_t   totalArcs = 0;
+    size_t   totalTerminals = 0;
+    size_t   totalPartTypes = 0;
+    size_t   totalGates = 0;
+    size_t   totalGatePins = 0;
+    size_t   totalSignalPins = 0;
+    size_t   totalPlacements = 0;
+    size_t   totalPlacedPins = 0;
+    size_t   totalGroupFields = 0;
+    size_t   totalUnboundCustomFields = 0;
+    size_t   totalReusedGateUnits = 0;
+    size_t   totalNets = 0;
+    size_t   totalWires = 0;
+    size_t   totalWireVertices = 0;
+    size_t   totalPinEndpoints = 0;
+    size_t   totalJunctions = 0;
+    size_t   totalOffpages = 0;
+    size_t   totalNetNames = 0;
+    size_t   totalLinkedSignals = 0;
+    size_t   totalStandardFields = 0;
+    size_t   totalEmbeddedTexts = 0;
+    size_t   totalPageTexts = 0;
+    size_t   totalWorksheets = 0;
+    size_t   totalPreservedTexts = 0;
+    size_t   totalResolvedPinBodies = 0;
+    size_t   totalPlaceholders = 0;
+
+    for( const SCH_SDB_BLOCK& block : aSdb.Blocks() )
+    {
+        if( block.kind != SCH_SDB_BLOCK_KIND::SHEET )
+            continue;
+
+        const SHEET_CONTROLLERS controllers = sheetControllers( cursor, block );
+        const DEFINITION_LAYOUT layout =
+                definitionLayout( cursor, controllers, sheetIndex, aSourceName, model.version );
+        std::vector<MODEL_SYMBOL_DEFINITION*> definitionsByRecord( controllers.pools[2].count );
+        std::vector<size_t>                   pageGraphicRecords;
+        decodeSymbolDefinitions( aBytes, cursor, controllers, layout, sheetIndex,
+                                 aSourceName, definitionsByRecord, pageGraphicRecords, model );
+
+        totalPieces += controllers.pools[3].count;
+        totalVertices += controllers.pools[4].count;
+        totalArcs += controllers.pools[5].count;
+
+        // v9 92-byte USED_DECAL references the 80-byte definition by u16
+        // at +48, not the newer u32 record. Bound and name checks are already
+        // performed by validateLegacyV9Records(). Resolve to real definitions.
+        for( size_t record = 0; record < controllers.pools[6].count; ++record )
+        {
+            const size_t decalOffset = controllers.offsets[6] + record * 92;
+            const uint16_t definitionRecord = cursor.U16At( decalOffset + 48 );
+
+            if( definitionRecord == 0xFFFF || !definitionsByRecord[definitionRecord] )
+                continue;
+
+            ++linkedDecals;
+        }
+
+        // v9 controller 1 text records are 28 bytes (v13: 32). The record
+        // offsets, local coordinates, text dimensions and the two independent
+        // ownership words are all shifted by four bytes, not a blind cast.
+        const size_t textBase = controllers.offsets[0];
+        const size_t heapBase = controllers.offsets[1];
+        const uint32_t heapBytes = controllers.pools[1].usedBytes;
+
+        for( size_t record = 0; record < controllers.pools[0].count; ++record )
+        {
+            const size_t offset = textBase + record * 28;
+
+            // Equal predecessor/successor words are the free text owners;
+            // definition fields, embedded texts and worksheet texts must be
+            // handled separately by their owning object.
+            if( cursor.U16At( offset + 20 ) != cursor.U16At( offset + 22 ) )
+                continue;
+
+            SOURCE_PROVENANCE source = sourceAt( aSourceName, model.version, wxS( "free text" ), 1,
+                                                 record, offset, 28, static_cast<int>( sheetIndex ) );
+            const uint32_t stringOffset = cursor.U32At( offset + 4 );
+            const uint16_t stringBytes = cursor.U16At( offset + 16 );
+
+            if( stringOffset >= heapBytes || stringBytes == 0 || stringBytes > heapBytes - stringOffset
+                || aBytes[heapBase + stringOffset + stringBytes - 1] != 0 )
+                throwDecodeError( source, wxS( "legacy free-text string leaves controller 2" ) );
+
+            SOURCE_PROVENANCE stringSource = sourceAt(
+                    aSourceName, model.version, wxS( "free text string" ), 2, record,
+                    heapBase + stringOffset, stringBytes - 1, static_cast<int>( sheetIndex ) );
+            MODEL_TEXT text;
+            text.source = source;
+            text.sheet = { model.sheets[sheetIndex].id, source };
+            text.text = PADS_SCH_BINARY_PARSER::DecodeString(
+                    { aBytes.begin() + stringSource.absoluteOffset,
+                      aBytes.begin() + stringSource.absoluteOffset + stringSource.length },
+                    DEFAULT_CODE_PAGE, stringSource, model.diagnostics );
+            text.position = { decodeCoordinate( cursor.U16At( offset + 8 ) ),
+                              decodeCoordinate( cursor.U16At( offset + 10 ) ), source };
+            text.angle = NormalizeAngle( cursor.U16At( offset + 12 ) );
+            text.presentation.source = source;
+            text.presentation.height = int64_t( cursor.U16At( offset + 18 ) ) * 2;
+            text.presentation.width = int64_t( cursor.U16At( offset + 26 ) ) * 2;
+            const uint16_t justification =
+                    rotatedFieldJustification( cursor.U16At( offset + 14 ), text.angle );
+            text.presentation.horizontalJustification = freeTextHorizontalJustification( justification );
+            text.presentation.verticalJustification = verticalJustification( justification );
+            model.texts.push_back( std::move( text ) );
+        }
+
+        const LEGACY_V9_PART_COUNTS parts = decodeLegacyV9PartsAndPins(
+                aBytes, cursor, controllers, layout, sheetIndex, aSourceName,
+                definitionsByRecord, model );
+        totalTerminals += parts.terminals;
+        totalPartTypes += parts.partTypes;
+        totalGates += parts.gates;
+        totalGatePins += parts.gatePins;
+        totalSignalPins += parts.signalPins;
+        const LEGACY_V9_FINAL_COUNTS details = decodeLegacyV9FinalDetails(
+                aBytes, cursor, controllers, sheetIndex, aSourceName, model );
+        totalLinkedSignals += details.signalPins;
+        totalStandardFields += details.standardFields;
+        totalEmbeddedTexts += details.embeddedTexts;
+        totalPageTexts += details.pageTexts;
+        totalWorksheets += details.worksheets;
+        totalPreservedTexts += details.preservedTexts;
+        totalResolvedPinBodies += details.resolvedPinBodies;
+        totalPlaceholders += details.placeholders;
+        const LEGACY_V9_PLACEMENT_COUNTS placements = decodeLegacyV9Placements(
+                aBytes, cursor, aSdb, controllers, sheetIndex, aSourceName, model );
+        totalPlacements += placements.placements;
+        totalPlacedPins += placements.pins;
+        totalGroupFields += placements.attributeFields;
+        totalUnboundCustomFields += placements.unboundCustomFields;
+        totalReusedGateUnits += placements.reusedGateUnits;
+        materializeLegacyV9GateUnits( aBytes, model, sheetIndex );
+        const LEGACY_V9_CONNECTIVITY_COUNTS connectivity = decodeLegacyV9Connectivity(
+                aBytes, cursor, aSdb, controllers, sheetIndex, aSourceName, model );
+        totalNets += connectivity.nets;
+        totalWires += connectivity.wires;
+        totalWireVertices += connectivity.vertices;
+        totalPinEndpoints += connectivity.pinEndpoints;
+        totalJunctions += connectivity.junctions;
+        totalOffpages += connectivity.offpages;
+        totalNetNames += connectivity.netNames;
+        ++sheetIndex;
+    }
+
+    // Keep the measured decoding coverage in the semantic provenance. This
+    // also makes all of the stage counters visible to a future diagnostic
+    // exporter instead of discarding them after the earlier read-only passes.
+    wxString audit = wxString::Format(
+            wxS( "sheets=%zu definitions=%zu linked_decals=%zu graphics=%zu free_texts=%zu "
+                 "pieces=%zu vertices=%zu arcs=%zu" ),
+            sheetIndex, model.definitions.size(), linkedDecals, model.graphics.size(),
+            model.texts.size(), totalPieces, totalVertices, totalArcs );
+    audit += wxString::Format(
+            wxS( " terminals=%zu parttypes=%zu gates=%zu gate_pins=%zu signal_records=%zu "
+                 "placements=%zu placed_pins=%zu attributes=%zu custom_unbound=%zu reused_units=%zu" ),
+            totalTerminals, totalPartTypes, totalGates, totalGatePins, totalSignalPins,
+            totalPlacements, totalPlacedPins, totalGroupFields, totalUnboundCustomFields,
+            totalReusedGateUnits );
+    audit += wxString::Format(
+            wxS( " nets=%zu wires=%zu wire_vertices=%zu pin_endpoints=%zu junctions=%zu "
+                 "offpages=%zu netnames=%zu" ),
+            totalNets, totalWires, totalWireVertices, totalPinEndpoints,
+            totalJunctions, totalOffpages, totalNetNames );
+    audit += wxString::Format(
+            wxS( " sigpins=%zu default_fields=%zu embedded_texts=%zu page_texts=%zu "
+                 "worksheets=%zu placeholders=%zu preserved_texts=%zu pin_bodies=%zu" ),
+            totalLinkedSignals, totalStandardFields, totalEmbeddedTexts, totalPageTexts,
+            totalWorksheets, totalPlaceholders, totalPreservedTexts, totalResolvedPinBodies );
+    SOURCE_PROPERTY sourceAudit = sourceProperty( wxS( "v9_semantic_import_coverage" ), audit, model.source );
+    sourceAudit.disposition = PROPERTY_DISPOSITION::PRESERVED;
+    model.settings.properties.push_back( std::move( sourceAudit ) );
+
+    // The v9 semantic model now contains real definitions, pin bodies, parts,
+    // placements, nets, labels and the authored worksheet. Do not bypass
+    // the model's own structural validation before the KiCad builder sees it.
+    decodeOleImages( aBytes, aSdb, aSourceName, model );
+    inheritDefaultSystemFonts( model );
+    assignFieldIds( model );
+    model.ValidateOrThrow();
+    return model;
+}
+
 PADS_SCH_MODEL PADS_SCH_BINARY_PARSER::Parse( const std::vector<uint8_t>& aBytes, const wxString& aSourceName ) const
 {
     PADS_SCH_SDB sdb;
     sdb.Load( aBytes );
+
+    // Decode the legacy sheet, symbol geometry and free texts with their own
+    // v9 layouts. This path intentionally rejects an incomplete schematic.
+    if( sdb.Version() == 0x0009 )
+    {
+        validateLegacyV9Records( sdb, aBytes );
+        return decodeLegacyV9GraphicsAndTexts( aBytes, aSourceName, sdb );
+    }
 
     const PADS_IO::BINARY_CURSOR& cursor = sdb.Cursor();
     PADS_SCH_MODEL                model;

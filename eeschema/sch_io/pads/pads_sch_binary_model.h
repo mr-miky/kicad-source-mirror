@@ -627,6 +627,9 @@ struct MODEL_BUS_ENTRY
     SOURCE_PROVENANCE            source;
     SOURCE_POINT                 position;
     NET_REFERENCE                memberNet;
+    // Controller-21 connection record selected by this controller-20 bus entry.
+    // Needed when multiple wires on the same net touch the same bus point.
+    std::optional<uint32_t>      connectionRecordIndex;
     std::vector<SOURCE_PROPERTY> properties;
 
     bool operator==( const MODEL_BUS_ENTRY& ) const = default;
@@ -671,8 +674,11 @@ struct MODEL_LABEL
     SOURCE_STRING                decalName;
     SOURCE_POINT                 position;
     SOURCE_POINT                 textOffset;
-    int                          angle = 0;
+    // OFFPAGE angle after applying its mirror flags, independent of NETNAMES text.
+    int                          symbolAngle = 0;
+    int                          angle = 0; // NETNAMES text angle
     uint8_t                      symbolVariant = 0xFF;
+    uint16_t                     offpageMirrorFlags = 0;  // PADS controller-20 +28, low two bits
 
     // External height of the selected PADS off-page CAEDECAL body, in semantic
     // model coordinate units (half-mils). Zero means unresolved.

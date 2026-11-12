@@ -30,6 +30,7 @@ namespace
 {
 
     constexpr uint8_t  MAGIC1 = 0xFE;
+    constexpr uint16_t VERSION_9 = 0x0009;
     constexpr uint16_t VERSION_12 = 0x000C;
     constexpr uint16_t VERSION_13 = 0x000D;
     constexpr size_t   HEADER_SIZE = 0x20;
@@ -64,6 +65,12 @@ namespace
     constexpr size_t POOL_USED_BYTES_OFFSET = 12;
     constexpr size_t POOL_HANDLE_OFFSET = 16;
 
+    size_t outerPoolCount( uint16_t aVersion )
+    {
+        // Legacy PADS Logic v0x0009 predates outer controller 20.
+        return aVersion == VERSION_9 ? 19 : POOL_COUNT;
+    }
+
 } // namespace
 
 
@@ -75,7 +82,7 @@ bool PADS_SCH_SDB::HasFamilyMagic( const std::vector<uint8_t>& aBytes )
 
 bool PADS_SCH_SDB::IsSupportedVersion( uint16_t aVersion )
 {
-    return aVersion == VERSION_12 || aVersion == VERSION_13;
+    return aVersion == VERSION_9 || aVersion == VERSION_12 || aVersion == VERSION_13;
 }
 
 
@@ -121,16 +128,16 @@ void PADS_SCH_SDB::parseHeader()
     if( m_cursor.U16At( 4 ) != expectedRevision )
         throwAt( 4, "invalid version-specific PADS Logic format flags" );
 
-    m_payloadOffset = PAYLOAD_OFFSET;
+    m_payloadOffset = POOL_OFFSET + outerPoolCount( m_version ) * POOL_SIZE;
 }
 
 
 void PADS_SCH_SDB::parseDirectory()
 {
-    if( m_data.size() < PAYLOAD_OFFSET )
+    if( m_data.size() < m_payloadOffset )
         throwAt( m_data.size(), "file too small for PADS Logic pool directory" );
 
-    for( size_t i = 0; i < POOL_COUNT; ++i )
+    for( size_t i = 0; i < outerPoolCount( m_version ); ++i )
     {
         size_t              offset = POOL_OFFSET + i * POOL_SIZE;
         PADS_IO::SDB_RECORD record( m_cursor, offset );
@@ -152,7 +159,7 @@ void PADS_SCH_SDB::parseDirectory()
 
 void PADS_SCH_SDB::verifyFooter()
 {
-    if( m_data.size() < PAYLOAD_OFFSET + FOOTER_SIZE )
+    if( m_data.size() < m_payloadOffset + FOOTER_SIZE )
         throwAt( m_data.size(), "file too small for PADS Logic binary footer" );
 
     m_footerOffset = m_data.size() - FOOTER_SIZE;
@@ -191,7 +198,9 @@ void PADS_SCH_SDB::parseBlocks()
 
     size_t offset = m_payloadOffset;
 
-    if( m_cursor.U32At( offset ) != DATABASE_CONTROLLER )
+    const uint32_t firstOrdinal = m_version == VERSION_9 ? 0x08 : DATABASE_CONTROLLER;
+
+    if( m_cursor.U32At( offset ) != firstOrdinal )
         throwAt( offset, "invalid first schematic controller ordinal" );
 
     size_t outerStart = offset;
@@ -206,8 +215,8 @@ void PADS_SCH_SDB::parseBlocks()
         outerEnd = blockEnd;
     }
 
-    m_blocks.push_back( { SCH_SDB_BLOCK_KIND::FIXED_CONTROLLER, static_cast<int>( DATABASE_CONTROLLER ), outerStart,
-                          outerEnd - outerStart, 19, 0 } );
+    m_blocks.push_back( { SCH_SDB_BLOCK_KIND::FIXED_CONTROLLER, static_cast<int>( firstOrdinal ), outerStart,
+                          outerEnd - outerStart, outerPoolCount( m_version ) - 1, 0 } );
 
     offset = outerEnd;
 
