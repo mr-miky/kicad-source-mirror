@@ -81,13 +81,9 @@ public:
                          const std::set<std::string>& aSkipSignals = {},
                          const std::map<std::string, NETNAME_LABEL>& aNetNameLabels = {} );
 
-    /**
-     * Map the PADS *NETNAMES* text/body offset to KiCad spin.
-     *
-     * A zero offset carries no direction information, so keep the wire-derived fallback.
-     */
-    static SPIN_STYLE SpinFromNetNameOffset( const NETNAME_LABEL& aLabel,
-                                             SPIN_STYLE aFallback );
+    /** Map an OFFPAGE REF's angle, mirror and selected REFIN/REFOUT CAEDECAL. */
+    static SPIN_STYLE SpinFromOffPageConnector( const OFF_PAGE_CONNECTOR& aConnector,
+                                                SPIN_STYLE aFallback );
 
     /**
      * Create a net label. PADS signals are global, so labels are SCH_GLOBALLABEL to avoid

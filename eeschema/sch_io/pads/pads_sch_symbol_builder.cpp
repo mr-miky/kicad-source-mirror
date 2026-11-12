@@ -912,10 +912,12 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
     ELECTRICAL_PINTYPE pinType = static_cast<ELECTRICAL_PINTYPE>( mapPinType( aPin.type ) );
     pin->SetType( pinType );
 
-    // Set graphic style
+    // Set graphic style.  PADS decals such as PCLKB/PINCLKB carry both
+    // inversion and clock decoration, so preserve the combined KiCad shape.
     GRAPHIC_PINSHAPE pinShape = GRAPHIC_PINSHAPE::LINE;
 
-    // PINIEB is the native active-low input marker, not an inversion bubble.
+    // PINIEB is not an inversion bubble. Its PADS polyline is the native
+    // active-low input marker: a 200 mil pin ending in the low-input wedge.
     if( aPin.pin_decal_name == "PINIEB" )
         pinShape = GRAPHIC_PINSHAPE::INPUT_LOW;
     else if( aPin.inverted && aPin.clock )
@@ -933,10 +935,10 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
     if( aUnit != 0 )
         pin->SetUnit( aUnit );
 
-    // Preserve an authored PADS terminal stroke only when KiCad's native pin
-    // does not already represent it. Decorated KiCad pins draw their own stem,
-    // bubble/clock/wedge; a plain default solid stem is also redundant when it
-    // exactly matches the KiCad pin root.
+    // SCH_PIN owns the electrical connection.  Add a graphical overlay only when
+    // the resolved PADS terminal stem carries information that SCH_PIN cannot
+    // reproduce by itself.  A normal, axis-aligned, standard-width solid stem
+    // that exactly matches the KiCad pin segment is redundant and is omitted.
     if( aPin.pin_decal_geometry_resolved )
     {
         VECTOR2I stemEnd( pos.x + toKiCadUnits( stemVector.x ),
@@ -958,6 +960,10 @@ SCH_PIN* PADS_SCH_SYMBOL_BUILDER::createPin( const SYMBOL_PIN& aPin, LIB_SYMBOL*
         case PIN_ORIENTATION::INHERIT:   break;
         }
 
+        // KiCad's decorated SCH_PIN renderer already owns the complete visual
+        // representation of inverted/clock/inverted-clock pins.  Do not draw a
+        // second PADS stem through those decorators.  For plain pins, suppress
+        // the overlay only when the PADS stem is exactly the standard KiCad one.
         const bool redundantStem =
                 pinShape != GRAPHIC_PINSHAPE::LINE
                 || ( stemEnd == kicadStemEnd

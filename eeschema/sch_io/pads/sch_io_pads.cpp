@@ -336,95 +336,27 @@ static SCH_TEXT* createSchText( const PADS_SCH::TEXT_ITEM& aText, const VECTOR2I
 }
 
 
-/**
- * Determine the orientation for a power symbol at an OPC position based on
- * the wire direction at that point. All power symbols are drawn with their
- * pin at (0,0). Ground-style symbols have their body below the pin (pin_up=false),
- * while VCC-style symbols have their body above the pin (pin_up=true).
- * We orient the symbol so its body faces away from the wire.
- */
-static int computePowerOrientation( const std::string& aOpcId, const std::vector<PADS_SCH::SCH_SIGNAL>& aSignals,
-                                    const VECTOR2I& aOpcPos, bool aPinUp, int aPageHeightIU )
+/** Compute a power symbol's orientation from PADS' own OFFPAGE transform. */
+static int padsAsciiPowerOrientation( const PADS_SCH::OFF_PAGE_CONNECTOR& aOpc )
 {
-    // Find the wire endpoint matching this OPC and get the adjacent vertex
-    std::string opcRef = "@@@O" + aOpcId;
-    VECTOR2I    adjPos = aOpcPos;
-    bool        found = false;
+    int angle = aOpc.rotation % 360;
 
-    for( const PADS_SCH::SCH_SIGNAL& signal : aSignals )
+    if( angle < 0 )
+        angle += 360;
+
+    if( aOpc.flags1 & 1 )
+        angle = ( 180 - angle + 360 ) % 360;
+
+    if( aOpc.flags1 & 2 )
+        angle = ( 360 - angle ) % 360;
+
+    switch( angle )
     {
-        for( const auto& wire : signal.wires )
-        {
-            if( wire.vertices.size() < 2 )
-                continue;
-
-            if( wire.endpoint_a == opcRef )
-            {
-                adjPos = VECTOR2I( schIUScale.MilsToIU( KiROUND( wire.vertices[1].x ) ),
-                                   aPageHeightIU - schIUScale.MilsToIU( KiROUND( wire.vertices[1].y ) ) );
-                found = true;
-                break;
-            }
-
-            if( wire.endpoint_b == opcRef )
-            {
-                size_t last = wire.vertices.size() - 1;
-                adjPos = VECTOR2I( schIUScale.MilsToIU( KiROUND( wire.vertices[last - 1].x ) ),
-                                   aPageHeightIU - schIUScale.MilsToIU( KiROUND( wire.vertices[last - 1].y ) ) );
-                found = true;
-                break;
-            }
-        }
-
-        if( found )
-            break;
-    }
-
-    if( !found )
-        return SYMBOL_ORIENTATION_T::SYM_ORIENT_0;
-
-    // Wire goes from aOpcPos toward adjPos
-    int dx = adjPos.x - aOpcPos.x;
-    int dy = adjPos.y - aOpcPos.y;
-
-    // A power connector can sit directly on a component pin, producing a zero-length
-    // PADS connection segment.  Such a segment carries no orientation information.
-    // Keep the native CAEDECAL orientation instead of accidentally treating (0,0)
-    // as a horizontal wire and rotating GND/AGND by 90 degrees.
-    if( dx == 0 && dy == 0 )
-        return SYMBOL_ORIENTATION_T::SYM_ORIENT_0;
-
-    // Determine which direction the wire approaches from (relative to OPC position).
-    // The symbol body should face AWAY from the wire.
-    // In KiCad Y-down coordinates: dy > 0 means wire goes down from OPC.
-
-    if( std::abs( dx ) >= std::abs( dy ) )
-    {
-        // Horizontal wire
-        if( dx > 0 )
-        {
-            // Wire goes right → body should face left
-            return aPinUp ? SYMBOL_ORIENTATION_T::SYM_ORIENT_90 : SYMBOL_ORIENTATION_T::SYM_ORIENT_270;
-        }
-        else
-        {
-            // Wire goes left → body should face right
-            return aPinUp ? SYMBOL_ORIENTATION_T::SYM_ORIENT_270 : SYMBOL_ORIENTATION_T::SYM_ORIENT_90;
-        }
-    }
-    else
-    {
-        // Vertical wire
-        if( dy > 0 )
-        {
-            // Wire goes down → body should face up
-            return aPinUp ? SYMBOL_ORIENTATION_T::SYM_ORIENT_0 : SYMBOL_ORIENTATION_T::SYM_ORIENT_180;
-        }
-        else
-        {
-            // Wire goes up → body should face down
-            return aPinUp ? SYMBOL_ORIENTATION_T::SYM_ORIENT_180 : SYMBOL_ORIENTATION_T::SYM_ORIENT_0;
-        }
+    case 0:   return SYMBOL_ORIENTATION_T::SYM_ORIENT_0;
+    case 90:  return SYMBOL_ORIENTATION_T::SYM_ORIENT_90;
+    case 180: return SYMBOL_ORIENTATION_T::SYM_ORIENT_180;
+    case 270: return SYMBOL_ORIENTATION_T::SYM_ORIENT_270;
+    default:  return SYMBOL_ORIENTATION_T::SYM_ORIENT_0;
     }
 }
 
@@ -1831,8 +1763,11 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
 
         for( const PADS_SCH::OFF_PAGE_CONNECTOR& opc : parser.GetOffPageConnectors() )
         {
+            // PADS may use one internal net name (e.g. $$$6) for both ground
+            // power ports and ordinary $OSR_SYMS off-page references.  Skip the
+            // power object, not every object sharing that signal name.
             if( opc.source_sheet != sheetNum || opc.signal_name.empty()
-                || powerSignalNames.count( opc.signal_name ) )
+                || ( powerSignalNames.count( opc.signal_name ) && opc.symbol_lib != "$OSR_SYMS" ) )
             {
                 continue;
             }
@@ -1904,13 +1839,8 @@ SCH_SHEET* SCH_IO_PADS::LoadSchematicFile( const wxString& aFileName, SCHEMATIC*
                     symbol->SetPosition( pos );
                     symbol->SetUnit( 1 );
 
-                    // VCC and PWR_TRIANGLE have pin pointing up (body above pin).
-                    // All others (GND, GNDD, PWR_BAR, VEE, Earth) have pin pointing down.
-                    bool pinUp = ( powerStyle == "VCC" || powerStyle == "PWR_TRIANGLE" );
-                    int  orient =
-                            computePowerOrientation( std::to_string( opc.id ), sheetSignals, pos, pinUp, pageHeightIU );
-
-                    symbol->SetOrientation( orient );
+                    // Respect PADS OFFPAGE rotation/mirror, not the adjacent wire.
+                    symbol->SetOrientation( padsAsciiPowerOrientation( opc ) );
 
                     wxString netName = wxString::FromUTF8( opc.signal_name );
 

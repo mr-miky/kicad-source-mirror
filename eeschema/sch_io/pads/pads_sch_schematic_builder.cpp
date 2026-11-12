@@ -173,11 +173,30 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
     for( const SCH_SIGNAL& signal : aSignals )
     {
-        if( signal.name.empty() || signal.name[0] == '$' )
+        // PADS internally named nets ($$$...) may contain real $OSR_SYMS
+        // off-page connectors.  A net name alone does not identify a power port.
+        if( signal.name.empty() )
             continue;
 
+        // Keep the power-net suppression unless an explicitly selected signal
+        // off-page endpoint is present on this net.  Actual power-port endpoints
+        // are filtered when aSignalOpcIds is built by sch_io_pads.cpp.
         if( aSkipSignals.count( signal.name ) )
-            continue;
+        {
+            bool hasSignalOffpage = false;
+
+            for( const WIRE_SEGMENT& wire : signal.wires )
+            {
+                if( aSignalOpcIds.count( wire.endpoint_a ) || aSignalOpcIds.count( wire.endpoint_b ) )
+                {
+                    hasSignalOffpage = true;
+                    break;
+                }
+            }
+
+            if( !hasSignalOffpage )
+                continue;
+        }
 
         if( signal.wires.empty() )
             continue;
@@ -224,15 +243,14 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 
         for( const PLACEMENT& placement : opcPlacements )
         {
-            // Match the binary importer: PADS *NETNAMES* stores the visible off-page
-            // text/body displacement from the electrical anchor and therefore gives the
-            // reading direction.  Use adjacent wire direction only when that offset is zero.
+            // OFFPAGE owns symbol direction; movable NETNAMES text does not.
+            // Use wire direction only for missing/unsupported OFFPAGE records.
             SPIN_STYLE orient = computeLabelOrientation( placement.labelPos, placement.adjPos );
             auto       opcIt = aOffPageConnectors.find( placement.anchorRef );
             auto       presentationIt = aNetNameLabels.find( placement.anchorRef );
 
-            if( opcIt != aOffPageConnectors.end() && presentationIt != aNetNameLabels.end() )
-                orient = SpinFromNetNameOffset( presentationIt->second, orient );
+            if( opcIt != aOffPageConnectors.end() )
+                orient = SpinFromOffPageConnector( opcIt->second, orient );
 
             SCH_GLOBALLABEL* label = CreateNetLabel( signal, placement.labelPos, orient );
 
@@ -328,18 +346,42 @@ int PADS_SCH_SCHEMATIC_BUILDER::CreateNetLabels( const std::vector<SCH_SIGNAL>& 
 }
 
 
-SPIN_STYLE PADS_SCH_SCHEMATIC_BUILDER::SpinFromNetNameOffset(
-        const NETNAME_LABEL& aLabel, SPIN_STYLE aFallback )
+SPIN_STYLE PADS_SCH_SCHEMATIC_BUILDER::SpinFromOffPageConnector(
+        const OFF_PAGE_CONNECTOR& aConnector, SPIN_STYLE aFallback )
 {
-    if( aLabel.x_offset == 0 && aLabel.y_offset == 0 )
+    // flags1 is the OFFPAGE mirror; flags2 selects REFIN (0) or REFOUT (1).
+    if( aConnector.symbol_lib != "$OSR_SYMS" || ( aConnector.flags2 != 0 && aConnector.flags2 != 1 )
+        || ( aConnector.flags1 & ~3 ) != 0 )
+    {
+        return aFallback;
+    }
+
+    int angle = aConnector.rotation % 360;
+
+    if( angle < 0 )
+        angle += 360;
+
+    if( angle % 90 != 0 )
         return aFallback;
 
-    if( std::abs( aLabel.x_offset ) >= std::abs( aLabel.y_offset ) )
-        return aLabel.x_offset >= 0 ? SPIN_STYLE::RIGHT : SPIN_STYLE::LEFT;
+    if( aConnector.flags1 & 1 )
+        angle = ( 180 - angle + 360 ) % 360;
 
-    // PADS page Y increases upwards.  This is the authored body/text displacement,
-    // so positive Y means the label body is above the electrical anchor.
-    return aLabel.y_offset >= 0 ? SPIN_STYLE::UP : SPIN_STYLE::BOTTOM;
+    if( aConnector.flags1 & 2 )
+        angle = ( 360 - angle ) % 360;
+
+    // Native REFIN points left, REFOUT right.
+    if( aConnector.flags2 == 0 )
+        angle = ( angle + 180 ) % 360;
+
+    switch( angle )
+    {
+    case 0:   return SPIN_STYLE::RIGHT;
+    case 90:  return SPIN_STYLE::UP;
+    case 180: return SPIN_STYLE::LEFT;
+    case 270: return SPIN_STYLE::BOTTOM;
+    default:  return aFallback;
+    }
 }
 
 
