@@ -266,7 +266,9 @@ void PADS_PCB_CONVERTER::PreparePadsRomansimFont()
 
     std::vector<unsigned char> source( static_cast<size_t>( length ) );
 
-    if( file.Read( source.data(), source.size() ) != source.size() )
+    const auto bytesRead = file.Read( source.data(), source.size() );
+
+    if( bytesRead != static_cast<decltype( bytesRead )>( source.size() ) )
         return;
 
     std::vector<char> converted;

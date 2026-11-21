@@ -645,6 +645,8 @@ struct MODEL_BUS
     std::vector<SOURCE_POINT>    vertices;
     std::vector<MODEL_BUS_ENTRY> entries;
     std::vector<SOURCE_STRING>   aliases;
+    // Exact outer PADS global-net record owning this controller-18 bus.
+    std::optional<uint32_t>      globalNetRecordIndex; // PADS_V15
     std::vector<SOURCE_STRING>   declaredMembers;
     std::vector<NET_REFERENCE>   memberNets;
     std::vector<SOURCE_PROPERTY> properties;
@@ -674,6 +676,10 @@ struct MODEL_LABEL
     SOURCE_STRING                decalName;
     SOURCE_POINT                 position;
     SOURCE_POINT                 textOffset;
+    // v0x000D NETNAMES on a bus-entry: controller-20 source record, not a net-member ordinal.
+    std::optional<uint32_t>      netNameBusEntryRecordIndex;
+    // Exact sheet-local MODEL_NET id, not a name guessed from geometry.
+    std::optional<NET_ID>        netNameMemberNetId; // PADS_V15
     // OFFPAGE angle after applying its mirror flags, independent of NETNAMES text.
     int                          symbolAngle = 0;
     int                          angle = 0; // NETNAMES text angle

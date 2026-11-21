@@ -4165,6 +4165,7 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             bus.source = source;
             bus.sheet = { aModel.sheets[aDecode.sheetIndex].id, source };
             bus.name = global.name;
+            bus.globalNetRecordIndex = globalRecord; // PADS_V15
             bus.aliases.push_back( global.name );
             bus.declaredMembers = global.aliasMembers;
             // Preserve the original 16-bit bus marker for future round-trip
@@ -4724,18 +4725,60 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
                     if( !busEntry )
                         throwDecodeError( source, wxS( "net-name off-page owner targets wrong object class" ) );
 
-                    MODEL_TEXT busText;
-                    busText.source = source;
-                    busText.sheet = { aModel.sheets[aDecode.sheetIndex].id, source };
-                    busText.text = ownerNet.name;
-                    busText.position = { busEntry->position.x + textOffset.x, busEntry->position.y + textOffset.y,
-                                         source };
-                    busText.angle = NormalizeAngle( aDecode.cursor.U16At( offset + 24 ) );
-                    busText.presentation = std::move( presentation );
-                    busText.properties.push_back( sourceProperty(
+                    // NETNAMES is the graphical presentation of an electrical
+                    // name, not a free-standing page annotation. The PADS
+                    // offset controls text placement, but a KiCad label's
+                    // anchor MUST touch a wire to carry the net name.
+                    if( !busEntry->connectionRecordIndex )
+                        throwDecodeError( source, wxS( "net-name bus-entry lacks connection owner" ) );
+
+                    auto entryConnection = std::ranges::find_if(
+                            ownerNet.connections,
+                            [&]( const MODEL_CONNECTION& aConnection )
+                            {
+                                return aConnection.source.recordIndex == *busEntry->connectionRecordIndex;
+                            } );
+
+                    if( entryConnection == ownerNet.connections.end() || entryConnection->vertices.size() < 2 )
+                        throwDecodeError( source, wxS( "net-name bus-entry connection is unresolved" ) );
+
+                    const auto& vertices = entryConnection->vertices;
+                    const bool atFirst = vertices.front().x == busEntry->position.x
+                                         && vertices.front().y == busEntry->position.y;
+                    const bool atLast = vertices.back().x == busEntry->position.x
+                                        && vertices.back().y == busEntry->position.y;
+
+                    if( atFirst == atLast )
+                        throwDecodeError( source, wxS( "net-name bus-entry connection has ambiguous direction" ) );
+
+                    // The bus-side segment is emitted as SCH_BUS_WIRE_ENTRY
+                    // by the builder; its opposite vertex touches the wire.
+                    const SOURCE_POINT& wireAnchor =
+                            atFirst ? vertices[1] : vertices[vertices.size() - 2];
+
+                    if( wireAnchor.x == busEntry->position.x && wireAnchor.y == busEntry->position.y )
+                        throwDecodeError( source, wxS( "net-name bus-entry wire anchor is degenerate" ) );
+
+                    MODEL_LABEL netLabel;
+                    netLabel.source = source;
+                    netLabel.sheet = { aModel.sheets[aDecode.sheetIndex].id, source };
+                    netLabel.kind = MODEL_LABEL_KIND::GLOBAL;
+                    netLabel.text = ownerNet.name;
+                    netLabel.position = wireAnchor;
+                    netLabel.netNameBusEntryRecordIndex = static_cast<uint32_t>( offpageRecord );
+                    netLabel.netNameMemberNetId = ownerNet.id; // PADS_V15
+                    netLabel.textOffset = textOffset;
+                    netLabel.angle = NormalizeAngle( aDecode.cursor.U16At( offset + 24 ) );
+                    netLabel.presentation = std::move( presentation );
+                    netLabel.properties.push_back( sourceProperty(
                             wxS( "net_name_text_offset" ),
                             wxString::Format( wxS( "%lld,%lld" ), textOffset.x, textOffset.y ), source ) );
-                    aModel.texts.push_back( std::move( busText ) );
+                    netLabel.properties.push_back( sourceProperty(
+                            wxS( "preserved_net_name_graphic_position" ),
+                            wxString::Format( wxS( "%lld,%lld" ),
+                                              busEntry->position.x + textOffset.x,
+                                              busEntry->position.y + textOffset.y ), source ) );
+                    aModel.labels.push_back( std::move( netLabel ) );
                     continue;
                 }
 
@@ -4790,17 +4833,27 @@ static bool binaryPinBodyRootDistance( const MODEL_SYMBOL_DEFINITION& aSymbol,
             if( !endpoint )
                 throwDecodeError( source, wxS( "net-name placement pin owner is unresolved" ) );
 
-            MODEL_TEXT text;
-            text.source = source;
-            text.sheet = { aModel.sheets[aDecode.sheetIndex].id, source };
-            text.text = ownerNet.name;
-            text.position = { endpoint->point.x + textOffset.x, endpoint->point.y + textOffset.y, source };
-            text.angle = NormalizeAngle( aDecode.cursor.U16At( offset + 24 ) );
-            text.presentation = std::move( presentation );
-            text.properties.push_back(
+            // Place the KiCad label at the actual connected pin, instead of
+            // importing a disconnected-looking NETNAMES graphic as SCH_TEXT.
+            MODEL_LABEL netLabel;
+            netLabel.source = source;
+            netLabel.sheet = { aModel.sheets[aDecode.sheetIndex].id, source };
+            netLabel.kind = MODEL_LABEL_KIND::GLOBAL;
+            netLabel.text = ownerNet.name;
+            netLabel.position = endpoint->point;
+            netLabel.netNameMemberNetId = ownerNet.id; // PADS_V15
+            netLabel.textOffset = textOffset;
+            netLabel.angle = NormalizeAngle( aDecode.cursor.U16At( offset + 24 ) );
+            netLabel.presentation = std::move( presentation );
+            netLabel.properties.push_back(
                     sourceProperty( wxS( "net_name_text_offset" ),
                                     wxString::Format( wxS( "%lld,%lld" ), textOffset.x, textOffset.y ), source ) );
-            aModel.texts.push_back( std::move( text ) );
+            netLabel.properties.push_back( sourceProperty(
+                    wxS( "preserved_net_name_graphic_position" ),
+                    wxString::Format( wxS( "%lld,%lld" ),
+                                      endpoint->point.x + textOffset.x,
+                                      endpoint->point.y + textOffset.y ), source ) );
+            aModel.labels.push_back( std::move( netLabel ) );
         }
     }
 

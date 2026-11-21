@@ -9,6 +9,8 @@
  * any later version.
  */
 
+#include <cstdlib> // PADS_V15_BUS_TRACE_INCLUDE
+#include <cstdio> // PADS_V15_BUS_TRACE_INCLUDE
 #include <sch_io/pads/pads_sch_binary_builder.h>
 
 
@@ -2324,6 +2326,129 @@ namespace
 
         using SEGMENT_KEY = std::tuple<uint32_t, uint32_t, int64_t, int64_t, int64_t, int64_t>;
         std::set<SEGMENT_KEY> busEntrySegments;
+        // PADS_V15_SHARED_BUS_BEGIN
+        // A bus alias with the same spelling does not prove shared electrical
+        // identity. The source global-net record DOES. A name reused by two
+        // distinct source records must not be globalized in KiCad.
+        std::map<uint32_t, std::set<SHEET_ID>> v15BusRecordSheets;
+        std::map<uint32_t, wxString> v15BusRecordNames;
+        std::map<uint32_t, std::vector<wxString>> v15BusRecordMembers;
+        std::map<wxString, std::set<uint32_t>> v15BusNameRecords;
+
+        for( const auto& [sourceSheetId, buses] : aIndex.busesBySheet )
+        {
+            for( const MODEL_BUS* sourceBus : buses )
+            {
+                if( sourceBus->source.version != 0x000D || !sourceBus->globalNetRecordIndex )
+                    continue;
+
+                const uint32_t sourceRecord = *sourceBus->globalNetRecordIndex;
+                std::vector<wxString> members;
+
+                for( const SOURCE_STRING& member : sourceBus->declaredMembers )
+                    members.push_back( member.text );
+
+                auto [nameIt, inserted] = v15BusRecordNames.try_emplace(
+                        sourceRecord, sourceBus->name.text );
+
+                if( !inserted && ( nameIt->second != sourceBus->name.text
+                                   || v15BusRecordMembers.at( sourceRecord ) != members ) )
+                    THROW_IO_ERROR( FormatParserError( sourceBus->source,
+                                    wxS( "shared PADS bus record has inconsistent name/members" ) ) );
+
+                if( inserted )
+                    v15BusRecordMembers.emplace( sourceRecord, std::move( members ) );
+
+                v15BusRecordSheets[sourceRecord].insert( sourceSheetId );
+                v15BusNameRecords[sourceBus->name.text].insert( sourceRecord );
+            }
+        }
+
+        std::set<uint32_t> v15SharedBusRecords;
+
+        for( const auto& [sourceRecord, sheets] : v15BusRecordSheets )
+        {
+            const wxString& name = v15BusRecordNames.at( sourceRecord );
+
+            if( sheets.size() > 1 && v15BusNameRecords.at( name ).size() == 1 )
+                v15SharedBusRecords.insert( sourceRecord );
+        }
+
+        // Only scalar nets attached to a provably shared bus are localized.
+        std::set<NET_ID> v15LocalMemberNets;
+
+        for( const MODEL_BUS* sourceBus :
+             MODEL_INDEX::ForSheet( aIndex.busesBySheet, aSourceSheet.id ) )
+        {
+            if( sourceBus->globalNetRecordIndex
+                && v15SharedBusRecords.contains( *sourceBus->globalNetRecordIndex ) )
+            {
+                for( const MODEL_BUS_ENTRY& entry : sourceBus->entries )
+                    v15LocalMemberNets.insert( entry.memberNet.id );
+            }
+        }
+        // PADS_V15_SHARED_BUS_END
+        // PADS_V15_BUS_TRACE_BEGIN
+        // Diagnostics only: no changes to KiCad bus labels or member-net wiring.
+        // Enable with KICAD_PADS_BUS_TRACE=/tmp/pads-bus-trace.log.
+        if( const char* tracePath = std::getenv( "KICAD_PADS_BUS_TRACE" ) )
+        {
+            if( *tracePath )
+            {
+                if( std::FILE* trace = std::fopen( tracePath, "a" ) )
+                {
+                    for( const MODEL_BUS* traceBus :
+                         MODEL_INDEX::ForSheet( aIndex.busesBySheet, aSourceSheet.id ) )
+                    {
+                        const bool hasRecord = traceBus->source.version == 0x000D
+                                               && traceBus->globalNetRecordIndex.has_value();
+                        const uint32_t record = hasRecord ? *traceBus->globalNetRecordIndex : 0;
+                        const auto sheetsIt = v15BusRecordSheets.find( record );
+                        const auto recordsIt = v15BusNameRecords.find( traceBus->name.text );
+                        const size_t nSheets = hasRecord && sheetsIt != v15BusRecordSheets.end()
+                                                       ? sheetsIt->second.size() : 0;
+                        const size_t nNameRecords = hasRecord
+                                                    && recordsIt != v15BusNameRecords.end()
+                                                       ? recordsIt->second.size() : 0;
+                        const bool isGlobal = hasRecord && v15SharedBusRecords.contains( record );
+                        const char* reason = !hasRecord ? "NO_GLOBAL_RECORD_OR_LEGACY"
+                                             : nSheets <= 1 ? "SINGLE_SHEET"
+                                             : nNameRecords != 1 ? "NAME_COLLISION"
+                                             : "SHARED_RECORD";
+
+                        std::fprintf( trace,
+                                "PADS_BUS sheet=%d source_bus_rec=%llu name=\"%s\" "
+                                "global_rec=%u has_record=%u sheets=%zu name_records=%zu "
+                                "members=%zu entries=%zu label=%s reason=%s sheet_ids=",
+                                traceBus->source.sheet,
+                                static_cast<unsigned long long>( traceBus->source.recordIndex ),
+                                traceBus->name.text.ToUTF8().data(),
+                                record, static_cast<unsigned>( hasRecord ), nSheets,
+                                nNameRecords, traceBus->declaredMembers.size(),
+                                traceBus->entries.size(), isGlobal ? "GLOBAL" : "LOCAL", reason );
+
+                        if( hasRecord && sheetsIt != v15BusRecordSheets.end() )
+                        {
+                            for( const SHEET_ID& sheetId : sheetsIt->second )
+                                std::fprintf( trace, "%u,", sheetId.Value() );
+                        }
+
+                        std::fprintf( trace, "\n" );
+                    }
+                    std::fclose( trace );
+                }
+                else
+                {
+                    std::fprintf( stderr, "PADS_BUS unable to open trace file: %s\n", tracePath );
+                }
+            }
+        }
+        // PADS_V15_BUS_TRACE_END
+        // v14: exact bus-entry NETNAMES -> KiCad wire-side position and source connection.
+        std::map<const MODEL_LABEL*, VECTOR2I> v14BusLabelAnchors;
+        std::map<const MODEL_LABEL*, std::pair<uint32_t, uint32_t>> v14BusLabelConnections;
+        std::map<std::pair<uint32_t, uint32_t>, VECTOR2I> v14BusWireAnchors;
+        std::set<std::tuple<uint32_t, int64_t, int64_t>> v14BusSidePoints;
 
         auto segmentKey = []( SHEET_ID aSheet, NET_ID aNet, const SOURCE_POINT& aStart, const SOURCE_POINT& aEnd )
         {
@@ -2390,9 +2515,25 @@ namespace
                 busLabel = wxS( "{" ) + bus->name.text + wxS( "}" );
             }
 
-            auto label = std::make_unique<SCH_LABEL>( pagePoint( bus->vertices.front(), pageHeight ), busLabel );
-            aScreen->Append( label.get() );
-            label.release();
+            // PADS_V15_GLOBAL_BUS_LABEL: same source global net record on
+            // multiple sheets -> global KiCad bus; otherwise retain local.
+            if( bus->globalNetRecordIndex
+                && v15SharedBusRecords.contains( *bus->globalNetRecordIndex ) )
+            {
+                auto label = std::make_unique<SCH_GLOBALLABEL>(
+                        pagePoint( bus->vertices.front(), pageHeight ), busLabel );
+                label->SetShape( LABEL_FLAG_SHAPE::L_UNSPECIFIED );
+                aScreen->Append( label.get() );
+                label.release();
+            }
+            else
+            {
+                auto label = std::make_unique<SCH_LABEL>(
+                        pagePoint( bus->vertices.front(), pageHeight ), busLabel );
+                aScreen->Append( label.get() );
+                label.release();
+            }
+
             ++aStaged.result.counts.labels;
 
             for( const MODEL_BUS_ENTRY& entry : bus->entries )
@@ -2488,6 +2629,50 @@ namespace
                     ++aStaged.result.counts.wires;
                 }
 
+                // PADS_V14_BUS_ENTRY_LABEL_ANCHOR: a bus-entry is graphics, not a
+                // scalar-net identifier. The continuation wire begins at entryEnd.
+                v14BusSidePoints.insert( { entry.memberNet.id.Value(),
+                                           entry.position.x, entry.position.y } );
+
+                if( entry.connectionRecordIndex )
+                {
+                    const auto connectionKey =
+                            std::make_pair( entry.memberNet.id.Value(), *entry.connectionRecordIndex );
+
+                    // A separate wire exists only when the bus-entry consumes
+                    // less than the first PADS segment. Otherwise leave the
+                    // authored label at its next source vertex.
+                    if( entryEnd != end )
+                        v14BusWireAnchors.try_emplace( connectionKey, entryEnd );
+
+                    for( const MODEL_LABEL* sourceLabel :
+                         MODEL_INDEX::ForSheet( aIndex.labelsBySheet, aSourceSheet.id ) )
+                    {
+                        if( !sourceLabel->netNameBusEntryRecordIndex
+                            || *sourceLabel->netNameBusEntryRecordIndex != entry.source.recordIndex )
+                        {
+                            continue;
+                        }
+
+                        if( sourceLabel->text.text != ownerNet->second->name.text
+                            || sourceLabel->position.x != adjacentPoint.x
+                            || sourceLabel->position.y != adjacentPoint.y )
+                        {
+                            THROW_IO_ERROR( FormatParserError( sourceLabel->source,
+                                            wxS( "NETNAMES bus-entry source/connection mismatch" ) ) );
+                        }
+
+                        const VECTOR2I actualWireAnchor = entryEnd != end ? entryEnd : end;
+
+                        if( !v14BusLabelAnchors.emplace( sourceLabel, actualWireAnchor ).second
+                            || !v14BusLabelConnections.emplace( sourceLabel, connectionKey ).second )
+                        {
+                            THROW_IO_ERROR( FormatParserError( sourceLabel->source,
+                                            wxS( "NETNAMES bus-entry has duplicate ownership" ) ) );
+                        }
+                    }
+                }
+
                 busEntrySegments.insert(
                         segmentKey( aSourceSheet.id, entry.memberNet.id, entry.position, adjacentPoint ) );
                 ++aStaged.result.counts.busEntries;
@@ -2496,6 +2681,101 @@ namespace
 
         for( const MODEL_NET* net : MODEL_INDEX::ForSheet( aIndex.netsBySheet, aSourceSheet.id ) )
         {
+            // PADS_V14_ELECTRICAL_ISLANDS_BEGIN: only v0x000D. The legacy v9
+            // label fallback must retain its previous behavior.
+            const bool v14UseIslands = aSourceSheet.source.version == 0x000D;
+            std::vector<size_t> v14Parent( net->connections.size() );
+
+            for( size_t i = 0; i < v14Parent.size(); ++i )
+                v14Parent[i] = i;
+
+            auto v14FindRoot = [&]( size_t index )
+            {
+                while( v14Parent[index] != index )
+                {
+                    v14Parent[index] = v14Parent[v14Parent[index]];
+                    index = v14Parent[index];
+                }
+
+                return index;
+            };
+
+            std::set<size_t> v14GroupsWithLabels;
+            std::set<size_t> v14EmittedGroupLabels;
+
+            if( v14UseIslands )
+            {
+                // Only a proven shared, non-bus-side PADS vertex merges two
+                // connection records. Unknown crossings remain separate.
+                std::map<std::pair<int64_t, int64_t>, size_t> pointOwners;
+
+                for( size_t i = 0; i < net->connections.size(); ++i )
+                {
+                    for( const SOURCE_POINT& point : net->connections[i].vertices )
+                    {
+                        if( v14BusSidePoints.contains(
+                                { net->id.Value(), point.x, point.y } ) )
+                        {
+                            continue;
+                        }
+
+                        auto [previous, inserted] = pointOwners.emplace(
+                                std::make_pair( point.x, point.y ), i );
+
+                        if( !inserted )
+                            v14Parent[v14FindRoot( i )] = v14FindRoot( previous->second );
+                    }
+                }
+
+                // A visible PADS label on any wire in the island makes the
+                // synthetic fallback unnecessary for the entire island.
+                for( size_t i = 0; i < net->connections.size(); ++i )
+                {
+                    const MODEL_CONNECTION& candidateConnection = net->connections[i];
+                    const bool hasActualLabel = std::ranges::any_of(
+                            MODEL_INDEX::ForSheet( aIndex.labelsBySheet, aSourceSheet.id ),
+                            [&]( const MODEL_LABEL* label )
+                            {
+                                if( ( label->kind != MODEL_LABEL_KIND::GLOBAL
+                                      && label->kind != MODEL_LABEL_KIND::POWER
+                                      && label->kind != MODEL_LABEL_KIND::GROUND )
+                                    || label->text.text != net->name.text )
+                                {
+                                    return false;
+                                }
+
+                                // Exact PADS connection ownership wins over
+                                // coincidences at the bus edge.
+                                if( label->netNameBusEntryRecordIndex )
+                                {
+                                    auto owner = v14BusLabelConnections.find( label );
+                                    return owner != v14BusLabelConnections.end()
+                                           && owner->second.first == net->id.Value()
+                                           && owner->second.second
+                                                      == static_cast<uint32_t>( candidateConnection.source.recordIndex );
+                                }
+
+                                auto atLabel = [&]( const SOURCE_POINT& point )
+                                {
+                                    return label->position.x == point.x
+                                           && label->position.y == point.y;
+                                };
+
+                                return std::ranges::any_of( candidateConnection.vertices, atLabel )
+                                       || std::ranges::any_of(
+                                               candidateConnection.endpoints,
+                                               [&]( const MODEL_CONNECTION_ENDPOINT& endpoint )
+                                               {
+                                                   return atLabel( endpoint.point );
+                                               } );
+                            } );
+
+                    if( hasActualLabel )
+                        v14GroupsWithLabels.insert( v14FindRoot( i ) );
+                }
+            }
+            // PADS_V14_ELECTRICAL_ISLANDS_END
+
             for( const MODEL_CONNECTION& connection : net->connections )
             {
                 if( connection.vertices.size() < 2 )
@@ -2531,6 +2811,40 @@ namespace
                                                                    connection.vertices[1] ) ) )
                     labelPoint = connection.vertices[1];
 
+                // v14: choose a real wire-side point instead of a resistor pin
+                // when possible. This does not alter wire geometry or net IDs.
+                VECTOR2I v14FallbackPoint = pagePoint( labelPoint, pageHeight );
+
+                if( v14UseIslands )
+                {
+                    auto preferred = v14BusWireAnchors.find(
+                            { net->id.Value(), static_cast<uint32_t>( connection.source.recordIndex ) } );
+
+                    if( preferred != v14BusWireAnchors.end() )
+                    {
+                        v14FallbackPoint = preferred->second;
+                    }
+                    else
+                    {
+                        for( const SOURCE_POINT& vertex : connection.vertices )
+                        {
+                            if( v14BusSidePoints.contains(
+                                    { net->id.Value(), vertex.x, vertex.y } ) )
+                            {
+                                continue;
+                            }
+
+                            const VECTOR2I candidate = pagePoint( vertex, pageHeight );
+
+                            if( !connectedPinPoints.contains( { candidate.x, candidate.y } ) )
+                            {
+                                v14FallbackPoint = candidate;
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 // Suppress the synthetic net-name label when this connection already
                 // terminates on an explicit PADS label.  The fallback label point is
                 // intentionally biased toward a pin endpoint, while an off-page/global
@@ -2558,11 +2872,69 @@ namespace
                                     } );
                         } );
 
-                if( !hasSourceLabel )
+                // PADS_NETNAMES_V13_BEGIN: suppress hidden fallback only for a real wire label
+                // NETNAMES labels are anchored on pin endpoints or on the first wire
+                // vertex after a bus entry, which may differ from labelPoint.
+                // Only suppress the invisible connectivity fallback for the SAME
+                // electrical connection; other disjoint connections retain it.
+                const bool hasNetnamesElectricalLabel = std::ranges::any_of(
+                        MODEL_INDEX::ForSheet( aIndex.labelsBySheet, aSourceSheet.id ),
+                        [&]( const MODEL_LABEL* aLabel )
+                        {
+                            if( ( aLabel->kind != MODEL_LABEL_KIND::GLOBAL
+                                  && aLabel->kind != MODEL_LABEL_KIND::POWER
+                                  && aLabel->kind != MODEL_LABEL_KIND::GROUND )
+                                || aLabel->text.text != net->name.text )
+                            {
+                                return false;
+                            }
+
+                            const auto atLabel = [&]( const SOURCE_POINT& aPoint )
+                            {
+                                return aLabel->position.x == aPoint.x
+                                       && aLabel->position.y == aPoint.y;
+                            };
+
+                            return std::ranges::any_of( connection.vertices, atLabel )
+                                   || std::ranges::any_of(
+                                              connection.endpoints,
+                                              [&]( const MODEL_CONNECTION_ENDPOINT& aEndpoint )
+                                              {
+                                                  return atLabel( aEndpoint.point );
+                                              } );
+                        } );
+                // PADS_NETNAMES_V13_END
+
+                // Emit only once for each explicitly proven electrical island.
+                // The exact original per-connection behavior remains for v0x0009.
+                if( !hasSourceLabel && !hasNetnamesElectricalLabel
+                    && ( !v14UseIslands
+                         || ( !v14GroupsWithLabels.contains(
+                                      v14FindRoot( static_cast<size_t>(
+                                              &connection - net->connections.data() ) ) )
+                              && v14EmittedGroupLabels.insert(
+                                      v14FindRoot( static_cast<size_t>(
+                                              &connection - net->connections.data() ) ) ).second ) ) )
                 {
-                    auto label =
-                            std::make_unique<SCH_GLOBALLABEL>( pagePoint( labelPoint, pageHeight ), net->name.text );
-                    label->SetTextSize( VECTOR2I( 1, 1 ) );
+                    // PADS_V15_LOCAL_MEMBER_FALLBACK: global bus labels
+                    // carry shared member nets between sheets. Other nets keep
+                    // the conservative global fallback until netlist verification.
+                    std::unique_ptr<SCH_ITEM> label;
+
+                    if( v15LocalMemberNets.contains( net->id ) )
+                    {
+                        auto localLabel = std::make_unique<SCH_LABEL>(
+                                v14FallbackPoint, net->name.text );
+                        localLabel->SetTextSize( VECTOR2I( 1, 1 ) );
+                        label = std::move( localLabel );
+                    }
+                    else
+                    {
+                        auto globalLabel = std::make_unique<SCH_GLOBALLABEL>(
+                                v14FallbackPoint, net->name.text );
+                        globalLabel->SetTextSize( VECTOR2I( 1, 1 ) );
+                        label = std::move( globalLabel );
+                    }
                     aScreen->Append( label.get() );
                     label.release();
                 }
@@ -2580,6 +2952,10 @@ namespace
         for( const MODEL_LABEL* labelPointer : MODEL_INDEX::ForSheet( aIndex.labelsBySheet, aSourceSheet.id ) )
         {
             const MODEL_LABEL& label = *labelPointer;
+            const auto v14Relocated = v14BusLabelAnchors.find( labelPointer );
+            const VECTOR2I v14LabelPosition = v14Relocated == v14BusLabelAnchors.end()
+                                                ? pagePoint( label.position, pageHeight )
+                                                : v14Relocated->second;
 
             const SOURCE_POINT* adjacentWirePoint = nullptr;
             auto adjacency = aIndex.endpointAdjacencyBySheet.find(
@@ -2602,10 +2978,19 @@ namespace
 
             case MODEL_LABEL_KIND::GLOBAL:
             {
-                auto globalLabel =
-                        std::make_unique<SCH_GLOBALLABEL>( pagePoint( label.position, pageHeight ), label.text.text );
-                globalLabel->SetShape( LABEL_FLAG_SHAPE::L_UNSPECIFIED );
-                item = std::move( globalLabel );
+                if( label.netNameMemberNetId
+                    && v15LocalMemberNets.contains( *label.netNameMemberNetId ) )
+                {
+                    // PADS_V15_LOCAL_NETNAME: normal KiCad bus member label.
+                    item = std::make_unique<SCH_LABEL>( v14LabelPosition, label.text.text );
+                }
+                else
+                {
+                    auto globalLabel =
+                            std::make_unique<SCH_GLOBALLABEL>( v14LabelPosition, label.text.text );
+                    globalLabel->SetShape( LABEL_FLAG_SHAPE::L_UNSPECIFIED );
+                    item = std::move( globalLabel );
+                }
                 break;
             }
 
