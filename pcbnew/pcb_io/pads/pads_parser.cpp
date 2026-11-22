@@ -719,7 +719,13 @@ void PARSER::parseSectionPARTS( std::ifstream& aStream )
                                  || visible_str == "BOTH" );
                 attr.mirrored = ( mirrored_str == "M" );
                 iss_attr >> right_reading_str;
-                attr.right_reading = ( right_reading_str == "Y" || right_reading_str == "ORTHO" );
+
+                if( right_reading_str == "ORTHO" || right_reading_str == "Y" )
+                    attr.right_reading = RIGHT_READING::ORTHO;
+                else if( right_reading_str == "ANGLED" )
+                    attr.right_reading = RIGHT_READING::ANGLED;
+                else
+                    attr.right_reading = RIGHT_READING::NONE;
             }
 
             if( m_has_font_lines )
@@ -1612,7 +1618,13 @@ void PARSER::parseSectionPARTDECAL( std::ifstream& aStream )
                                   || type_token == "BOTH" );
                  attr.mirrored = ( mirrored_str == "M" );
                  ss >> right_reading_str;
-                 attr.right_reading = ( right_reading_str == "Y" || right_reading_str == "ORTHO" );
+
+                 if( right_reading_str == "ORTHO" || right_reading_str == "Y" )
+                     attr.right_reading = RIGHT_READING::ORTHO;
+                 else if( right_reading_str == "ANGLED" )
+                     attr.right_reading = RIGHT_READING::ANGLED;
+                 else
+                     attr.right_reading = RIGHT_READING::NONE;
              }
 
              attr.font_info = fontLine;
@@ -4330,7 +4342,13 @@ void PARSER::parseSectionJUMPER( std::ifstream& aStream )
                                  visible_str == "BOTH" );
                 attr.mirrored = ( mirrored_str == "M" || mirrored_str == "1" );
                 ss_attr >> right_reading_str;
-                attr.right_reading = ( right_reading_str == "Y" || right_reading_str == "ORTHO" );
+
+                if( right_reading_str == "ORTHO" || right_reading_str == "Y" )
+                    attr.right_reading = RIGHT_READING::ORTHO;
+                else if( right_reading_str == "ANGLED" )
+                    attr.right_reading = RIGHT_READING::ANGLED;
+                else
+                    attr.right_reading = RIGHT_READING::NONE;
             }
 
             if( m_has_font_lines )

@@ -169,6 +169,13 @@ struct DESIGN_RULES
     bool IsSpecified( DESIGN_RULE_FIELD aField ) const { return ( specified & static_cast<unsigned>( aField ) ) != 0; }
 };
 
+enum class RIGHT_READING
+{
+    NONE,
+    ORTHO,
+    ANGLED
+};
+
 struct ATTRIBUTE
 {
     // Line 1
@@ -182,7 +189,7 @@ struct ATTRIBUTE
     bool mirrored = false;
     std::string hjust;
     std::string vjust;
-    bool right_reading = false;
+    RIGHT_READING right_reading = RIGHT_READING::NONE;
 
     // Binary PADS placement-field rendered world AABB. ASCII files do not
     // serialize this information, so has_bbox remains false there.

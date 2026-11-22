@@ -748,7 +748,8 @@ void PCB_IO_PADS_BINARY::loadFootprints()
             EDA_ANGLE partAngle( padsPart.rotation, DEGREES_T );
             RotatePoint( offset, partAngle );
 
-            EDA_ANGLE textAngle( attribute.orientation + padsPart.rotation, DEGREES_T );
+            EDA_ANGLE padsTextAngle( attribute.orientation + padsPart.rotation, DEGREES_T );
+            EDA_ANGLE textAngle = padsTextAngle;
 
             // PADS binary direct-import test v2.9: preserve PADS field anchor.
             // A serialized placement-field bbox gives us enough information to fit
@@ -761,45 +762,95 @@ void PCB_IO_PADS_BINARY::loadFootprints()
                 RotatePoint( textShift, textAngle );
             }
 
+            const bool keepUpright =
+                    attribute.right_reading == PADS_IO::RIGHT_READING::ANGLED;
+
+            if( keepUpright )
+            {
+                while( textAngle > ANGLE_90 )
+                    textAngle -= ANGLE_180;
+
+                while( textAngle <= -ANGLE_90 )
+                    textAngle += ANGLE_180;
+            }
+
             // PADS Romansim v3.6 anchor metric correction.
             if( padsRomansim )
             {
                 VECTOR2I metricShift = m_converter->GetPadsRomansimAnchorCorrection(
                         attribute.vjust, scaledSize, field->GetTextThickness(), attribute.mirrored );
-                RotatePoint( metricShift, textAngle );
+                RotatePoint( metricShift, padsTextAngle );
                 textShift += metricShift;
             }
 
+            EDA_ANGLE rightReadingDelta = textAngle - padsTextAngle;
+            rightReadingDelta.Normalize();
+
+            const bool rightReadingFlipped180 =
+                    attribute.right_reading == PADS_IO::RIGHT_READING::ANGLED
+                    && ( rightReadingDelta == ANGLE_180 || rightReadingDelta == -ANGLE_180 );
+
             field->SetPosition( footprint->GetPosition() + offset + textShift );
             field->SetTextAngle( textAngle );
-            field->SetKeepUpright( false );
+
+            field->SetKeepUpright( keepUpright );
             field->SetVisible( attribute.visible );
 
             if( attribute.hjust == "LEFT" )
-                field->SetHorizJustify( GR_TEXT_H_ALIGN_LEFT );
+            {
+                field->SetHorizJustify( rightReadingFlipped180
+                                                ? GR_TEXT_H_ALIGN_RIGHT
+                                                : GR_TEXT_H_ALIGN_LEFT );
+            }
             else if( attribute.hjust == "RIGHT" )
-                field->SetHorizJustify( GR_TEXT_H_ALIGN_RIGHT );
+            {
+                field->SetHorizJustify( rightReadingFlipped180
+                                                ? GR_TEXT_H_ALIGN_LEFT
+                                                : GR_TEXT_H_ALIGN_RIGHT );
+            }
             else
+            {
                 field->SetHorizJustify( GR_TEXT_H_ALIGN_CENTER );
+            }
 
             // PADS Romansim v3.5.2 field vertical-justify mapping.
             if( padsRomansim )
             {
                 if( attribute.vjust == "UP" )
-                    field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                {
+                    field->SetVertJustify( rightReadingFlipped180
+                                                   ? GR_TEXT_V_ALIGN_BOTTOM
+                                                   : GR_TEXT_V_ALIGN_TOP );
+                }
                 else if( attribute.vjust == "DOWN" )
-                    field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+                {
+                    field->SetVertJustify( rightReadingFlipped180
+                                                   ? GR_TEXT_V_ALIGN_TOP
+                                                   : GR_TEXT_V_ALIGN_BOTTOM );
+                }
                 else
+                {
                     field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                }
             }
             else
             {
                 if( attribute.vjust == "UP" )
-                    field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+                {
+                    field->SetVertJustify( rightReadingFlipped180
+                                                   ? GR_TEXT_V_ALIGN_TOP
+                                                   : GR_TEXT_V_ALIGN_BOTTOM );
+                }
                 else if( attribute.vjust == "DOWN" )
-                    field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                {
+                    field->SetVertJustify( rightReadingFlipped180
+                                                   ? GR_TEXT_V_ALIGN_BOTTOM
+                                                   : GR_TEXT_V_ALIGN_TOP );
+                }
                 else
+                {
                     field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                }
             }
 
             if( !padsRomansim && attribute.has_bbox )

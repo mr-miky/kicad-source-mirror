@@ -577,7 +577,6 @@ void BINARY_PARSER::parsePadStacks()
 
         if( m_sdb.RecordAt( base ).U8( layout.markerOff ) != 0xFE )
             continue;
-
         PAD_STACK_LAYER defaultLayer = readLayer( base );
 
         // Slotted-drill metadata is carried by the following physical padstack record. Bit 3
@@ -659,7 +658,6 @@ void BINARY_PARSER::parsePadStacks()
 
                 if( shapeIt == PAD_SHAPE_NAMES.end() )
                     continue;
-
                 PAD_STACK_LAYER layer = defaultLayer;
                 layer.layer = selector == 0      ? 0
                               : selector == 0xFF ? -1
@@ -972,7 +970,6 @@ void BINARY_PARSER::parsePartDecals()
     {
         if( name.empty() )
             continue;
-
         PART_DECAL decal;
         decal.name = name;
         decal.units = "M";
@@ -1103,7 +1100,6 @@ void BINARY_PARSER::assignDefaultPadStacks()
     {
         if( decal.terminals.empty() )
             continue;
-
         if( !m_padStackPool.empty() && !m_padStackPool[0].empty() )
         {
             decal.pad_stacks[0] = m_padStackPool[0];
@@ -1190,7 +1186,6 @@ void BINARY_PARSER::parseNetNamesNew()
 
         if( name.empty() || !isValidNetName( name ) || !existing.insert( name ).second )
             continue;
-
         NET net;
         net.name = name;
         m_nets.push_back( net );
@@ -1314,7 +1309,6 @@ void BINARY_PARSER::parseNetConnectionsNew()
     {
         if( anchor.netIndex >= m_nets.size() || anchor.terminalOrdinal == 0 )
             continue;
-
         const size_t root = findRoot( intern( { anchor.placementObject, anchor.terminalOrdinal } ) );
         auto [it, inserted] = componentNet.emplace( root, anchor.netIndex );
 
@@ -1341,7 +1335,6 @@ void BINARY_PARSER::parseNetConnectionsNew()
 
         if( netIt == componentNet.end() )
             continue;
-
         const auto [placementObject, terminalOrdinal] = pins[index];
         m_netConnectionEndpoints.push_back( { netIt->second, placementObject, terminalOrdinal } );
 
@@ -1436,7 +1429,6 @@ void BINARY_PARSER::parseNetNamesOld()
 
         if( name.empty() || !isValidNetName( name ) )
             continue;
-
         m_sec23IndexToNet[static_cast<uint32_t>( i )] = name;
 
         if( existing.insert( name ).second )
@@ -1614,7 +1606,6 @@ void BINARY_PARSER::parseNetConnectionsOld()
 
         if( !netRecordName( offset, name, count, edgeIndex, anchorObject, anchorOrdinal ) || !isValidNetName( name ) )
             continue;
-
         if( edgeIndex >= stream.size() )
             THROW_IO_ERROR( "Invalid PADS legacy net edge reference" );
 
@@ -1643,7 +1634,6 @@ void BINARY_PARSER::parseNetConnectionsOld()
         {
             if( findRoot( conn.pinA ) != root )
                 continue;
-
             m_netConnectionEndpoints.push_back( { netIt->second, conn.objectA, conn.ordinalA } );
             m_netConnectionEndpoints.push_back( { netIt->second, conn.objectB, conn.ordinalB } );
         }
@@ -1740,12 +1730,10 @@ std::vector<NET_CLASS_RULE_EDGE> BINARY_PARSER::collectNetClassRuleEdges( const 
 
         if( rec.U32( SCOPE_TYPE ) != NET_CLASS_SCOPE )
             continue;
-
         uint32_t owner = rec.U32( SCOPE_REFERENCE );
 
         if( !aOwnerSet.count( owner ) )
             continue;
-
         edges.push_back( { owner, rec.U32( RULE_KIND ), rec.U32( RULE_DETAIL_HANDLE ),
                            static_cast<int>( rec.U32( LAYER ) ), off } );
     }
@@ -1763,7 +1751,6 @@ void BINARY_PARSER::applyNetClassClearances( const std::vector<NET_CLASS_RULE_ED
     {
         if( e.ruleKind != CLEARANCE_RULE_KIND )
             continue;
-
         auto owner = aOwnerOrdinal.find( e.owner );
 
         if( owner != aOwnerOrdinal.end() )
@@ -1796,22 +1783,18 @@ void BINARY_PARSER::applyNetClassClearances( const std::vector<NET_CLASS_RULE_ED
     {
         if( edge.ruleKind != CLEARANCE_RULE_KIND || edge.layer != 0 || edge.rulePtr < firstClearanceHandle )
             continue;
-
         uint32_t delta = edge.rulePtr - firstClearanceHandle;
 
         if( delta % valueStride != 0 )
             continue;
-
         uint32_t index = delta / valueStride;
 
         if( index >= values->physicalCount )
             continue;
-
         auto owner = aOwnerOrdinal.find( edge.owner );
 
         if( owner == aOwnerOrdinal.end() )
             continue;
-
         SDB_RECORD         value = m_sdb.RecordAt( values->physicalOffset + index * valueStride );
         BIN_NET_CLASS_DEF& netClass = m_netClasses[owner->second];
 
@@ -1873,7 +1856,6 @@ void BINARY_PARSER::parseDiffPairs()
 
         if( !seen.insert( { nameA, nameB } ).second )
             continue;
-
         double  gapOverride = obj.F64( GAP_OVERRIDE );
         double  gap = ( gapOverride != F64_INHERIT ) ? gapOverride : obj.F64( GAP_INHERIT );
         int32_t widthOverride = obj.I32( WIDTH_OVERRIDE );
@@ -1983,19 +1965,16 @@ void BINARY_PARSER::parseTextRecords()
 
             if( metadata.U16( 4 ) != 0xFFFE )
                 continue;
-
             const uint32_t presentation = metadata.U32( 24 );
             const uint8_t  fieldKind = static_cast<uint8_t>( presentation >> 16 );
             const uint8_t  labelType = fieldKind & 0x07U; // PADS binary direct-import test v2.7: fieldKind base-type mask
 
             if( labelType != 0x02 && labelType != 0x03 )
                 continue;
-
             const int32_t ownerIndex = resolveDecalFieldOwner( fieldIndex );
 
             if( ownerIndex < 0 )
                 continue;
-
             const std::string& decalName = m_decalNameTable[static_cast<size_t>( ownerIndex )];
             auto               decalIt = m_decals.find( decalName );
 
@@ -2020,17 +1999,57 @@ void BINARY_PARSER::parseTextRecords()
 
             const uint8_t displayMode = fieldKind & 0xE0U;
             attribute.visible = displayMode != 0x00U;
-            attribute.right_reading = ( fieldKind & 0x18U ) == 0x08U;
-
-            if( ( presentation & 0x11000000U ) == 0x11000000U )
+            switch( fieldKind & 0x18U )
             {
-                attribute.hjust = "CENTER";
-                attribute.vjust = "CENTER";
+            case 0x08U:
+                attribute.right_reading = RIGHT_READING::ORTHO;
+                break;
+            case 0x10U:
+                attribute.right_reading = RIGHT_READING::ANGLED;
+                break;
+            default:
+                attribute.right_reading = RIGHT_READING::NONE;
+                break;
             }
-            else
+
+            const uint8_t justify = static_cast<uint8_t>( presentation >> 24 );
+
+            switch( justify & 0x03U )
             {
+            case 0:
                 attribute.hjust = "LEFT";
-                attribute.vjust = ( presentation & 0x20000000U ) ? "UP" : "DOWN";
+                break;
+
+            case 1:
+                attribute.hjust = "CENTER";
+                break;
+
+            case 2:
+                attribute.hjust = "RIGHT";
+                break;
+
+            default:
+                attribute.hjust = "CENTER";
+                break;
+            }
+
+            switch( ( justify >> 4 ) & 0x03U )
+            {
+            case 0:
+                attribute.vjust = "DOWN";
+                break;
+
+            case 1:
+                attribute.vjust = "CENTER";
+                break;
+
+            case 2:
+                attribute.vjust = "UP";
+                break;
+
+            default:
+                attribute.vjust = "CENTER";
+                break;
             }
 
             auto& attrs = decalIt->second.attributes;
@@ -2094,7 +2113,6 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
 
             if( metadata.U16( 4 ) != 0xFFFE )
                 continue;
-
             uint32_t association = metadata.U32( 12 );
             uint8_t  associationKind = static_cast<uint8_t>( association >> 24 );
             uint32_t target = association & 0x00FFFFFFU;
@@ -2122,12 +2140,10 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
         {
             if( placementOwner[terminal] < 0 )
                 continue;
-
             size_t partIndex = static_cast<size_t>( placementOwner[terminal] );
 
             if( m_partFieldStart.count( partIndex ) )
                 continue;
-
             uint32_t           head = terminal;
             std::set<uint32_t> visited;
 
@@ -2147,7 +2163,6 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
     {
         if( fieldStart < 0 )
             continue;
-
         if( partIndex >= m_parts.size() || static_cast<uint32_t>( fieldStart ) >= aText.physicalCount )
             THROW_IO_ERROR( "Invalid PADS placement field-presentation link" );
 
@@ -2167,19 +2182,61 @@ void BINARY_PARSER::parsePlacementFields( const SDB_SECTION& aText, size_t aReco
             SDB_RECORD metadata = m_sdb.RecordAt( aRecordBase + static_cast<size_t>( fieldIndex + 1 ) * aRecordSize );
             uint32_t   presentation = metadata.U32( 24 );
             uint8_t    fieldKind = static_cast<uint8_t>( presentation >> 16 );
+
+
             const uint8_t displayMode = fieldKind & 0xE0U;
             attribute.visible = displayMode != 0x00U;
-            attribute.right_reading = ( fieldKind & 0x18U ) == 0x08U;
-
-            if( ( presentation & 0x11000000U ) == 0x11000000U )
+            switch( fieldKind & 0x18U )
             {
-                attribute.hjust = "CENTER";
-                attribute.vjust = "CENTER";
+            case 0x08U:
+                attribute.right_reading = RIGHT_READING::ORTHO;
+                break;
+            case 0x10U:
+                attribute.right_reading = RIGHT_READING::ANGLED;
+                break;
+            default:
+                attribute.right_reading = RIGHT_READING::NONE;
+                break;
             }
-            else
+
+            const uint8_t justify = static_cast<uint8_t>( presentation >> 24 );
+
+            switch( justify & 0x03U )
             {
+            case 0:
                 attribute.hjust = "LEFT";
-                attribute.vjust = ( presentation & 0x20000000U ) ? "UP" : "DOWN";
+                break;
+
+            case 1:
+                attribute.hjust = "CENTER";
+                break;
+
+            case 2:
+                attribute.hjust = "RIGHT";
+                break;
+
+            default:
+                attribute.hjust = "CENTER";
+                break;
+            }
+
+            switch( ( justify >> 4 ) & 0x03U )
+            {
+            case 0:
+                attribute.vjust = "DOWN";
+                break;
+
+            case 1:
+                attribute.vjust = "CENTER";
+                break;
+
+            case 2:
+                attribute.vjust = "UP";
+                break;
+
+            default:
+                attribute.vjust = "CENTER";
+                break;
             }
 
             if( ( fieldKind & 0x07U ) == 0x03 )
@@ -2241,7 +2298,6 @@ void BINARY_PARSER::parseFreeText( const SDB_SECTION& aText, size_t aRecordBase,
 
         if( meta.U16( 4 ) != 0xFFFE || meta.U32( 12 ) != 0 || ( aRecordSize == 72 && meta.U32( 28 ) != 0x49000000 ) )
             continue;
-
         uint32_t layerWord = meta.U32( 24 );
 
         // PADS binary direct-import test v2.3: free-text justification.
@@ -2274,7 +2330,6 @@ void BINARY_PARSER::parseFreeText( const SDB_SECTION& aText, size_t aRecordBase,
 
         if( content.empty() )
             continue;
-
         int32_t height = geom.I32( aRingRotation );
         int32_t linewidth = geom.I32( aRingRotation + 4 );
         int32_t x = geom.I32( aRingRotation + 8 );
@@ -2478,7 +2533,6 @@ std::map<uint32_t, size_t> BINARY_PARSER::parseRouteJunctionNets() const
 
         if( !netIndex )
             continue;
-
         auto [it, inserted] = result.emplace( junctionIndex, *netIndex );
 
         if( !inserted && it->second != *netIndex )
@@ -2512,7 +2566,6 @@ void BINARY_PARSER::parseRouteVertices()
     {
         if( route.tracks.empty() && route.vias.empty() )
             continue;
-
         m_routes.push_back( std::move( route ) );
     }
 }
@@ -2563,7 +2616,6 @@ std::vector<BINARY_PARSER::VIA_LOCATION> BINARY_PARSER::decodeViaLocations()
 
         if( netIt == junctionNets.end() )
             continue;
-
         if( netIt->second >= m_nets.size() || typeBytes[junction] < 27 )
             THROW_IO_ERROR( "Invalid PADS route-junction net mapping" );
 
@@ -2584,10 +2636,8 @@ std::vector<BINARY_PARSER::VIA_LOCATION> BINARY_PARSER::decodeViaLocations()
 
         if( !isVia )
             continue;
-
         if( typeByte < 27 || !m_cursor.InBounds( typeByte - 27, 8 ) )
             continue;
-
         int32_t vx = m_cursor.I32At( typeByte - 27 );
         int32_t vy = m_cursor.I32At( typeByte - 23 );
 
@@ -2937,7 +2987,6 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
 
         if( track.points.size() < 2 )
             continue;
-
         auto                  handleIt = routeNodeNets.find( objectHandles[chunk.objectIndex] );
         std::optional<size_t> netIndex;
 
@@ -3132,7 +3181,6 @@ BINARY_PARSER::resolveRouteObjectNodes( const SDB_SECTION& aRouteLayers, size_t 
 
             if( linkedIt == routeNodeOrdinals.end() )
                 continue;
-
             routeNodeLinks[linkedIt->second].push_back( ordinal );
         }
     }
@@ -3168,7 +3216,6 @@ BINARY_PARSER::resolveRouteObjectNodes( const SDB_SECTION& aRouteLayers, size_t 
                 {
                     if( visitedStamp[linked] == static_cast<uint32_t>( root ) )
                         continue;
-
                     visitedStamp[linked] = static_cast<uint32_t>( root );
                     next.push_back( linked );
                 }
@@ -3208,7 +3255,6 @@ BINARY_PARSER::resolveRouteObjectNodes( const SDB_SECTION& aRouteLayers, size_t 
 
             if( handle == 0 )
                 continue;
-
             int padsLayer = padsLayerForSerializedIndex( layer );
             auto [layerIt, inserted] = routeHandleLayers.emplace( handle, padsLayer );
 
@@ -3271,17 +3317,14 @@ void BINARY_PARSER::parseCopperShapes()
     {
         if( name.size() < 4 || name.substr( 0, 3 ) != "DRW" )
             continue;
-
         const size_t ownerStride = m_version <= 0x2022 ? DRW_ITEM_V2022::SIZE : DRW_ITEM::SIZE;
 
         if( ( run.itemKind & 0xFFFFU ) != 3 )
             continue;
-
         uint32_t sec11Index = static_cast<uint32_t>( run.pieceStart );
 
         if( sec11Index >= sec11->count )
             continue;
-
         int32_t originX = ringI32( *sec10, DRW_ITEM::ROTATION, ownerStride, run.ownerIndex, DRW_ITEM::ORIGIN_X );
         int32_t originY = ringI32( *sec10, DRW_ITEM::ROTATION, ownerStride, run.ownerIndex, DRW_ITEM::ORIGIN_Y );
 
@@ -3309,7 +3352,6 @@ void BINARY_PARSER::parseCopperShapes()
 
             if( !fetchOwnerCirclePoints( name, p0, p1 ) )
                 continue;
-
             const double cx = ( p0.x + p1.x ) / 2.0;
             const double cy = ( p0.y + p1.y ) / 2.0;
             const double radius = std::hypot( p1.x - p0.x, p1.y - p0.y ) / 2.0;
@@ -3387,12 +3429,10 @@ void BINARY_PARSER::parseDimensions()
 
         if( name.size() < 4 || name.substr( 0, 3 ) != "DIM" )
             continue;
-
         auto it = m_ownerRuns.find( name );
 
         if( it == m_ownerRuns.end() )
             continue;
-
         int32_t startRow = it->second.vertexStart;
 
         int32_t bp1x = 0, bp1y = 0, bp2x = 0, bp2y = 0, arwx = 0, arwy = 0, attr = 0;
@@ -3514,7 +3554,6 @@ void BINARY_PARSER::buildOwnerRuns()
 
         if( name.empty() || m_ownerRuns.count( name ) )
             continue;
-
         uint32_t  lagIndex = ( ownerIndex + 1 ) % sec10->count;
         OWNER_RUN run;
         run.pieceStart = ringI32( *sec10, DRW_ITEM::ROTATION, stride, lagIndex, DRW_ITEM::PIECE_START );
@@ -3630,7 +3669,6 @@ void BINARY_PARSER::parseDecalGraphics()
 
         if( decalIt == m_decals.end() )
             continue;
-
         if( static_cast<uint64_t>( run.pieceStart ) + static_cast<uint64_t>( run.pieceCount ) > pieces->count )
             THROW_IO_ERROR( wxString::Format( "Invalid PADS decal piece range (%s)", name.c_str() ) );
 
@@ -3668,7 +3706,6 @@ void BINARY_PARSER::parseDecalGraphics()
             // use the same vertex pool; their +4 piece word is the restriction mask.
             if( kind != 0 && kind != 1 && kind != 2 && kind != 10 && kind != 11 )
                 continue;
-
             DECAL_ITEM item;
             item.type = kind == 0  ? "OPEN"
                         : kind == 1  ? "CLOSED"
@@ -3767,12 +3804,10 @@ void BINARY_PARSER::parseDecalGraphics()
 
             if( name.empty() )
                 continue;
-
             auto target = m_decals.find( name );
 
             if( target == m_decals.end() || !target->second.items.empty() )
                 continue;
-
             SDB_RECORD header = m_sdb.RecordAt(
                     headers->physicalOffset + static_cast<uint32_t>( index * recordSize ) );
             int32_t sourceIndex = header.I32( graphicOwnerOffset );
@@ -3814,7 +3849,6 @@ void BINARY_PARSER::parseBoardOutlineDirect()
     {
         if( ( run.itemKind & 0xFFFFU ) != 1 || run.pieceCount <= 0 || run.pieceStart < 0 || run.vertexStart < 0 )
             continue;
-
         if( static_cast<uint64_t>( run.pieceStart ) + static_cast<uint64_t>( run.pieceCount ) > pieces->count )
             THROW_IO_ERROR( "Invalid PADS board-outline piece range" );
 
@@ -4138,7 +4172,6 @@ void BINARY_PARSER::parseKeepouts()
     {
         if( ( run.itemKind & 0xFFFFU ) != 10 )
             continue;
-
         Owner owner;
         owner.name = name;
         owner.originX = ringI32( *sec10, DRW_ITEM::ROTATION, DRW_ITEM::SIZE, run.ownerIndex, DRW_ITEM::ORIGIN_X );
@@ -4193,7 +4226,6 @@ void BINARY_PARSER::parseKeepouts()
 
         if( spanX <= 0 || spanX != spanY )
             continue;
-
         constexpr int ELLIPSE_SEGMENTS = 32;
         double        cx = static_cast<double>( owner.minX + owner.maxX ) / 2.0;
         double        cy = static_cast<double>( owner.minY + owner.maxY ) / 2.0;
@@ -4319,7 +4351,6 @@ void BINARY_PARSER::parseCopperPours()
 
         if( pourOwner.type != TYPE_POUROUT || pourOwner.name.empty() )
             continue;
-
         int32_t child = pourOwner.childOrNextHat;
         std::set<uint32_t> visited;
 
@@ -4353,7 +4384,6 @@ void BINARY_PARSER::parseCopperPours()
 
         if( hatOwner.type != TYPE_HATOUT || !parentName.count( hatIndex ) )
             continue;
-
         int32_t child = hatOwner.childOrNextVoid;
         std::set<uint32_t> visited;
 
@@ -4686,17 +4716,14 @@ void BINARY_PARSER::linkPartsToDecals()
 
             if( !part.decal.empty() )
                 continue;
-
             auto hintIt = m_partDecalIndex.find( partIdx );
 
             if( hintIt == m_partDecalIndex.end() )
                 continue;
-
             uint32_t decalIndex = hintIt->second;
 
             if( decalIndex >= m_decalNameTable.size() )
                 continue;
-
             const std::string& decalName = m_decalNameTable[decalIndex];
 
             if( !decalName.empty() && m_decals.count( decalName ) )
@@ -4719,17 +4746,14 @@ void BINARY_PARSER::linkPartsToDecals()
 
         if( !part.decal.empty() )
             continue;
-
         auto hintIt = m_partTypeIndex.find( partIdx );
 
         if( hintIt == m_partTypeIndex.end() )
             continue;
-
         uint32_t partTypeIdx = hintIt->second;
 
         if( partTypeIdx >= m_partTypeDecalIndices.size() )
             continue;
-
         const std::vector<int32_t>& decalIndices = m_partTypeDecalIndices[partTypeIdx];
         int32_t                     decalIndex = decalIndices.empty() ? -1 : decalIndices.front();
 
@@ -4765,7 +4789,6 @@ void BINARY_PARSER::linkPartsToDecals()
 
         if( decalIndex < 0 || static_cast<size_t>( decalIndex ) >= m_decalNameTable.size() )
             continue;
-
         const std::string& decalName = m_decalNameTable[decalIndex];
 
         if( !decalName.empty() && m_decals.count( decalName ) )
