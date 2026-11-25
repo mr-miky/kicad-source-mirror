@@ -493,6 +493,7 @@ private:
     std::vector<NET_ANCHOR> m_netAnchors;
     std::vector<NET_ANCHOR> m_netConnectionEndpoints;
 
+
     // The serialized placement object ID is the nominal section-22 record ordinal plus 11.
     // Keep the object identity separate from m_parts order because invalid directory records
     // do not produce imported parts.

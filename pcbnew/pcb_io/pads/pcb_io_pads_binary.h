@@ -26,6 +26,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -106,6 +107,8 @@ private:
     const PADS_IO::BINARY_PARSER*       m_parser = nullptr;
     std::unique_ptr<PADS_PCB_CONVERTER> m_converter;
     int                                 m_minObjectSize = 1000;
+    int                                 m_testPointIndex = 1;
+    std::set<size_t>                    m_consumedTestPointTextIndices;
 
     // Binary-PADS requester state, reset to the historical defaults per load.
     bool m_importPadsTeardropMetadata = true;

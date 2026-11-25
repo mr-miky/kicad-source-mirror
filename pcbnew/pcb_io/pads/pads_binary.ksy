@@ -2774,16 +2774,20 @@ types:
   # =========================================================================
   # SECTION 5 — per-padstack pad-shape layer table
   # =========================================================================
-  # Flat array of 20-B or 24-B rows. Version v0x2022 geometry row j is at
-  # (section_5_index - 2 + j) modulo the row count. In v0x2027, section_5_index is the first
-  # geometry row. Both store selector/shape in each geometry row's serialized
-  # successor, including a trailing carrier after the declared rows.
+  # Flat array of 20-B or 24-B rows. In verified PowerPCB 4 / v0x2017 files,
+  # section_5_index is the first geometry row and selector/shape ownership is in
+  # that row's serialized successor. Version v0x2022 geometry row j is at
+  # (section_5_index - 2 + j) modulo the row count. In v0x2027, section_5_index is
+  # the first geometry row. These validated dialects store selector/shape in each
+  # geometry row's serialized successor, including a trailing carrier after the
+  # declared rows.
   # Rows before the first geometry row are a global default prefix.
   section_5_pad_layer_20_bytes:
     doc: |
       This is a legacy 20-byte pad-layer row. The selector and shape are the
       first two bytes. Dimensions start at +4. The value at +16 is an angle in
-      degrees times 1,800,000.
+      degrees times 1,800,000. In PowerPCB 4 / v0x2017, selector/shape in row
+      N+1 belong to the geometry stored in row N.
     seq:
       - id: layer_selector
         type: u1
@@ -5932,6 +5936,10 @@ types:
   # last record's 32-byte tail. Logical record 0 starts at physical +32. The last
   # record's remaining head closes the section. Modern logical records are 48 bytes.
   # Legacy records are 36 bytes. Width = quarter_width*4.
+  # In v0x2017, the legacy endpoint teardrop parameter pair is the record's
+  # trailing_tag (+32) followed by the next logical record's leading_tag (+36,
+  # crossing the ring boundary).  This was verified against a PowerPCB 4 ASCII
+  # export; other legacy versions still need independent validation.
   section_62_route_object_48_bytes:
     seq:
       - id: leading_tag

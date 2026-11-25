@@ -606,7 +606,12 @@ void BINARY_PARSER::parsePadStacks()
         uint32_t   layerStart = stackRec.U32( layout.layerStartOff );
         uint8_t    layerCount = stackRec.U8( layout.layerCountOff );
         bool       endCursor = m_version == 0x2022;
-        bool       successorMetadata = endCursor || m_version == 0x2027;
+        // PowerPCB 4 / v0x2017 uses the current row for geometry and the
+        // following serialized row for selector/shape ownership.  This is
+        // verified against 30382_F02.pcb and its PADS ASCII export: it
+        // reconstructs Top/Inner/Bottom/mask padstack rows exactly.
+        bool       successorMetadata =
+                m_version == 0x2017 || endCursor || m_version == 0x2027;
         bool       rawLayerSelector = successorMetadata;
 
         if( layerCount > 0
@@ -661,7 +666,8 @@ void BINARY_PARSER::parsePadStacks()
                 PAD_STACK_LAYER layer = defaultLayer;
                 layer.layer = selector == 0      ? 0
                               : selector == 0xFF ? -1
-                                                 : static_cast<int>( selector ) + ( rawLayerSelector ? 0 : 1 );
+                                                 : static_cast<int>( selector )
+                                                           + ( rawLayerSelector ? 0 : 1 );
                 layer.shape = shapeIt->second;
                 layer.sizeA = static_cast<double>( geometryRec.I32( 4 ) );
                 int32_t sizeB = geometryRec.I32( 8 );
@@ -2727,7 +2733,9 @@ std::map<std::string, ROUTE> BINARY_PARSER::seedRoutesFromVias( const std::vecto
 
         if( via.viaIndex >= 0 && static_cast<size_t>( via.viaIndex ) < m_decalNameTable.size() )
         {
-            auto decalIt = m_decals.find( m_decalNameTable[via.viaIndex] );
+            viaDef.name = m_decalNameTable[via.viaIndex];
+
+            auto decalIt = m_decals.find( viaDef.name );
 
             if( decalIt != m_decals.end() )
             {
@@ -2866,10 +2874,21 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
         object.width = static_cast<int32_t>( ringU32( ringStart, base + widthOffset ) ) * 4;
         object.style = ringU32( ringStart, base + ( legacyObjects ? 20 : 32 ) );
         object.cellCount = ringU32( ringStart, base + cellCountOffset );
-        // Binary teardrop endpoints v1.12. The final pair straddles the
-        // descriptor's logical ring boundary. Verified against ASCII exports.
-        // Older 36-byte dialects have not been validated for these fields.
-        if( !legacyObjects && m_version == 0x2026 )
+        // Binary teardrop endpoints v1.23.  In both known layouts the endpoint
+        // parameter pair occupies the descriptor tail followed by the next logical
+        // descriptor head, so the second word straddles the route-object ring.
+        //
+        // PowerPCB 4 / v0x2017 uses 36-byte descriptors.  Comparison of
+        // 30382_F02.pcb with its ASCII export identifies +32/+36 as the PADS
+        // teardrop words: the low fields decode to the exported 90/90 values and
+        // match the teardrop-bearing route endpoints.  Keep this restricted to
+        // v0x2017 until the other legacy dialects are validated independently.
+        if( legacyObjects && m_version == 0x2017 )
+        {
+            object.startTeardrop = ringU32( ringStart, base + 32 );
+            object.endTeardrop = ringU32( ringStart, base + 36 );
+        }
+        else if( !legacyObjects && m_version == 0x2026 )
         {
             object.startTeardrop = ringU32( ringStart, base + 44 );
             object.endTeardrop = ringU32( ringStart, base + 48 );
@@ -3023,24 +3042,36 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
     {
         ROUTE& route = aRoutes[decoded.netName];
         route.net_name = decoded.netName;
-        // Every routed-subpath end carries a parameter word; 0x80000 suppresses
-        // that end. Other high bits describe route state and are not enable bits.
+
+        // The route descriptor owns one parameter word per physical endpoint.
+        //
+        // PowerPCB 4 / binary v0x2017 does NOT encode a unique ASCII P/N side here:
+        // one section-62 route object can be shared by multiple section-24 pin-pair
+        // traversals and can therefore be P in one traversal and N in another.
+        // For that dialect preserve START/END only. The +32/+36 words remain attached
+        // to the same physical endpoints and therefore keep the imported copper exact.
+        //
+        // 0x80000 is a modern endpoint-suppression bit; do not apply that interpretation
+        // to the legacy v0x2017 state word.
         auto addTeardrop = [&]( bool aStart, uint32_t aWord )
         {
-            if( aWord == 0 || ( aWord & 0x00080000 ) != 0 )
+            if( aWord == 0 || ( !legacyObjects && ( aWord & 0x00080000 ) != 0 ) )
                 return;
 
             const TRACK& track = decoded.track;
+
             if( track.points.size() < 2 )
                 return;
 
             const auto& point = aStart ? track.points.front() : track.points.back();
             const auto& neighbour = aStart ? track.points[1]
-                                          : track.points[track.points.size() - 2];
+                                           : track.points[track.points.size() - 2];
+
             TEARDROP td;
             td.x = point.x;
             td.y = point.y;
             td.layer = track.layer;
+
             double length = aWord & 0x3FF;
             double width = ( aWord >> 10 ) & 0x7F;
             char shape = ( aWord & 0x40000 ) ? 'C' : ( aWord & 0x20000 ) ? 'L' : 'D';
@@ -3051,6 +3082,8 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
 
             if( aStart )
             {
+                // "next" is local polyline adjacency here, not an assertion that
+                // this physical endpoint is ASCII side N.
                 td.has_next = true;
                 td.next_connected = true;
                 td.next_point = { neighbour.x, neighbour.y };
@@ -3062,6 +3095,7 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
             }
             else
             {
+                // Likewise "previous" is local adjacency at the physical END.
                 td.has_previous = true;
                 td.previous_connected = true;
                 td.previous_point = { neighbour.x, neighbour.y };
@@ -3072,11 +3106,25 @@ void BINARY_PARSER::decodeRoutedCopper( std::map<std::string, ROUTE>& aRoutes )
                 td.previous_adjustable = adjustable;
             }
 
-            td.original_spec = fmt::format(
-                    "PADS binary 0x{:04X} TEARDROP {} {} {} {}{}; raw=0x{:08X}",
-                    m_version, aStart ? "N" : "P", width, length,
-                    shape == 'D' ? "" : shape == 'C' ? "C" : "L",
-                    adjustable ? "A" : "", aWord );
+            if( legacyObjects && m_version == 0x2017 )
+            {
+                td.logical_side_known = false;
+                td.physical_endpoint = aStart ? 'S' : 'E';
+                td.original_spec = fmt::format(
+                        "PADS binary 0x{:04X} endpoint {} {} {} {}{}; raw=0x{:08X}",
+                        m_version, aStart ? "START" : "END", width, length,
+                        shape == 'D' ? "" : shape == 'C' ? "C" : "L",
+                        adjustable ? "A" : "", aWord );
+            }
+            else
+            {
+                td.original_spec = fmt::format(
+                        "PADS binary 0x{:04X} TEARDROP {} {} {} {}{}; raw=0x{:08X}",
+                        m_version, aStart ? "N" : "P", width, length,
+                        shape == 'D' ? "" : shape == 'C' ? "C" : "L",
+                        adjustable ? "A" : "", aWord );
+            }
+
             route.teardrops.push_back( std::move( td ) );
         };
 

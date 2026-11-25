@@ -291,6 +291,15 @@ struct TEARDROP
 
     bool has_previous = false;
     bool has_next = false;
+
+    // Binary legacy route objects own physical START/END parameter words, but P/N belongs
+    // to a logical pin-pair traversal and is not a unique property of a shared route object.
+    // ASCII parsing and binary dialects with known logical adjacency leave this true.
+    bool logical_side_known = true;
+
+    // 'S'/'E' identify the physical START/END of a binary route object when
+    // logical_side_known is false. Zero means no separate physical-endpoint semantics.
+    char physical_endpoint = '\0';
 };
 
 struct JUMPER_MARKER

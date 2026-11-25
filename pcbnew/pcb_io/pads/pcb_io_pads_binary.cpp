@@ -187,6 +187,8 @@ void PCB_IO_PADS_BINARY::loadBoard( const wxString& aFileName, BOARD& aBoard, bo
     m_loadBoard = &aBoard;
     m_parser = &parser;
     m_converter = std::make_unique<PADS_PCB_CONVERTER>( m_loadBoard, m_reporter );
+    m_testPointIndex = 1;
+    m_consumedTestPointTextIndices.clear();
     // Activate the document alternate stroke font before any PADS text is created.
     if( m_importPadsRomansimFont )
         m_converter->PreparePadsRomansimFont();
@@ -212,7 +214,18 @@ void PCB_IO_PADS_BINARY::loadBoard( const wxString& aFileName, BOARD& aBoard, bo
         loadBoardOutline();
         loadGraphicLines();
         loadTracksAndVias();
-        m_converter->LoadTexts( m_parser->GetTexts() );
+
+        std::vector<PADS_IO::TEXT> remainingTexts;
+        const std::vector<PADS_IO::TEXT>& allTexts = m_parser->GetTexts();
+        remainingTexts.reserve( allTexts.size() - m_consumedTestPointTextIndices.size() );
+
+        for( size_t i = 0; i < allTexts.size(); ++i )
+        {
+            if( !m_consumedTestPointTextIndices.count( i ) )
+                remainingTexts.push_back( allTexts[i] );
+        }
+
+        m_converter->LoadTexts( remainingTexts );
         loadCopperShapes();
         loadZones();
         m_converter->LoadKeepouts( m_parser->GetKeepouts() );
@@ -222,6 +235,18 @@ void PCB_IO_PADS_BINARY::loadBoard( const wxString& aFileName, BOARD& aBoard, bo
         // ever load rules written beside the PADS source
         if( aIsNewLoad )
             m_converter->WriteDiffPairRules( aFileName, m_parser->GetDiffPairs() );
+
+        // PADS test-point ratsnest connectivity.
+        // Synthetic TP pads already carry the electrical PADS net via SetNet();
+        // the attached text is graphical only and must never be used to infer it.
+        // Rebuild once after all imported copper/footprints are present so newly
+        // created TESTPOINT pads participate immediately in KiCad connectivity.
+        if( !m_loadBoard->BuildConnectivity( nullptr ) && m_reporter )
+        {
+            m_reporter->Report(
+                    _( "Failed to rebuild connectivity after importing PADS test points." ),
+                    RPT_SEVERITY_WARNING );
+        }
 
         m_converter->ReportStatistics();
     }
@@ -1096,11 +1121,26 @@ void PCB_IO_PADS_BINARY::buildPad( FOOTPRINT* aFootprint, const PADS_IO::PART_DE
                 }
                 else
                 {
-                    int padsLayer = stackLayer.layer;
-                    kicadLayer = getMappedLayer( padsLayer );
+                    int          padsLayer = stackLayer.layer;
+                    PCB_LAYER_ID mappedLayer = getMappedLayer( padsLayer );
 
-                    if( kicadLayer != UNDEFINED_LAYER )
-                        layerSet.set( kicadLayer );
+                    // Pad-stack technical rows describe mask/paste presence and
+                    // opening size.  They are not copper shapes.  Applying their
+                    // geometry through PAD::SetShape()/SetSize() aliases the
+                    // FRONT/INNER/BACK padstack slot and can overwrite F.Cu
+                    // (observed on PowerPCB 4 DIP/SIP pads).
+                    if( mappedLayer == F_Mask || mappedLayer == B_Mask
+                        || mappedLayer == F_Paste || mappedLayer == B_Paste )
+                    {
+                        layerSet.set( mappedLayer );
+                        continue;
+                    }
+
+                    if( !IsCopperLayer( mappedLayer ) )
+                        continue;
+
+                    kicadLayer = mappedLayer;
+                    layerSet.set( kicadLayer );
                 }
 
                 if( kicadLayer != UNDEFINED_LAYER )
@@ -1188,11 +1228,19 @@ void PCB_IO_PADS_BINARY::buildPad( FOOTPRINT* aFootprint, const PADS_IO::PART_DE
         }
         else
         {
-            // Keep whatever mask and paste rows the stack carried, the way the ASCII path does
+            // Keep whatever mask and paste rows the stack carried, the way the ASCII path does.
+            // If parsePadStacks() supplied explicit copper-layer rows, buildPad() has already
+            // populated a FRONT_INNER_BACK padstack above.  Do not collapse it back to NORMAL
+            // here: legacy PADS boards can use different front/back shapes (for example a
+            // square top and round bottom through-hole pad), and losing that distinction also
+            // changes whether a PADS Default teardrop is valid on the back side.
             LSET maskPasteBits = layerSet & LSET( { F_Mask, B_Mask, F_Paste, B_Paste } );
 
-            pad->Padstack().SetMode( PADSTACK::MODE::NORMAL );
-            applyPadShape( pad, layerDef, F_Cu );
+            if( !hasExplicitLayers )
+            {
+                pad->Padstack().SetMode( PADSTACK::MODE::NORMAL );
+                applyPadShape( pad, layerDef, F_Cu );
+            }
 
             if( layerDef.plated )
             {
@@ -1484,6 +1532,12 @@ void PCB_IO_PADS_BINARY::loadGraphicLines()
 void PCB_IO_PADS_BINARY::loadTracksAndVias()
 {
     const auto& routes = m_parser->GetRoutes();
+    const std::vector<PADS_IO::TEXT>& texts = m_parser->GetTexts();
+    std::set<wxString> componentRefs;
+
+    for( const PADS_IO::PART& part : m_parser->GetParts() )
+        componentRefs.insert( PADS_COMMON::ConvertText( part.name ) );
+
     for( const auto& route : routes )
     {
         NETINFO_ITEM* net = nullptr;
@@ -1496,7 +1550,9 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
             {
                 if( m_reporter )
                 {
-                    m_reporter->Report( wxString::Format( _( "Route net '%s' not found, skipping" ), route.net_name ),
+                    m_reporter->Report(
+                            wxString::Format( _( "Route net '%s' not found, skipping" ),
+                                              route.net_name ),
                             RPT_SEVERITY_WARNING );
                 }
 
@@ -1511,16 +1567,15 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
 
             PCB_LAYER_ID track_layer = getMappedLayer( track_def.layer );
 
-            // An importer is best effort, and a route layer the user mapped to a non-copper
-            // layer is ordinary input, so drop the track rather than the whole board
             if( !IsCopperLayer( track_layer ) )
             {
                 if( m_reporter )
                 {
-                    m_reporter->Report( wxString::Format( _( "Skipped a route on non-copper or unmapped "
-                                                             "PADS layer %d." ),
-                                                          track_def.layer ),
-                                        RPT_SEVERITY_WARNING );
+                    m_reporter->Report(
+                            wxString::Format(
+                                    _( "Skipped a route on non-copper or unmapped PADS layer %d." ),
+                                    track_def.layer ),
+                            RPT_SEVERITY_WARNING );
                 }
 
                 continue;
@@ -1532,9 +1587,11 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
             {
                 if( m_reporter )
                 {
-                    m_reporter->Report( wxString::Format( _( "Skipped a non-positive-width route on PADS layer %d." ),
-                                                          track_def.layer ),
-                                        RPT_SEVERITY_WARNING );
+                    m_reporter->Report(
+                            wxString::Format(
+                                    _( "Skipped a non-positive-width route on PADS layer %d." ),
+                                    track_def.layer ),
+                            RPT_SEVERITY_WARNING );
                 }
 
                 continue;
@@ -1545,26 +1602,27 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
                 const PADS_IO::ARC_POINT& p1 = track_def.points[i];
                 const PADS_IO::ARC_POINT& p2 = track_def.points[i + 1];
 
-                VECTOR2I start = scalePoint( p1.x, p1.y );
-                VECTOR2I end = scalePoint( p2.x, p2.y );
+                VECTOR2I startPoint = scalePoint( p1.x, p1.y );
+                VECTOR2I endPoint = scalePoint( p2.x, p2.y );
 
-                // Route-cell endpoints retain quantization residue that the PADS writer
-                // collapses when exporting the same route to ASCII.
                 constexpr int MIN_ROUTE_LENGTH = 500;
-                int64_t deltaX = static_cast<int64_t>( end.x ) - start.x;
-                int64_t deltaY = static_cast<int64_t>( end.y ) - start.y;
+                int64_t deltaX = static_cast<int64_t>( endPoint.x ) - startPoint.x;
+                int64_t deltaY = static_cast<int64_t>( endPoint.y ) - startPoint.y;
 
-                if( deltaX * deltaX + deltaY * deltaY < MIN_ROUTE_LENGTH * MIN_ROUTE_LENGTH )
+                if( deltaX * deltaX + deltaY * deltaY
+                    < MIN_ROUTE_LENGTH * MIN_ROUTE_LENGTH )
+                {
                     continue;
+                }
 
                 if( p2.is_arc )
                 {
                     VECTOR2I center = scalePoint( p2.arc.cx, p2.arc.cy );
-
-                    bool clockwise = ( p2.arc.delta_angle < 0 );
+                    bool clockwise = p2.arc.delta_angle < 0;
 
                     SHAPE_ARC shapeArc;
-                    shapeArc.ConstructFromStartEndCenter( start, end, center, clockwise, track_width );
+                    shapeArc.ConstructFromStartEndCenter(
+                            startPoint, endPoint, center, clockwise, track_width );
 
                     PCB_ARC* arc = new PCB_ARC( m_loadBoard, &shapeArc );
 
@@ -1584,81 +1642,179 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
 
                     track->SetWidth( track_width );
                     track->SetLayer( track_layer );
-                    track->SetStart( start );
-                    track->SetEnd( end );
+                    track->SetStart( startPoint );
+                    track->SetEnd( endPoint );
                     m_loadBoard->Add( track );
                 }
             }
         }
 
-        for( const auto& via_def : route.vias )
+        for( const auto& viaDef : route.vias )
         {
-            VECTOR2I pos = scalePoint( via_def.location.x, via_def.location.y );
+            VECTOR2I viaPos = scalePoint( viaDef.location.x, viaDef.location.y );
 
-            std::unique_ptr<PCB_VIA> via = std::make_unique<PCB_VIA>( m_loadBoard );
+            if( viaDef.name == "TP" )
+            {
+                bool hasTopPad = false;
+                bool hasBottomPad = false;
+                int tpSize = m_minObjectSize;
+
+                for( const PADS_IO::PAD_STACK_LAYER& stackLayer : viaDef.stack )
+                {
+                    if( stackLayer.sizeA <= 0.0
+                        || !PADS_IO::IsCopperPadRow( stackLayer ) )
+                    {
+                        continue;
+                    }
+
+                    tpSize = std::max( tpSize, scaleSize( stackLayer.sizeA ) );
+
+                    if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_TOP )
+                        hasTopPad = true;
+                    else if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_BOTTOM )
+                        hasBottomPad = true;
+                }
+
+                PCB_LAYER_ID tpLayer =
+                        hasBottomPad && !hasTopPad ? B_Cu : F_Cu;
+
+                FOOTPRINT* footprint = new FOOTPRINT( m_loadBoard );
+                footprint->SetReference(
+                        wxString::Format( wxT( "TP%d" ), m_testPointIndex++ ) );
+                footprint->SetValue( PADS_COMMON::ConvertText( viaDef.name ) );
+                footprint->SetPosition( viaPos );
+                footprint->SetLayer( tpLayer );
+
+                PAD* pad = new PAD( footprint );
+                pad->SetPadstackMode( PADSTACK::MODE::NORMAL );
+                pad->SetNumber( wxT( "1" ) );
+                pad->SetPosition( viaPos );
+                pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
+                pad->SetSize( PADSTACK::ALL_LAYERS,
+                              VECTOR2I( tpSize, tpSize ) );
+                pad->SetAttribute( PAD_ATTRIB::SMD );
+                pad->SetLayerSet(
+                        tpLayer == B_Cu ? LSET( { B_Cu } ) : LSET( { F_Cu } ) );
+
+                if( net )
+                    pad->SetNet( net );
+
+                footprint->Add( pad );
+                m_converter->ConfigureSyntheticTestPoint(
+                        footprint, pad, tpSize, tpLayer );
+
+                const PCB_LAYER_ID silkLayer =
+                        tpLayer == B_Cu ? B_SilkS : F_SilkS;
+
+                std::optional<size_t> textIndex =
+                        m_converter->FindNearbyTestPointText(
+                                texts, componentRefs,
+                                m_consumedTestPointTextIndices,
+                                viaPos, silkLayer );
+
+                if( textIndex )
+                {
+                    m_converter->AddAttachedTestPointText(
+                            footprint, texts[*textIndex] );
+                    m_consumedTestPointTextIndices.insert( *textIndex );
+                }
+
+                m_loadBoard->Add( footprint );
+                continue;
+            }
+
+            std::unique_ptr<PCB_VIA> via =
+                    std::make_unique<PCB_VIA>( m_loadBoard );
 
             if( net )
                 via->SetNet( net );
 
-            via->SetPosition( pos );
+            via->SetPosition( viaPos );
 
-            const double viaDrill = via_def.stack.front().drill;
-            via->Padstack().SetMode( PADSTACK::MODE::FRONT_INNER_BACK );
-
-            for( const PADS_IO::PAD_STACK_LAYER& layer : via_def.stack )
-            {
-                if( layer.sizeA <= 0 || !PADS_IO::IsCopperPadRow( layer ) )
-                    continue;
-
-                int width = scaleSize( layer.sizeA );
-
-                if( layer.layer == -2 )
-                    via->SetWidth( F_Cu, width );
-                else if( layer.layer == 0 )
-                    via->SetWidth( PADSTACK::INNER_LAYERS, width );
-                else if( layer.layer == -1 )
-                    via->SetWidth( B_Cu, width );
-            }
-
-            via->SetDrill( scaleSize( viaDrill ) );
-            PCB_LAYER_ID startLayer = getMappedLayer( via_def.start_layer );
-            PCB_LAYER_ID endLayer = getMappedLayer( via_def.end_layer );
-
-            // A one-layer file defaults every via to the same span, so a whole board must not be
-            // lost to a via the layer table cannot place
-            if( !IsCopperLayer( startLayer ) || !IsCopperLayer( endLayer ) || startLayer == endLayer )
+            if( viaDef.stack.empty() )
             {
                 if( m_reporter )
                 {
-                    m_reporter->Report( wxString::Format( _( "Skipped a via on net '%s' with an unusable "
-                                                             "PADS layer span %d,%d." ),
-                                                          PADS_COMMON::ConvertText( route.net_name ),
-                                                          via_def.start_layer, via_def.end_layer ),
-                                        RPT_SEVERITY_WARNING );
+                    m_reporter->Report(
+                            wxString::Format(
+                                    _( "Skipped a PADS via on net '%s' with an empty padstack." ),
+                                    PADS_COMMON::ConvertText( route.net_name ) ),
+                            RPT_SEVERITY_WARNING );
                 }
 
                 continue;
             }
 
-            // SetLayerPair sanitizes the span against the current via type and PCB_VIA is
-            // constructed as THROUGH, so the type has to be set first or the decoded span is
-            // overwritten with F_Cu/B_Cu and every blind or buried via becomes full stack
+            const double viaDrill = viaDef.stack.front().drill;
+            via->Padstack().SetMode( PADSTACK::MODE::FRONT_INNER_BACK );
+
+            for( const PADS_IO::PAD_STACK_LAYER& stackLayer : viaDef.stack )
+            {
+                if( stackLayer.sizeA <= 0
+                    || !PADS_IO::IsCopperPadRow( stackLayer ) )
+                {
+                    continue;
+                }
+
+                int width = scaleSize( stackLayer.sizeA );
+
+                if( stackLayer.layer == -2 )
+                    via->SetWidth( F_Cu, width );
+                else if( stackLayer.layer == 0 )
+                    via->SetWidth( PADSTACK::INNER_LAYERS, width );
+                else if( stackLayer.layer == -1 )
+                    via->SetWidth( B_Cu, width );
+            }
+
+            via->SetDrill( scaleSize( viaDrill ) );
+
+            PCB_LAYER_ID startLayer = getMappedLayer( viaDef.start_layer );
+            PCB_LAYER_ID endLayer = getMappedLayer( viaDef.end_layer );
+
+            if( !IsCopperLayer( startLayer )
+                || !IsCopperLayer( endLayer )
+                || startLayer == endLayer )
+            {
+                if( m_reporter )
+                {
+                    m_reporter->Report(
+                            wxString::Format(
+                                    _( "Skipped a via on net '%s' with an unusable "
+                                       "PADS layer span %d,%d." ),
+                                    PADS_COMMON::ConvertText( route.net_name ),
+                                    viaDef.start_layer, viaDef.end_layer ),
+                            RPT_SEVERITY_WARNING );
+                }
+
+                continue;
+            }
+
             if( ( startLayer == F_Cu && endLayer == B_Cu )
                 || ( startLayer == B_Cu && endLayer == F_Cu ) )
+            {
                 via->SetViaType( VIATYPE::THROUGH );
-            else if( std::abs( via_def.start_layer - via_def.end_layer ) == 1
-                     && ( startLayer == F_Cu || startLayer == B_Cu || endLayer == F_Cu || endLayer == B_Cu ) )
+            }
+            else if( std::abs( viaDef.start_layer - viaDef.end_layer ) == 1
+                     && ( startLayer == F_Cu || startLayer == B_Cu
+                          || endLayer == F_Cu || endLayer == B_Cu ) )
+            {
                 via->SetViaType( VIATYPE::MICROVIA );
-            else if( startLayer == F_Cu || startLayer == B_Cu || endLayer == F_Cu || endLayer == B_Cu )
+            }
+            else if( startLayer == F_Cu || startLayer == B_Cu
+                     || endLayer == F_Cu || endLayer == B_Cu )
+            {
                 via->SetViaType( VIATYPE::BLIND );
+            }
             else
+            {
                 via->SetViaType( VIATYPE::BURIED );
+            }
 
             via->SetLayerPair( startLayer, endLayer );
-
             m_loadBoard->Add( via.release() );
         }
     }
+
     // Binary hybrid teardrop conversion v1.12.
     // PADS owns the parameters per route end.  KiCad owns them per pad/via, so first
     // recover every concrete connection and then decide whether an anchor is uniform.
@@ -1688,6 +1844,8 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
         IMPORTED_TD_KEY        key;
         std::string            originalSpec;
         bool                   previous = false;
+        bool                   logicalSideKnown = true;
+        char                   physicalEndpoint = '\0';
         bool                   persistentAnchor = false;
         bool                   trackNodeAnchor = false;
     };
@@ -1775,10 +1933,23 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
                             const double metadataLength =
                                     aPrevious ? td.previous_length : td.next_length;
 
-                            source->SetCustomProperty( wxS( "PADS Teardrop Metadata Version" ),
-                                                       wxS( "1" ) );
-                            source->SetCustomProperty( metadataPrefix + wxS( "Side" ),
-                                                       aPrevious ? wxS( "P" ) : wxS( "N" ) );
+                            source->SetCustomProperty(
+                                    wxS( "PADS Teardrop Metadata Version" ),
+                                    td.logical_side_known ? wxS( "1" ) : wxS( "2" ) );
+
+                            if( td.logical_side_known )
+                            {
+                                source->SetCustomProperty( metadataPrefix + wxS( "Side" ),
+                                                           aPrevious ? wxS( "P" )
+                                                                     : wxS( "N" ) );
+                            }
+                            else if( td.physical_endpoint != '\0' )
+                            {
+                                source->SetCustomProperty(
+                                        metadataPrefix + wxS( "Physical Endpoint" ),
+                                        td.physical_endpoint == 'S' ? wxS( "START" )
+                                                                    : wxS( "END" ) );
+                            }
                             source->SetCustomProperty(
                                     metadataPrefix + wxS( "Anchor" ),
                                     wxString::Format( wxS( "%lld,%lld" ),
@@ -1946,6 +2117,8 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
                         connection.layer = layer;
                         connection.net = net;
                         connection.previous = aPrevious;
+                        connection.logicalSideKnown = td.logical_side_known;
+                        connection.physicalEndpoint = td.physical_endpoint;
                         connection.persistentAnchor = persistentAnchor;
                         connection.trackNodeAnchor = trackNodeAnchor;
                         connection.originalSpec = td.original_spec;
@@ -2120,8 +2293,17 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
         zone->SetCustomProperty( wxS( "PADS Storage" ),
                                  nativeAnchor ? wxS( "KiCad native anchor" )
                                               : wxS( "Per-connection" ) );
-        zone->SetCustomProperty( wxS( "PADS Side" ),
-                                 connection.previous ? wxS( "P" ) : wxS( "N" ) );
+        if( connection.logicalSideKnown )
+        {
+            zone->SetCustomProperty( wxS( "PADS Side" ),
+                                     connection.previous ? wxS( "P" ) : wxS( "N" ) );
+        }
+        else if( connection.physicalEndpoint != '\0' )
+        {
+            zone->SetCustomProperty(
+                    wxS( "PADS Physical Endpoint" ),
+                    connection.physicalEndpoint == 'S' ? wxS( "START" ) : wxS( "END" ) );
+        }
         zone->SetCustomProperty( wxS( "PADS Width" ),
                                  wxString::FromUTF8(
                                          fmt::format( "{}", connection.key.width ).c_str() ) );
