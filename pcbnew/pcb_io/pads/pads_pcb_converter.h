@@ -21,6 +21,8 @@
 #define PADS_PCB_CONVERTER_H_
 
 #include <map>
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,8 @@
 #include "pads_parser.h"
 
 class BOARD;
+class FOOTPRINT;
+class PAD;
 class REPORTER;
 class SHAPE_ARC;
 class SHAPE_LINE_CHAIN;
@@ -67,14 +71,6 @@ public:
     BOARD* GetBoard() const { return m_board; }
 
     KIFONT::FONT* GetPadsRomansimFont() const { return m_padsRomansimFont; }
-
-
-
-
-
-
-
-
 
 
     /** Prepare and activate the PADS-provided document alternate stroke font. */
@@ -148,6 +144,8 @@ PADS_UNIT_CONVERTER& UnitConverter() { return m_unitConverter; }
 
     void EnsureNet( const std::string& aNetName );
 
+    /** Mark an existing KiCad pad as a fabrication test point. */
+
     /**
      * Append PADS vertices to a chain, converting arc entries to polylines and expanding a
      * lone full-circle entry to a 36-segment polygon.
@@ -162,6 +160,19 @@ PADS_UNIT_CONVERTER& UnitConverter() { return m_unitConverter; }
                                int aWidth ) const;
 
     void LoadTexts( const std::vector<PADS_IO::TEXT>& aTexts );
+
+    void ConfigureTestPointPad( PAD* aPad ) const;
+
+    void ConfigureSyntheticTestPoint( FOOTPRINT* aFootprint, PAD* aPad, int aPadDiameter,
+                                      PCB_LAYER_ID aCopperLayer ) const;
+
+    std::optional<size_t> FindNearbyTestPointText(
+            const std::vector<PADS_IO::TEXT>& aTexts, const std::set<wxString>& aComponentRefs,
+            const std::set<size_t>& aConsumed, const VECTOR2I& aPosition,
+            PCB_LAYER_ID aSilkLayer ) const;
+
+    void AddAttachedTestPointText( FOOTPRINT* aFootprint, const PADS_IO::TEXT& aText ) const;
+
 
     void LoadKeepouts( const std::vector<PADS_IO::KEEPOUT>& aKeepouts );
 

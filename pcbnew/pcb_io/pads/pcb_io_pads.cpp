@@ -143,6 +143,7 @@ void PCB_IO_PADS::loadBoard( const wxString& aFileName, BOARD& aBoard, bool aIsN
     // Activate the document alternate stroke font before any PADS text is created.
     m_converter->PreparePadsRomansimFont();
     m_testPointIndex = 1;
+    m_consumedTestPointTextIndices.clear();
     m_minObjectSize = ADVANCED_CFG::GetCfg().m_PcbImportMinObjectSizeNm;
 
     try
@@ -159,7 +160,18 @@ void PCB_IO_PADS::loadBoard( const wxString& aFileName, BOARD& aBoard, bool aIsN
         loadFootprints();
         loadReuseBlockGroups();
         loadTestPoints();
-        m_converter->LoadTexts( m_parser->GetTexts() );
+
+        std::vector<PADS_IO::TEXT> remainingTexts;
+        const std::vector<PADS_IO::TEXT>& allTexts = m_parser->GetTexts();
+        remainingTexts.reserve( allTexts.size() - m_consumedTestPointTextIndices.size() );
+
+        for( size_t i = 0; i < allTexts.size(); ++i )
+        {
+            if( !m_consumedTestPointTextIndices.count( i ) )
+                remainingTexts.push_back( allTexts[i] );
+        }
+
+        m_converter->LoadTexts( remainingTexts );
 
         if( m_progressReporter )
             m_progressReporter->BeginPhase( 3 );
@@ -173,6 +185,18 @@ void PCB_IO_PADS::loadBoard( const wxString& aFileName, BOARD& aBoard, bool aIsN
         m_converter->LoadKeepouts( m_parser->GetKeepouts() );
         loadGraphicLines();
         m_converter->WriteDiffPairRules( aFileName, m_parser->GetDiffPairs() );
+        // PADS test-point ratsnest connectivity.
+        // Synthetic TP pads already carry the electrical PADS net via SetNet();
+        // the attached text is graphical only and must never be used to infer it.
+        // Rebuild once after all imported copper/footprints are present so newly
+        // created TESTPOINT pads participate immediately in KiCad connectivity.
+        if( !m_loadBoard->BuildConnectivity( nullptr ) && m_reporter )
+        {
+            m_reporter->Report(
+                    _( "Failed to rebuild connectivity after importing PADS test points." ),
+                    RPT_SEVERITY_WARNING );
+        }
+
         m_converter->ReportStatistics();
     }
     catch( ... )
@@ -493,9 +517,12 @@ void PCB_IO_PADS::loadFootprints()
                         EDA_ANGLE part_orient( pads_part.rotation, DEGREES_T );
                         RotatePoint( offset, part_orient );
 
-                        // PADS text anchor differs from KiCad by a small offset along the
-                        // reading direction. Shift left (toward text start) to compensate.
-                        EDA_ANGLE textAngle = EDA_ANGLE( attr.orientation, DEGREES_T ) + part_orient;
+                        // Keep the original PADS angle separate from the displayed
+                        // right-reading angle. Anchor corrections are defined in the
+                        // original PADS geometry.
+                        EDA_ANGLE padsTextAngle =
+                                EDA_ANGLE( attr.orientation, DEGREES_T ) + part_orient;
+                        EDA_ANGLE textAngle = padsTextAngle;
                         VECTOR2I textShift( 0, 0 );
 
                         if( !padsRomansim )
@@ -504,47 +531,95 @@ void PCB_IO_PADS::loadFootprints()
                             RotatePoint( textShift, textAngle );
                         }
 
-                        offset += textShift;
+                        const bool keepUpright =
+                                attr.right_reading == PADS_IO::RIGHT_READING::ANGLED;
+
+                        if( keepUpright )
+                        {
+                            while( textAngle > ANGLE_90 )
+                                textAngle -= ANGLE_180;
+
+                            while( textAngle <= -ANGLE_90 )
+                                textAngle += ANGLE_180;
+                        }
 
                         // PADS Romansim v3.6 anchor metric correction.
                         if( padsRomansim )
                         {
                             VECTOR2I metricShift = m_converter->GetPadsRomansimAnchorCorrection(
                                     attr.vjust, scaledSize, field->GetTextThickness(), attr.mirrored );
-                            RotatePoint( metricShift, textAngle );
-                            offset += metricShift;
+                            RotatePoint( metricShift, padsTextAngle );
+                            textShift += metricShift;
                         }
 
-                        field->SetPosition( footprint->GetPosition() + offset );
+                        EDA_ANGLE rightReadingDelta = textAngle - padsTextAngle;
+                        rightReadingDelta.Normalize();
+
+                        const bool rightReadingFlipped180 =
+                                attr.right_reading == PADS_IO::RIGHT_READING::ANGLED
+                                && ( rightReadingDelta == ANGLE_180
+                                     || rightReadingDelta == -ANGLE_180 );
+
+                        field->SetPosition( footprint->GetPosition() + offset + textShift );
                         field->SetTextAngle( textAngle );
-                        field->SetKeepUpright( false );
+                        field->SetKeepUpright( keepUpright );
                         field->SetVisible( attr.visible );
 
                         if( attr.hjust == "LEFT" )
-                            field->SetHorizJustify( GR_TEXT_H_ALIGN_LEFT );
+                        {
+                            field->SetHorizJustify( rightReadingFlipped180
+                                                           ? GR_TEXT_H_ALIGN_RIGHT
+                                                           : GR_TEXT_H_ALIGN_LEFT );
+                        }
                         else if( attr.hjust == "RIGHT" )
-                            field->SetHorizJustify( GR_TEXT_H_ALIGN_RIGHT );
+                        {
+                            field->SetHorizJustify( rightReadingFlipped180
+                                                           ? GR_TEXT_H_ALIGN_LEFT
+                                                           : GR_TEXT_H_ALIGN_RIGHT );
+                        }
                         else
+                        {
                             field->SetHorizJustify( GR_TEXT_H_ALIGN_CENTER );
+                        }
 
                         // PADS Romansim v3.5.2 field vertical-justify mapping.
                         if( padsRomansim )
                         {
                             if( attr.vjust == "UP" )
-                                field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                            {
+                                field->SetVertJustify( rightReadingFlipped180
+                                                              ? GR_TEXT_V_ALIGN_BOTTOM
+                                                              : GR_TEXT_V_ALIGN_TOP );
+                            }
                             else if( attr.vjust == "DOWN" )
-                                field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+                            {
+                                field->SetVertJustify( rightReadingFlipped180
+                                                              ? GR_TEXT_V_ALIGN_TOP
+                                                              : GR_TEXT_V_ALIGN_BOTTOM );
+                            }
                             else
+                            {
                                 field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                            }
                         }
                         else
                         {
                             if( attr.vjust == "UP" )
-                                field->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+                            {
+                                field->SetVertJustify( rightReadingFlipped180
+                                                              ? GR_TEXT_V_ALIGN_TOP
+                                                              : GR_TEXT_V_ALIGN_BOTTOM );
+                            }
                             else if( attr.vjust == "DOWN" )
-                                field->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+                            {
+                                field->SetVertJustify( rightReadingFlipped180
+                                                              ? GR_TEXT_V_ALIGN_BOTTOM
+                                                              : GR_TEXT_V_ALIGN_TOP );
+                            }
                             else
+                            {
                                 field->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+                            }
                         }
 
                         if( ownsField )
@@ -1329,65 +1404,96 @@ void PCB_IO_PADS::loadReuseBlockGroups()
 
 void PCB_IO_PADS::loadTestPoints()
 {
-    const std::vector<PADS_IO::TEST_POINT>&        test_points = m_parser->GetTestPoints();
-    const std::map<std::string, PADS_IO::VIA_DEF>& via_defs = m_parser->GetViaDefs();
+    const std::vector<PADS_IO::TEST_POINT>& testPoints = m_parser->GetTestPoints();
+    const std::map<std::string, PADS_IO::VIA_DEF>& viaDefs = m_parser->GetViaDefs();
+    const std::vector<PADS_IO::TEXT>& texts = m_parser->GetTexts();
 
-    for( const PADS_IO::TEST_POINT& tp : test_points )
+    std::set<wxString> componentRefs;
+
+    for( const PADS_IO::PART& part : m_parser->GetParts() )
+        componentRefs.insert( PADS_COMMON::ConvertText( part.name ) );
+
+    for( const PADS_IO::TEST_POINT& tp : testPoints )
     {
-        FOOTPRINT* footprint = new FOOTPRINT( m_loadBoard );
+        if( tp.type == "PIN" )
+        {
+            const size_t dot = tp.symbol_name.rfind( '.' );
 
-        wxString refDes = wxString::Format( wxT( "TP%d" ), m_testPointIndex++ );
-        footprint->SetReference( refDes );
+            if( dot == std::string::npos || dot == 0 || dot + 1 >= tp.symbol_name.size() )
+                continue;
+
+            const wxString ref = PADS_COMMON::ConvertText( tp.symbol_name.substr( 0, dot ) );
+            const wxString pin = PADS_COMMON::ConvertText( tp.symbol_name.substr( dot + 1 ) );
+            PAD* targetPad = nullptr;
+
+            for( FOOTPRINT* fp : m_loadBoard->Footprints() )
+            {
+                if( fp->GetReference().CmpNoCase( ref ) != 0 )
+                    continue;
+
+                for( PAD* pad : fp->Pads() )
+                {
+                    if( pad->GetNumber() == pin )
+                    {
+                        targetPad = pad;
+                        break;
+                    }
+                }
+
+                break;
+            }
+
+            if( targetPad )
+                m_converter->ConfigureTestPointPad( targetPad );
+            else if( m_reporter )
+                m_reporter->Report(
+                        wxString::Format( _( "PADS test point '%s' does not resolve to a PCB pad." ),
+                                          PADS_COMMON::ConvertText( tp.symbol_name ) ),
+                        RPT_SEVERITY_WARNING );
+
+            continue;
+        }
+
+        if( tp.type != "VIA" )
+            continue;
+
+        FOOTPRINT* footprint = new FOOTPRINT( m_loadBoard );
+        footprint->SetReference( wxString::Format( wxT( "TP%d" ), m_testPointIndex++ ) );
         footprint->SetValue( PADS_COMMON::ConvertText( tp.symbol_name ) );
 
         VECTOR2I pos( scaleCoord( tp.x, true ), scaleCoord( tp.y, false ) );
         footprint->SetPosition( pos );
 
-        // Default layer and size; refined below from the via definition.
-        PCB_LAYER_ID layer = ( tp.side == 2 ) ? B_Cu : F_Cu;
+        PCB_LAYER_ID layer = tp.side == 2 ? B_Cu : F_Cu;
         int tpSize = std::max( scaleSize( 50.0 ), m_minObjectSize );
 
-        auto it = via_defs.find( tp.symbol_name );
+        auto it = viaDefs.find( tp.symbol_name );
 
-        if( it != via_defs.end() )
+        if( it != viaDefs.end() )
         {
             const PADS_IO::VIA_DEF& def = it->second;
-
-            // Inspect the pad stack once to recover both the pad size and the
-            // board side.  A non-zero pad on copper layer -2 (top) or -1 (bottom)
-            // takes first priority for the side; when those are both zero (an
-            // in-circuit test point) the soldermask layers (25=top, 28=bottom)
-            // indicate the side instead.  The pad size falls back to the largest
-            // stack entry when the via definition carries no explicit size.
-            double stackSize    = def.size;
-            bool   hasTopPad    = false;
-            bool   hasBottomPad = false;
-            bool   hasMaskTop   = false;
-            bool   hasMaskBot   = false;
+            double stackSize = def.size;
+            bool hasTopPad = false;
+            bool hasBottomPad = false;
+            bool hasMaskTop = false;
+            bool hasMaskBot = false;
 
             for( const PADS_IO::PAD_STACK_LAYER& stackLayer : def.stack )
             {
-                if( def.size <= 0.0 && stackLayer.sizeA > stackSize )
+                if( def.size <= 0.0 && stackLayer.sizeA > stackSize
+                    && PADS_IO::IsCopperPadRow( stackLayer ) )
                     stackSize = stackLayer.sizeA;
 
                 if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_TOP
-                    && stackLayer.sizeA > 0.0 )
-                {
+                    && stackLayer.sizeA > 0.0 && PADS_IO::IsCopperPadRow( stackLayer ) )
                     hasTopPad = true;
-                }
                 else if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_BOTTOM
-                         && stackLayer.sizeA > 0.0 )
-                {
+                         && stackLayer.sizeA > 0.0 && PADS_IO::IsCopperPadRow( stackLayer ) )
                     hasBottomPad = true;
-                }
                 else if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_SOLDERMASK_TOP )
-                {
                     hasMaskTop = true;
-                }
                 else if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_SOLDERMASK_BOTTOM )
-                {
                     hasMaskBot = true;
-                }
             }
 
             if( stackSize > 0.0 )
@@ -1416,26 +1522,29 @@ void PCB_IO_PADS::loadTestPoints()
 
         if( !tp.net_name.empty() )
         {
-            NETINFO_ITEM* net = m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( tp.net_name ) );
+            NETINFO_ITEM* net =
+                    m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( tp.net_name ) );
 
             if( net )
                 pad->SetNet( net );
         }
 
         footprint->Add( pad );
+        m_converter->ConfigureSyntheticTestPoint( footprint, pad, tpSize, layer );
 
-        footprint->SetBoardOnly( true );
+        const PCB_LAYER_ID silkLayer = layer == B_Cu ? B_SilkS : F_SilkS;
+        std::optional<size_t> textIndex = m_converter->FindNearbyTestPointText(
+                texts, componentRefs, m_consumedTestPointTextIndices, pos, silkLayer );
 
-        PCB_FIELD* tpField = new PCB_FIELD( footprint, FIELD_T::USER, wxT( "Test_Point" ) );
-        tpField->SetLayer( Cmts_User );
-        tpField->SetVisible( false );
-        tpField->SetText( PADS_COMMON::ConvertText( tp.type ) );
-        footprint->Add( tpField );
+        if( textIndex )
+        {
+            m_converter->AddAttachedTestPointText( footprint, texts[*textIndex] );
+            m_consumedTestPointTextIndices.insert( *textIndex );
+        }
 
         m_loadBoard->Add( footprint );
     }
 }
-
 
 void PCB_IO_PADS::loadTracksAndVias()
 {

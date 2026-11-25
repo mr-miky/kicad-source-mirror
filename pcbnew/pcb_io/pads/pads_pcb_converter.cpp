@@ -37,6 +37,16 @@
 #include <advanced_config.h>
 #include <board.h>
 #include <board_design_settings.h>
+#include <footprint.h>
+#include <pad.h>
+#include <footprint.h>
+#include <pad.h>
+#include <footprint.h>
+#include <pad.h>
+#include <footprint.h>
+#include <pad.h>
+#include <footprint.h>
+#include <pad.h>
 #include <board_stackup_manager/board_stackup.h>
 #include <geometry/eda_angle.h>
 #include <geometry/shape_arc.h>
@@ -45,6 +55,7 @@
 #include <math/util.h>
 #include <netinfo.h>
 #include <pcb_dimension.h>
+#include <pcb_shape.h>
 #include <pcb_text.h>
 #include <pcb_track.h>
 #include <reporter.h>
@@ -57,6 +68,67 @@ PADS_PCB_CONVERTER::PADS_PCB_CONVERTER( BOARD* aBoard, REPORTER* aReporter ) :
         m_board( aBoard ),
         m_reporter( aReporter )
 {
+}
+
+
+void PADS_PCB_CONVERTER::ConfigureTestPointPad( PAD* aPad ) const
+{
+    if( aPad )
+        aPad->SetProperty( PAD_PROP::TESTPOINT );
+}
+
+
+void PADS_PCB_CONVERTER::ConfigureSyntheticTestPoint( FOOTPRINT* aFootprint, PAD* aPad,
+                                                       int aPadDiameter,
+                                                       PCB_LAYER_ID aCopperLayer ) const
+{
+    if( !aFootprint || !aPad )
+        return;
+
+    aFootprint->SetBoardOnly( true );
+    aFootprint->Reference().SetVisible( false );
+    aFootprint->Value().SetVisible( false );
+
+    ConfigureTestPointPad( aPad );
+
+    constexpr int SILK_STROKE_NM = 100000;
+    constexpr int SILK_RADIAL_MARGIN_NM = 300000;
+
+    PCB_LAYER_ID silkLayer =
+            aCopperLayer == B_Cu ? B_SilkS : F_SilkS;
+
+    VECTOR2I center = aPad->GetPosition();
+
+    int radius = std::max(
+            aPadDiameter / 2 + SILK_RADIAL_MARGIN_NM,
+            SILK_STROKE_NM );
+
+    PCB_SHAPE* circle = new PCB_SHAPE( aFootprint );
+    circle->SetShape( SHAPE_T::CIRCLE );
+    circle->SetLayer( silkLayer );
+    circle->SetCenter( center );
+    circle->SetEnd( VECTOR2I( center.x + radius, center.y ) );
+    circle->SetStroke(
+            STROKE_PARAMS( SILK_STROKE_NM, LINE_STYLE::SOLID ) );
+
+    aFootprint->Add( circle );
+
+    // Debug aid: show the maximum free-text capture radius used by
+    // FindNearbyTestPointText().  This is intentionally very thin and
+    // lives on the same silk side as the synthetic test point.
+    constexpr int TP_CAPTURE_RADIUS_NM = 2500000;
+    constexpr int TP_CAPTURE_STROKE_NM = 50000;
+
+    PCB_SHAPE* captureCircle = new PCB_SHAPE( aFootprint );
+    captureCircle->SetShape( SHAPE_T::CIRCLE );
+    captureCircle->SetLayer( silkLayer );
+    captureCircle->SetCenter( center );
+    captureCircle->SetEnd(
+            VECTOR2I( center.x + TP_CAPTURE_RADIUS_NM, center.y ) );
+    captureCircle->SetStroke(
+            STROKE_PARAMS( TP_CAPTURE_STROKE_NM, LINE_STYLE::SOLID ) );
+
+    aFootprint->Add( captureCircle );
 }
 
 
@@ -610,6 +682,207 @@ void PADS_PCB_CONVERTER::BuildStackup( const std::vector<PADS_IO::LAYER_INFO>& a
     bds.SetBoardThickness( stackup.BuildBoardThicknessFromStackup() );
     bds.m_HasStackup = true;
 }
+
+
+
+std::optional<size_t> PADS_PCB_CONVERTER::FindNearbyTestPointText(
+        const std::vector<PADS_IO::TEXT>& aTexts, const std::set<wxString>& aComponentRefs,
+        const std::set<size_t>& aConsumed, const VECTOR2I& aPosition,
+        PCB_LAYER_ID aSilkLayer ) const
+{
+    constexpr double STRONG_RADIUS_NM = 3000000.0;
+    constexpr double MAX_RADIUS_NM = 2500000.0;
+    constexpr double AMBIGUITY_GAP_NM = 1500000.0;
+
+    std::optional<size_t> bestIndex;
+    double bestDistance = std::numeric_limits<double>::max();
+    double secondDistance = std::numeric_limits<double>::max();
+
+    for( size_t i = 0; i < aTexts.size(); ++i )
+    {
+        if( aConsumed.count( i ) )
+            continue;
+
+        const PADS_IO::TEXT& padsText = aTexts[i];
+
+        if( GetMappedLayer( padsText.layer ) != aSilkLayer )
+            continue;
+
+        wxString label = PADS_COMMON::ConvertText( padsText.content );
+        label.Trim( true );
+        label.Trim( false );
+
+        if( label.empty() )
+            continue;
+
+        bool isComponentRef = false;
+
+        for( const wxString& ref : aComponentRefs )
+        {
+            if( label.CmpNoCase( ref ) == 0 )
+            {
+                isComponentRef = true;
+                break;
+            }
+        }
+
+        if( isComponentRef )
+            continue;
+
+        PCB_TEXT probe( m_board );
+        probe.SetText( PADS_COMMON::ConvertText( padsText.content ) );
+
+        int scaledSize = ScaleSize( padsText.height );
+
+        if( m_padsRomansimFont )
+        {
+            probe.SetTextSize( VECTOR2I( scaledSize, scaledSize ) );
+        }
+        else
+        {
+            int charHeight = static_cast<int>(
+                    scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
+            int charWidth = static_cast<int>(
+                    scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
+            probe.SetTextSize( VECTOR2I( charWidth, charHeight ) );
+        }
+
+        if( padsText.width > 0 )
+            probe.SetTextThickness( ScaleSize( padsText.width ) );
+
+        EDA_ANGLE textAngle( padsText.rotation, DEGREES_T );
+        probe.SetTextAngle( textAngle );
+        probe.SetPosition( ScalePoint( padsText.location.x, padsText.location.y ) );
+
+        if( m_padsRomansimFont )
+        {
+            VECTOR2I metricShift = GetPadsRomansimAnchorCorrection(
+                    PADS_COMMON::ConvertText( padsText.vjust ), scaledSize,
+                    probe.GetTextThickness(), padsText.mirrored );
+            RotatePoint( metricShift, textAngle );
+            probe.SetPosition( probe.GetPosition() + metricShift );
+        }
+
+        if( padsText.hjust == "LEFT" )
+            probe.SetHorizJustify( GR_TEXT_H_ALIGN_LEFT );
+        else if( padsText.hjust == "RIGHT" )
+            probe.SetHorizJustify( GR_TEXT_H_ALIGN_RIGHT );
+        else
+            probe.SetHorizJustify( GR_TEXT_H_ALIGN_CENTER );
+
+        if( padsText.vjust == "UP" )
+            probe.SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+        else if( padsText.vjust == "DOWN" )
+            probe.SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+        else
+            probe.SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+
+        probe.SetKeepUpright( false );
+        probe.SetLayer( aSilkLayer );
+        probe.SetMirrored( padsText.mirrored );
+
+        const BOX2I textBox = probe.GetBoundingBox();
+        const int nearestX = std::clamp( aPosition.x, textBox.GetLeft(), textBox.GetRight() );
+        const int nearestY = std::clamp( aPosition.y, textBox.GetTop(), textBox.GetBottom() );
+        const double dx = static_cast<double>( nearestX ) - aPosition.x;
+        const double dy = static_cast<double>( nearestY ) - aPosition.y;
+        const double distance = std::hypot( dx, dy );
+
+        if( distance > MAX_RADIUS_NM )
+            continue;
+
+        if( distance < bestDistance )
+        {
+            secondDistance = bestDistance;
+            bestDistance = distance;
+            bestIndex = i;
+        }
+        else if( distance < secondDistance )
+        {
+            secondDistance = distance;
+        }
+    }
+
+    if( !bestIndex )
+        return std::nullopt;
+
+    if( bestDistance <= STRONG_RADIUS_NM )
+        return bestIndex;
+
+    if( secondDistance < std::numeric_limits<double>::max()
+        && secondDistance <= bestDistance + AMBIGUITY_GAP_NM
+        && secondDistance <= bestDistance * 1.5 )
+    {
+        return std::nullopt;
+    }
+
+    return bestIndex;
+}
+
+
+void PADS_PCB_CONVERTER::AddAttachedTestPointText( FOOTPRINT* aFootprint,
+                                                    const PADS_IO::TEXT& padsText ) const
+{
+    if( !aFootprint )
+        return;
+
+    PCB_TEXT* text = new PCB_TEXT( aFootprint );
+    text->SetText( PADS_COMMON::ConvertText( padsText.content ) );
+
+    int scaledSize = ScaleSize( padsText.height );
+
+    if( m_padsRomansimFont )
+        text->SetTextSize( VECTOR2I( scaledSize, scaledSize ) );
+    else
+    {
+        int charHeight = static_cast<int>(
+                scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextHeightScale );
+        int charWidth = static_cast<int>(
+                scaledSize * ADVANCED_CFG::GetCfg().m_PadsPcbTextWidthScale );
+        text->SetTextSize( VECTOR2I( charWidth, charHeight ) );
+    }
+
+    if( padsText.width > 0 )
+        text->SetTextThickness( ScaleSize( padsText.width ) );
+
+    EDA_ANGLE textAngle( padsText.rotation, DEGREES_T );
+    text->SetTextAngle( textAngle );
+    text->SetPosition( ScalePoint( padsText.location.x, padsText.location.y ) );
+
+    if( m_padsRomansimFont )
+    {
+        VECTOR2I metricShift = GetPadsRomansimAnchorCorrection(
+                PADS_COMMON::ConvertText( padsText.vjust ), scaledSize,
+                text->GetTextThickness(), padsText.mirrored );
+        RotatePoint( metricShift, textAngle );
+        text->SetPosition( text->GetPosition() + metricShift );
+    }
+
+    if( padsText.hjust == "LEFT" )
+        text->SetHorizJustify( GR_TEXT_H_ALIGN_LEFT );
+    else if( padsText.hjust == "RIGHT" )
+        text->SetHorizJustify( GR_TEXT_H_ALIGN_RIGHT );
+    else
+        text->SetHorizJustify( GR_TEXT_H_ALIGN_CENTER );
+
+    if( padsText.vjust == "UP" )
+        text->SetVertJustify( GR_TEXT_V_ALIGN_TOP );
+    else if( padsText.vjust == "DOWN" )
+        text->SetVertJustify( GR_TEXT_V_ALIGN_BOTTOM );
+    else
+        text->SetVertJustify( GR_TEXT_V_ALIGN_CENTER );
+
+    PCB_LAYER_ID textLayer = GetMappedLayer( padsText.layer );
+
+    if( textLayer == UNDEFINED_LAYER )
+        textLayer = aFootprint->GetLayer() == B_Cu ? B_SilkS : F_SilkS;
+
+    text->SetLayer( textLayer );
+    text->SetKeepUpright( false );
+    text->SetMirrored( padsText.mirrored );
+    aFootprint->Add( text );
+}
+
 
 
 void PADS_PCB_CONVERTER::EnsureNet( const std::string& aNetName )

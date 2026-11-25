@@ -25,6 +25,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -96,5 +97,6 @@ private:
     std::map<std::string, std::string>          m_pinToNetMap;
     std::map<std::string, std::string>          m_partToBlockMap;
     int                                         m_testPointIndex = 1;
+    std::set<size_t>                            m_consumedTestPointTextIndices;
     int                                         m_minObjectSize = 1000;
 };
