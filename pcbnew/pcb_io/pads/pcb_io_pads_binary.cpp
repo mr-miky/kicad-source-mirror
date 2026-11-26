@@ -262,6 +262,19 @@ void PCB_IO_PADS_BINARY::loadBoard( const wxString& aFileName, BOARD& aBoard, bo
 
 void PCB_IO_PADS_BINARY::loadBoardSetup()
 {
+    wxString sourceComment = wxS( "PADS source: Binary" );
+
+    if( !m_parser->GetGeneratorVersion().empty() )
+    {
+        sourceComment += wxS( " CAM_VERSION " )
+                         + PADS_COMMON::ConvertText( m_parser->GetGeneratorVersion() );
+    }
+
+    sourceComment += wxString::Format( wxS( " (SDB 0x%04X)" ),
+                                       static_cast<unsigned>( m_parser->GetVersion() ) );
+
+    m_converter->SetSourceVersionComment( sourceComment );
+
     std::vector<PADS_IO::LAYER_INFO> padsLayerInfos = m_parser->GetLayerInfos();
 
     // Binary layer records often carry no function code, so the layer name is the only
@@ -1538,6 +1551,9 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
     for( const PADS_IO::PART& part : m_parser->GetParts() )
         componentRefs.insert( PADS_COMMON::ConvertText( part.name ) );
 
+    m_converter->LoadTracks( routes, true, 0 );
+
+    // Binary-only DFT test pads named "TP" remain source-specific.
     for( const auto& route : routes )
     {
         NETINFO_ITEM* net = nullptr;
@@ -1547,806 +1563,92 @@ void PCB_IO_PADS_BINARY::loadTracksAndVias()
             net = m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( route.net_name ) );
 
             if( !net )
-            {
-                if( m_reporter )
-                {
-                    m_reporter->Report(
-                            wxString::Format( _( "Route net '%s' not found, skipping" ),
-                                              route.net_name ),
-                            RPT_SEVERITY_WARNING );
-                }
-
                 continue;
-            }
-        }
-
-        for( const auto& track_def : route.tracks )
-        {
-            if( track_def.points.size() < 2 )
-                continue;
-
-            PCB_LAYER_ID track_layer = getMappedLayer( track_def.layer );
-
-            if( !IsCopperLayer( track_layer ) )
-            {
-                if( m_reporter )
-                {
-                    m_reporter->Report(
-                            wxString::Format(
-                                    _( "Skipped a route on non-copper or unmapped PADS layer %d." ),
-                                    track_def.layer ),
-                            RPT_SEVERITY_WARNING );
-                }
-
-                continue;
-            }
-
-            int track_width = scaleSize( track_def.width );
-
-            if( track_width <= 0 )
-            {
-                if( m_reporter )
-                {
-                    m_reporter->Report(
-                            wxString::Format(
-                                    _( "Skipped a non-positive-width route on PADS layer %d." ),
-                                    track_def.layer ),
-                            RPT_SEVERITY_WARNING );
-                }
-
-                continue;
-            }
-
-            for( size_t i = 0; i < track_def.points.size() - 1; ++i )
-            {
-                const PADS_IO::ARC_POINT& p1 = track_def.points[i];
-                const PADS_IO::ARC_POINT& p2 = track_def.points[i + 1];
-
-                VECTOR2I startPoint = scalePoint( p1.x, p1.y );
-                VECTOR2I endPoint = scalePoint( p2.x, p2.y );
-
-                constexpr int MIN_ROUTE_LENGTH = 500;
-                int64_t deltaX = static_cast<int64_t>( endPoint.x ) - startPoint.x;
-                int64_t deltaY = static_cast<int64_t>( endPoint.y ) - startPoint.y;
-
-                if( deltaX * deltaX + deltaY * deltaY
-                    < MIN_ROUTE_LENGTH * MIN_ROUTE_LENGTH )
-                {
-                    continue;
-                }
-
-                if( p2.is_arc )
-                {
-                    VECTOR2I center = scalePoint( p2.arc.cx, p2.arc.cy );
-                    bool clockwise = p2.arc.delta_angle < 0;
-
-                    SHAPE_ARC shapeArc;
-                    shapeArc.ConstructFromStartEndCenter(
-                            startPoint, endPoint, center, clockwise, track_width );
-
-                    PCB_ARC* arc = new PCB_ARC( m_loadBoard, &shapeArc );
-
-                    if( net )
-                        arc->SetNet( net );
-
-                    arc->SetWidth( track_width );
-                    arc->SetLayer( track_layer );
-                    m_loadBoard->Add( arc );
-                }
-                else
-                {
-                    PCB_TRACK* track = new PCB_TRACK( m_loadBoard );
-
-                    if( net )
-                        track->SetNet( net );
-
-                    track->SetWidth( track_width );
-                    track->SetLayer( track_layer );
-                    track->SetStart( startPoint );
-                    track->SetEnd( endPoint );
-                    m_loadBoard->Add( track );
-                }
-            }
         }
 
         for( const auto& viaDef : route.vias )
         {
+            if( viaDef.name != "TP" )
+                continue;
+
             VECTOR2I viaPos = scalePoint( viaDef.location.x, viaDef.location.y );
-
-            if( viaDef.name == "TP" )
-            {
-                bool hasTopPad = false;
-                bool hasBottomPad = false;
-                int tpSize = m_minObjectSize;
-
-                for( const PADS_IO::PAD_STACK_LAYER& stackLayer : viaDef.stack )
-                {
-                    if( stackLayer.sizeA <= 0.0
-                        || !PADS_IO::IsCopperPadRow( stackLayer ) )
-                    {
-                        continue;
-                    }
-
-                    tpSize = std::max( tpSize, scaleSize( stackLayer.sizeA ) );
-
-                    if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_TOP )
-                        hasTopPad = true;
-                    else if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_BOTTOM )
-                        hasBottomPad = true;
-                }
-
-                PCB_LAYER_ID tpLayer =
-                        hasBottomPad && !hasTopPad ? B_Cu : F_Cu;
-
-                FOOTPRINT* footprint = new FOOTPRINT( m_loadBoard );
-                footprint->SetReference(
-                        wxString::Format( wxT( "TP%d" ), m_testPointIndex++ ) );
-                footprint->SetValue( PADS_COMMON::ConvertText( viaDef.name ) );
-                footprint->SetPosition( viaPos );
-                footprint->SetLayer( tpLayer );
-
-                PAD* pad = new PAD( footprint );
-                pad->SetPadstackMode( PADSTACK::MODE::NORMAL );
-                pad->SetNumber( wxT( "1" ) );
-                pad->SetPosition( viaPos );
-                pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
-                pad->SetSize( PADSTACK::ALL_LAYERS,
-                              VECTOR2I( tpSize, tpSize ) );
-                pad->SetAttribute( PAD_ATTRIB::SMD );
-                pad->SetLayerSet(
-                        tpLayer == B_Cu ? LSET( { B_Cu } ) : LSET( { F_Cu } ) );
-
-                if( net )
-                    pad->SetNet( net );
-
-                footprint->Add( pad );
-                m_converter->ConfigureSyntheticTestPoint(
-                        footprint, pad, tpSize, tpLayer );
-
-                const PCB_LAYER_ID silkLayer =
-                        tpLayer == B_Cu ? B_SilkS : F_SilkS;
-
-                std::optional<size_t> textIndex =
-                        m_converter->FindNearbyTestPointText(
-                                texts, componentRefs,
-                                m_consumedTestPointTextIndices,
-                                viaPos, silkLayer );
-
-                if( textIndex )
-                {
-                    m_converter->AddAttachedTestPointText(
-                            footprint, texts[*textIndex] );
-                    m_consumedTestPointTextIndices.insert( *textIndex );
-                }
-
-                m_loadBoard->Add( footprint );
-                continue;
-            }
-
-            std::unique_ptr<PCB_VIA> via =
-                    std::make_unique<PCB_VIA>( m_loadBoard );
-
-            if( net )
-                via->SetNet( net );
-
-            via->SetPosition( viaPos );
-
-            if( viaDef.stack.empty() )
-            {
-                if( m_reporter )
-                {
-                    m_reporter->Report(
-                            wxString::Format(
-                                    _( "Skipped a PADS via on net '%s' with an empty padstack." ),
-                                    PADS_COMMON::ConvertText( route.net_name ) ),
-                            RPT_SEVERITY_WARNING );
-                }
-
-                continue;
-            }
-
-            const double viaDrill = viaDef.stack.front().drill;
-            via->Padstack().SetMode( PADSTACK::MODE::FRONT_INNER_BACK );
+            bool hasTopPad = false;
+            bool hasBottomPad = false;
+            int tpSize = m_minObjectSize;
 
             for( const PADS_IO::PAD_STACK_LAYER& stackLayer : viaDef.stack )
             {
-                if( stackLayer.sizeA <= 0
+                if( stackLayer.sizeA <= 0.0
                     || !PADS_IO::IsCopperPadRow( stackLayer ) )
                 {
                     continue;
                 }
 
-                int width = scaleSize( stackLayer.sizeA );
+                tpSize = std::max( tpSize, scaleSize( stackLayer.sizeA ) );
 
-                if( stackLayer.layer == -2 )
-                    via->SetWidth( F_Cu, width );
-                else if( stackLayer.layer == 0 )
-                    via->SetWidth( PADSTACK::INNER_LAYERS, width );
-                else if( stackLayer.layer == -1 )
-                    via->SetWidth( B_Cu, width );
+                if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_TOP )
+                    hasTopPad = true;
+                else if( stackLayer.layer == PADS_LAYER_MAPPER::LAYER_PAD_STACK_BOTTOM )
+                    hasBottomPad = true;
             }
 
-            via->SetDrill( scaleSize( viaDrill ) );
+            PCB_LAYER_ID tpLayer =
+                    hasBottomPad && !hasTopPad ? B_Cu : F_Cu;
 
-            PCB_LAYER_ID startLayer = getMappedLayer( viaDef.start_layer );
-            PCB_LAYER_ID endLayer = getMappedLayer( viaDef.end_layer );
+            FOOTPRINT* footprint = new FOOTPRINT( m_loadBoard );
+            footprint->SetReference(
+                    wxString::Format( wxT( "TP%d" ), m_testPointIndex++ ) );
+            footprint->SetValue( PADS_COMMON::ConvertText( viaDef.name ) );
+            footprint->SetPosition( viaPos );
+            footprint->SetLayer( tpLayer );
 
-            if( !IsCopperLayer( startLayer )
-                || !IsCopperLayer( endLayer )
-                || startLayer == endLayer )
+            PAD* pad = new PAD( footprint );
+            pad->SetPadstackMode( PADSTACK::MODE::NORMAL );
+            pad->SetNumber( wxT( "1" ) );
+            pad->SetPosition( viaPos );
+            pad->SetShape( PADSTACK::ALL_LAYERS, PAD_SHAPE::CIRCLE );
+            pad->SetSize( PADSTACK::ALL_LAYERS,
+                          VECTOR2I( tpSize, tpSize ) );
+            pad->SetAttribute( PAD_ATTRIB::SMD );
+            pad->SetLayerSet(
+                    tpLayer == B_Cu ? LSET( { B_Cu } ) : LSET( { F_Cu } ) );
+
+            if( net )
+                pad->SetNet( net );
+
+            footprint->Add( pad );
+            m_converter->ConfigureSyntheticTestPoint(
+                    footprint, pad, tpSize, tpLayer );
+
+            const PCB_LAYER_ID silkLayer =
+                    tpLayer == B_Cu ? B_SilkS : F_SilkS;
+
+            std::optional<size_t> textIndex =
+                    m_converter->FindNearbyTestPointText(
+                            texts, componentRefs,
+                            m_consumedTestPointTextIndices,
+                            viaPos, silkLayer );
+
+            if( textIndex )
             {
-                if( m_reporter )
-                {
-                    m_reporter->Report(
-                            wxString::Format(
-                                    _( "Skipped a via on net '%s' with an unusable "
-                                       "PADS layer span %d,%d." ),
-                                    PADS_COMMON::ConvertText( route.net_name ),
-                                    viaDef.start_layer, viaDef.end_layer ),
-                            RPT_SEVERITY_WARNING );
-                }
-
-                continue;
+                m_converter->AddAttachedTestPointText(
+                        footprint, texts[*textIndex] );
+                m_consumedTestPointTextIndices.insert( *textIndex );
             }
 
-            if( ( startLayer == F_Cu && endLayer == B_Cu )
-                || ( startLayer == B_Cu && endLayer == F_Cu ) )
-            {
-                via->SetViaType( VIATYPE::THROUGH );
-            }
-            else if( std::abs( viaDef.start_layer - viaDef.end_layer ) == 1
-                     && ( startLayer == F_Cu || startLayer == B_Cu
-                          || endLayer == F_Cu || endLayer == B_Cu ) )
-            {
-                via->SetViaType( VIATYPE::MICROVIA );
-            }
-            else if( startLayer == F_Cu || startLayer == B_Cu
-                     || endLayer == F_Cu || endLayer == B_Cu )
-            {
-                via->SetViaType( VIATYPE::BLIND );
-            }
-            else
-            {
-                via->SetViaType( VIATYPE::BURIED );
-            }
-
-            via->SetLayerPair( startLayer, endLayer );
-            m_loadBoard->Add( via.release() );
-        }
-    }
-
-    // Binary hybrid teardrop conversion v1.12.
-    // PADS owns the parameters per route end.  KiCad owns them per pad/via, so first
-    // recover every concrete connection and then decide whether an anchor is uniform.
-    struct IMPORTED_TD_KEY
-    {
-        double width = 0.0;
-        double length = 0.0;
-        char   shape = 'D';
-        bool   adjustable = false;
-
-        bool operator==( const IMPORTED_TD_KEY& aOther ) const
-        {
-            // PADS Default shapes v1.16: compare shapes independently.
-            // Auto Adjust has no exact KiCad equivalent and is metadata only.
-            return width == aOther.width && length == aOther.length
-                   && shape == aOther.shape;
-        }
-    };
-
-    struct IMPORTED_TD_CONNECTION
-    {
-        PCB_TRACK*             source = nullptr;
-        BOARD_ITEM*            anchor = nullptr;
-        VECTOR2I               anchorPos;
-        PCB_LAYER_ID           layer = UNDEFINED_LAYER;
-        NETINFO_ITEM*          net = nullptr;
-        IMPORTED_TD_KEY        key;
-        std::string            originalSpec;
-        bool                   previous = false;
-        bool                   logicalSideKnown = true;
-        char                   physicalEndpoint = '\0';
-        bool                   persistentAnchor = false;
-        bool                   trackNodeAnchor = false;
-    };
-
-    std::vector<IMPORTED_TD_CONNECTION> importedConnections;
-    size_t tdUnmatched = 0;
-    size_t tdDefaultOmitted = 0;
-
-    for( const PADS_IO::ROUTE& route : routes )
-    {
-        NETINFO_ITEM* net =
-                m_loadBoard->FindNet( PADS_COMMON::ConvertInvertedNetName( route.net_name ) );
-
-        if( !net )
-            continue;
-
-        for( const PADS_IO::TEARDROP& td : route.teardrops )
-        {
-            const VECTOR2I anchorPos = scalePoint( td.x, td.y );
-
-            auto collectConnection =
-                    [&]( bool aPrevious )
-                    {
-                        if( !( aPrevious ? td.previous_connected : td.next_connected ) )
-                        {
-                            ++tdUnmatched;
-                            return;
-                        }
-
-                        PCB_LAYER_ID layer =
-                                getMappedLayer( aPrevious ? td.previous_layer : td.next_layer );
-
-                        if( !IsCopperLayer( layer ) )
-                        {
-                            ++tdUnmatched;
-                            return;
-                        }
-
-                        const auto& neighbour = aPrevious ? td.previous_point : td.next_point;
-                        VECTOR2I outside = scalePoint( neighbour.x, neighbour.y );
-                        PCB_TRACK* source = nullptr;
-
-                        for( PCB_TRACK* item : m_loadBoard->Tracks() )
-                        {
-                            if( item->Type() != PCB_TRACE_T
-                                || item->GetNetCode() != net->GetNetCode()
-                                || item->GetLayer() != layer )
-                            {
-                                continue;
-                            }
-
-                            if( ( item->GetStart() == anchorPos && item->GetEnd() == outside )
-                                || ( item->GetEnd() == anchorPos && item->GetStart() == outside ) )
-                            {
-                                source = item;
-                                break;
-                            }
-                        }
-
-                        if( !source )
-                        {
-                            ++tdUnmatched;
-                            return;
-                        }
-
-                        if( m_importPadsTeardropMetadata )
-                        {
-                            // PADS binary per-track teardrop metadata v1.22.  Preserve
-                            // this before geometry/anchor filtering: a future plugin
-                            // must also see ends that this importer cannot render.
-                            // P/N is route adjacency; Start/End is the corresponding
-                            // endpoint of the actual KiCad segment.
-                            const bool metadataAtStart = source->GetStart() == anchorPos;
-                            const wxString metadataPrefix =
-                                    metadataAtStart ? wxS( "PADS Teardrop Start " )
-                                                    : wxS( "PADS Teardrop End " );
-                            const char metadataShape =
-                                    aPrevious ? td.previous_shape : td.next_shape;
-                            const bool metadataAdjustable =
-                                    aPrevious ? td.previous_adjustable : td.next_adjustable;
-                            const int metadataFlags =
-                                    aPrevious ? td.previous_flags : td.next_flags;
-                            const double metadataWidth =
-                                    aPrevious ? td.previous_width : td.next_width;
-                            const double metadataLength =
-                                    aPrevious ? td.previous_length : td.next_length;
-
-                            source->SetCustomProperty(
-                                    wxS( "PADS Teardrop Metadata Version" ),
-                                    td.logical_side_known ? wxS( "1" ) : wxS( "2" ) );
-
-                            if( td.logical_side_known )
-                            {
-                                source->SetCustomProperty( metadataPrefix + wxS( "Side" ),
-                                                           aPrevious ? wxS( "P" )
-                                                                     : wxS( "N" ) );
-                            }
-                            else if( td.physical_endpoint != '\0' )
-                            {
-                                source->SetCustomProperty(
-                                        metadataPrefix + wxS( "Physical Endpoint" ),
-                                        td.physical_endpoint == 'S' ? wxS( "START" )
-                                                                    : wxS( "END" ) );
-                            }
-                            source->SetCustomProperty(
-                                    metadataPrefix + wxS( "Anchor" ),
-                                    wxString::Format( wxS( "%lld,%lld" ),
-                                                      static_cast<long long>( anchorPos.x ),
-                                                      static_cast<long long>( anchorPos.y ) ) );
-                            source->SetCustomProperty(
-                                    metadataPrefix + wxS( "Width Ratio" ),
-                                    wxString::FromUTF8(
-                                            fmt::format( "{:.17g}", metadataWidth ).c_str() ) );
-                            source->SetCustomProperty(
-                                    metadataPrefix + wxS( "Length Ratio" ),
-                                    wxString::FromUTF8(
-                                            fmt::format( "{:.17g}", metadataLength ).c_str() ) );
-                            source->SetCustomProperty( metadataPrefix + wxS( "Shape" ),
-                                                       wxString::Format( wxS( "%c" ),
-                                                                         metadataShape ) );
-                            source->SetCustomProperty( metadataPrefix + wxS( "Auto Adjust" ),
-                                                       metadataAdjustable ? wxS( "1" )
-                                                                          : wxS( "0" ) );
-                            source->SetCustomProperty( metadataPrefix + wxS( "Flags" ),
-                                                       wxString::Format( wxS( "%d" ),
-                                                                         metadataFlags ) );
-
-                            if( !td.original_spec.empty() )
-                            {
-                                source->SetCustomProperty(
-                                        metadataPrefix + wxS( "Original" ),
-                                        wxString::FromUTF8( td.original_spec.c_str() ) );
-                            }
-
-                        }
-
-                        if( !m_generatePadsTeardropCopper )
-                            return;
-
-                        BOARD_ITEM* anchor = nullptr;
-                        bool persistentAnchor = false;
-                        bool trackNodeAnchor = false;
-                        int anchorSize = 0;
-
-                        for( FOOTPRINT* fp : m_loadBoard->Footprints() )
-                        {
-                            for( PAD* pad : fp->Pads() )
-                            {
-                                if( pad->GetPosition() == anchorPos
-                                    && pad->GetNetCode() == net->GetNetCode()
-                                    && pad->IsOnLayer( layer ) )
-                                {
-                                    anchor = pad;
-                                    persistentAnchor = true;
-                                    VECTOR2I sz = pad->GetSize( layer );
-                                    anchorSize = std::max( 1, std::min( sz.x, sz.y ) );
-                                    break;
-                                }
-                            }
-
-                            if( anchor )
-                                break;
-                        }
-
-                        if( !anchor )
-                        {
-                            for( PCB_TRACK* item : m_loadBoard->Tracks() )
-                            {
-                                if( item->Type() != PCB_VIA_T )
-                                    continue;
-
-                                PCB_VIA* via = static_cast<PCB_VIA*>( item );
-
-                                if( via->GetPosition() == anchorPos
-                                    && via->GetNetCode() == net->GetNetCode()
-                                    && via->IsOnLayer( layer ) )
-                                {
-                                    anchor = via;
-                                    persistentAnchor = true;
-                                    anchorSize = via->GetWidth( layer );
-                                    break;
-                                }
-                            }
-                        }
-
-                        if( !anchor )
-                        {
-                            for( PCB_TRACK* item : m_loadBoard->Tracks() )
-                            {
-                                if( item->Type() == PCB_TRACE_T
-                                    && item != source
-                                    && item->GetNetCode() == net->GetNetCode()
-                                    && item->GetLayer() == layer
-                                    && ( item->GetStart() == anchorPos
-                                         || item->GetEnd() == anchorPos )
-                                    && item->GetWidth() > anchorSize )
-                                {
-                                    anchor = item;
-                                    anchorSize = item->GetWidth();
-                                }
-                            }
-
-                            trackNodeAnchor = true;
-                        }
-
-                        if( !anchor || anchorSize <= 0 )
-                        {
-                            ++tdUnmatched;
-                            return;
-                        }
-
-                        // PADS Default is a real teardrop on circular/oval pads and
-                        // vias, but the tested square/rectangular pads do not render it.
-                        // Test the copper shape on this layer, after finding the anchor.
-                        // Leave L/C independent of this Default-only rule.
-                        if( ( aPrevious ? td.previous_shape : td.next_shape ) == 'D' )
-                        {
-                            bool roundedAnchor = anchor->Type() == PCB_VIA_T;
-
-                            if( anchor->Type() == PCB_PAD_T )
-                            {
-                                PAD* pad = static_cast<PAD*>( anchor );
-                                PAD_SHAPE padShape = pad->GetShape( layer );
-                                roundedAnchor = padShape == PAD_SHAPE::CIRCLE
-                                                || padShape == PAD_SHAPE::ROUNDRECT;
-
-                                // PADS Default oval cap rule v1.18. A stadium-shaped
-                                // pad has straight sides between its semicircular ends.
-                                // Rotate the route direction into the pad's local frame
-                                // (the same convention used by KiCad's oval geometry).
-                                if( padShape == PAD_SHAPE::OVAL )
-                                {
-                                    VECTOR2I direction = outside - pad->GetPosition();
-                                    RotatePoint( direction, pad->GetOrientation() );
-                                    VECTOR2I size = pad->GetSize( layer );
-                                    double dx = std::abs( static_cast<double>( direction.x ) );
-                                    double dy = std::abs( static_cast<double>( direction.y ) );
-
-                                    if( size.x > size.y )
-                                    {
-                                        // At the horizontal side y = size.y/2, the
-                                        // end cap starts at x = (size.x-size.y)/2.
-                                        roundedAnchor = dx * size.y
-                                                        > dy * ( size.x - size.y );
-                                    }
-                                    else if( size.y > size.x )
-                                    {
-                                        roundedAnchor = dy * size.x
-                                                        > dx * ( size.y - size.x );
-                                    }
-                                    else
-                                    {
-                                        roundedAnchor = true;
-                                    }
-                                }
-                            }
-
-                            if( !roundedAnchor )
-                            {
-                                ++tdDefaultOmitted;
-                                return;
-                            }
-                        }
-
-                        IMPORTED_TD_CONNECTION connection;
-                        connection.source = source;
-                        connection.anchor = anchor;
-                        connection.anchorPos = anchorPos;
-                        connection.layer = layer;
-                        connection.net = net;
-                        connection.previous = aPrevious;
-                        connection.logicalSideKnown = td.logical_side_known;
-                        connection.physicalEndpoint = td.physical_endpoint;
-                        connection.persistentAnchor = persistentAnchor;
-                        connection.trackNodeAnchor = trackNodeAnchor;
-                        connection.originalSpec = td.original_spec;
-                        connection.key.width = aPrevious ? td.previous_width : td.next_width;
-                        connection.key.length = aPrevious ? td.previous_length : td.next_length;
-                        connection.key.shape = aPrevious ? td.previous_shape : td.next_shape;
-                        connection.key.adjustable =
-                                aPrevious ? td.previous_adjustable : td.next_adjustable;
-                        importedConnections.push_back( std::move( connection ) );
-                    };
-
-            if( td.has_previous )
-                collectConnection( true );
-
-            if( td.has_next )
-                collectConnection( false );
-        }
-    }
-
-    std::map<BOARD_ITEM*, std::vector<size_t>> anchorConnections;
-
-    for( size_t i = 0; i < importedConnections.size(); ++i )
-    {
-        if( importedConnections[i].persistentAnchor )
-            anchorConnections[importedConnections[i].anchor].push_back( i );
-    }
-
-    auto makeParams =
-            []( const IMPORTED_TD_KEY& aKey )
-            {
-                TEARDROP_PARAMETERS params;
-                params.m_Enabled = true;
-                params.SetTeardropSizeRatio( aKey.length / 100.0, aKey.width / 100.0 );
-                params.m_CurvedEdges = aKey.shape == 'C';
-                params.SetTeardropMaxSize( 0, 0 );
-                params.m_WidthtoSizeFilterRatio = 1.0;
-                params.m_TdOnPadsInZones = true;
-                // PADS A is retained in metadata only. Use KiCad's normal
-                // short-segment setting independently of the original A flag.
-                params.m_AllowUseTwoTracks = true;
-                return params;
-            };
-
-    std::set<BOARD_ITEM*> nativeAnchors;
-    size_t tdNativePads = 0;
-    size_t tdNativeVias = 0;
-    size_t tdDivergentAnchors = 0;
-
-    for( const auto& [anchor, indices] : anchorConnections )
-    {
-        if( indices.empty() )
-            continue;
-
-        const IMPORTED_TD_KEY& first = importedConnections[indices.front()].key;
-        bool uniform = true;
-        std::set<PCB_TRACK*> specifiedTracks;
-
-        for( size_t index : indices )
-        {
-            const IMPORTED_TD_CONNECTION& connection = importedConnections[index];
-            uniform = uniform && connection.key == first;
-            specifiedTracks.insert( connection.source );
-        }
-
-        // Native pad/via parameters affect every connected trace.  Do not use them when
-        // PADS enabled the teardrop on only a subset of those traces.
-        std::set<PCB_TRACK*> eligibleTracks;
-        const IMPORTED_TD_CONNECTION& sample = importedConnections[indices.front()];
-
-        for( PCB_TRACK* item : m_loadBoard->Tracks() )
-        {
-            if( item->Type() != PCB_TRACE_T
-                || item->GetNetCode() != sample.net->GetNetCode()
-                || ( item->GetStart() != sample.anchorPos && item->GetEnd() != sample.anchorPos ) )
-            {
-                continue;
-            }
-
-            bool onAnchorLayer = false;
-
-            if( anchor->Type() == PCB_PAD_T )
-                onAnchorLayer = static_cast<PAD*>( anchor )->IsOnLayer( item->GetLayer() );
-            else if( anchor->Type() == PCB_VIA_T )
-                onAnchorLayer = static_cast<PCB_VIA*>( anchor )->IsOnLayer( item->GetLayer() );
-
-            if( onAnchorLayer )
-                eligibleTracks.insert( item );
-        }
-
-        uniform = uniform && specifiedTracks == eligibleTracks;
-
-        if( !uniform )
-        {
-            ++tdDivergentAnchors;
+            m_loadBoard->Add( footprint );
             continue;
         }
-
-        TEARDROP_PARAMETERS params = makeParams( first );
-
-        if( anchor->Type() == PCB_PAD_T )
-        {
-            static_cast<PAD*>( anchor )->GetTeardropParams() = params;
-            ++tdNativePads;
-        }
-        else
-        {
-            static_cast<PCB_VIA*>( anchor )->GetTeardropParams() = params;
-            ++tdNativeVias;
-        }
-
-        nativeAnchors.insert( anchor );
     }
 
-    size_t tdNativeZones = 0;
-    size_t tdPerConnectionZones = 0;
-    size_t tdNativeSkipped = 0;
-    std::set<std::vector<int>> tdEmittedContours;
-    TEARDROP_MANAGER nativeTeardrops( m_loadBoard, nullptr );
-    nativeTeardrops.BuildTrackCaches();
+    PADS_PCB_CONVERTER::VIA_LOAD_OPTIONS viaOptions;
+    viaOptions.allowUnconnected = true;
+    viaOptions.excludedNames.insert( "TP" );
+    m_converter->LoadVias( routes, viaOptions );
 
-    for( const IMPORTED_TD_CONNECTION& connection : importedConnections )
-    {
-        TEARDROP_PARAMETERS params = makeParams( connection.key );
-        bool nativeAnchor = nativeAnchors.contains( connection.anchor );
-        const auto variant = connection.trackNodeAnchor
-                ? TEARDROP_MANAGER::TD_TYPE_TRACKEND
-                : TEARDROP_MANAGER::TD_TYPE_PADVIA;
-        std::unique_ptr<ZONE> generated( nativeTeardrops.BuildImportedTeardrop(
-                params, connection.source, connection.anchor, connection.anchorPos, variant ) );
-
-        if( !generated )
-        {
-            ++tdNativeSkipped;
-            continue;
-        }
-
-        const SHAPE_LINE_CHAIN& contour = generated->Outline()->COutline( 0 );
-        std::vector<int> contourKey = { connection.net->GetNetCode(),
-                                        static_cast<int>( connection.layer ) };
-
-        for( int i = 0; i < contour.PointCount(); ++i )
-        {
-            contourKey.push_back( contour.CPoint( i ).x );
-            contourKey.push_back( contour.CPoint( i ).y );
-        }
-
-        if( !tdEmittedContours.insert( contourKey ).second )
-            continue;
-
-        ZONE* zone = generated.get();
-
-        // PADS static incompatible teardrops v1.13.
-        // Preserve per-connection copper without exposing it to KiCad's native
-        // teardrop updater/remover. Use a normal zone's default area type rather
-        // than relying on the numeric value of the enum.
-        if( !nativeAnchor )
-        {
-            ZONE ordinaryZone( m_loadBoard );
-            zone->SetTeardropAreaType( ordinaryZone.GetTeardropAreaType() );
-
-            // Prevent the native updater from adding teardrops on this same anchor.
-            // The user can explicitly enable native parameters after deleting the
-            // imported copper if a shared pad/via configuration is desired.
-            if( connection.persistentAnchor )
-            {
-                if( connection.anchor->Type() == PCB_PAD_T )
-                    static_cast<PAD*>( connection.anchor )->GetTeardropParams().m_Enabled = false;
-                else if( connection.anchor->Type() == PCB_VIA_T )
-                    static_cast<PCB_VIA*>( connection.anchor )->GetTeardropParams().m_Enabled = false;
-            }
-        }
-        zone->SetCustomProperty( wxS( "PADS Storage" ),
-                                 nativeAnchor ? wxS( "KiCad native anchor" )
-                                              : wxS( "Per-connection" ) );
-        if( connection.logicalSideKnown )
-        {
-            zone->SetCustomProperty( wxS( "PADS Side" ),
-                                     connection.previous ? wxS( "P" ) : wxS( "N" ) );
-        }
-        else if( connection.physicalEndpoint != '\0' )
-        {
-            zone->SetCustomProperty(
-                    wxS( "PADS Physical Endpoint" ),
-                    connection.physicalEndpoint == 'S' ? wxS( "START" ) : wxS( "END" ) );
-        }
-        zone->SetCustomProperty( wxS( "PADS Width" ),
-                                 wxString::FromUTF8(
-                                         fmt::format( "{}", connection.key.width ).c_str() ) );
-        zone->SetCustomProperty( wxS( "PADS Length" ),
-                                 wxString::FromUTF8(
-                                         fmt::format( "{}", connection.key.length ).c_str() ) );
-        zone->SetCustomProperty( wxS( "PADS Shape" ),
-                                 wxString::Format( wxS( "%c" ), connection.key.shape ) );
-        zone->SetCustomProperty( wxS( "PADS Adjustable" ),
-                                 connection.key.adjustable ? wxS( "yes" ) : wxS( "no" ) );
-
-        if( !connection.originalSpec.empty() )
-        {
-            zone->SetCustomProperty(
-                    wxS( "PADS Original" ),
-                    wxString::FromUTF8( connection.originalSpec.c_str() ) );
-        }
-
-        zone->SetNeedRefill( false );
-        zone->SetAssignedPriority( 600 );
-        m_loadBoard->Add( generated.release() );
-
-        if( nativeAnchor )
-            ++tdNativeZones;
-        else
-            ++tdPerConnectionZones;
-    }
-
-    if( m_reporter )
-    {
-        m_reporter->Report(
-                wxString::Format(
-                        _( "PADS hybrid teardrops: %zu native pad anchors, %zu native via anchors, "
-                           "%zu divergent anchors; %zu native zones, %zu per-connection zones, "
-                           "%zu unmatched/skipped; %zu Default ends omitted (v1.16 shapes)" ),
-                        tdNativePads, tdNativeVias, tdDivergentAnchors, tdNativeZones,
-                        tdPerConnectionZones, tdUnmatched + tdNativeSkipped,
-                        tdDefaultOmitted ),
-                ( tdUnmatched || tdNativeSkipped ) ? RPT_SEVERITY_WARNING : RPT_SEVERITY_INFO );
-    }
-
+m_converter->LoadTeardrops( routes, m_importPadsTeardropMetadata,
+                                m_generatePadsTeardropCopper );
 }
-
 
 void PCB_IO_PADS_BINARY::loadCopperShapes()
 {

@@ -2547,6 +2547,62 @@ void PARSER::parseSectionROUTES( std::ifstream& aStream )
     {
         current_route->tracks.push_back( current_track );
     }
+
+    // Normalize ASCII via physical data for the common VIA materializer.
+    // Route topology and semantic attributes are left untouched.
+    for( ROUTE& route : m_routes )
+    {
+        for( VIA& via : route.vias )
+        {
+            if( !via.stack.empty() )
+                continue;
+
+            double viaSize = 20.0;
+            double viaDrill = 10.0;
+
+            auto defIt = m_via_defs.find( via.name );
+
+            if( defIt != m_via_defs.end() )
+            {
+                const VIA_DEF& def = defIt->second;
+                viaSize = def.size;
+                viaDrill = def.drill;
+                via.start_layer = def.start_layer;
+                via.end_layer = def.end_layer;
+            }
+            else
+            {
+                via.start_layer = 1;
+                via.end_layer = m_parameters.layer_count;
+            }
+
+            if( via.start_layer <= 0 || via.end_layer <= 0
+                || via.start_layer == via.end_layer )
+            {
+                via.start_layer = 1;
+                via.end_layer = m_parameters.layer_count;
+            }
+
+            auto addCopperRow = [&]( int aLayer )
+            {
+                PAD_STACK_LAYER row;
+                row.layer = aLayer;
+                row.shape = "R";
+                row.sizeA = viaSize;
+                row.sizeB = viaSize;
+                row.drill = viaDrill;
+                row.plated = true;
+                via.stack.push_back( row );
+            };
+
+            // Preserve the legacy ASCII physical representation: one circular
+            // diameter on front/inner/back. Solder-mask semantics do NOT come
+            // from missing padstack rows; they live in via.attributes.
+            addCopperRow( -2 );
+            addCopperRow( 0 );
+            addCopperRow( -1 );
+        }
+    }
 }
 
 void PARSER::parseSectionTEXT( std::ifstream& aStream )
@@ -5012,6 +5068,165 @@ void PARSER::parseSectionMISC( std::ifstream& aStream )
                         currentDiffPair.negative_net = netName;
                 }
             }
+        }
+
+        // PADS ASCII per-VIA semantic attributes.
+        //
+        // ATTRIBUTE VALUES serializes a VIA instance as:
+        //
+        //   VIA <via-def> <instance-name> <x> <y>
+        //   {
+        //   "CAM.Solder mask.Adjust" <quantity>
+        //   }
+        //
+        // Route VIA objects are created earlier from *ROUTES*. Match by via
+        // definition and exact PADS coordinates, then attach the normalized
+        // typed attribute to every co-located logical representation so later
+        // physical-via de-duplication cannot discard the only copy.
+        if( token == "VIA" && !inDifPair && !inNetClass )
+        {
+            std::string viaDefName;
+            std::string viaInstanceName;
+            double viaX = 0.0;
+            double viaY = 0.0;
+
+            if( iss >> viaDefName >> viaInstanceName >> viaX >> viaY )
+            {
+                int savedDepth = braceDepth;
+                std::vector<PADS_TYPED_ATTRIBUTE> viaAttributes;
+
+                while( readLine( aStream, line ) )
+                {
+                    if( line.empty() )
+                        continue;
+
+                    if( line[0] == '}' )
+                        break;
+
+                    if( line[0] == '{' )
+                        continue;
+
+                    if( line[0] == '*' )
+                    {
+                        pushBackLine( line );
+                        clampDesignRuleSentinels();
+                        return;
+                    }
+
+                    std::string attrName;
+                    std::string attrValue;
+
+                    if( line[0] == '"' )
+                    {
+                        size_t endQuote = line.find( '"', 1 );
+
+                        if( endQuote != std::string::npos )
+                        {
+                            attrName = line.substr( 1, endQuote - 1 );
+                            attrValue = line.substr( endQuote + 1 );
+                        }
+                    }
+                    else
+                    {
+                        std::istringstream attrSS( line );
+                        attrSS >> attrName;
+                        std::getline( attrSS >> std::ws, attrValue );
+                    }
+
+                    while( !attrValue.empty() && attrValue.front() == ' ' )
+                        attrValue.erase( attrValue.begin() );
+
+                    if( attrName != "CAM.Solder mask.Adjust" || attrValue.empty() )
+                        continue;
+
+                    std::optional<double> quantityMeters;
+
+                    auto parseSuffixQuantity =
+                            [&]( const std::string& aSuffix, double aScaleToMeters )
+                            {
+                                if( attrValue.size() <= aSuffix.size()
+                                    || attrValue.compare( attrValue.size() - aSuffix.size(),
+                                                          aSuffix.size(), aSuffix ) != 0 )
+                                {
+                                    return;
+                                }
+
+                                const std::string number =
+                                        attrValue.substr( 0, attrValue.size() - aSuffix.size() );
+
+                                quantityMeters =
+                                        PADS_COMMON::ParseDouble(
+                                                number, 0.0,
+                                                "ASCII VIA CAM.Solder mask.Adjust" )
+                                        * aScaleToMeters;
+                            };
+
+                    // PADS DBU: 38100 dbunit == 1 mil.
+                    // PADS BASIC units: 38100 dbunit == 1 mil.
+                    parseSuffixQuantity(
+                            "dbunit",
+                            25.4e-6 / 38100.0 );
+
+                    if( !quantityMeters )
+                        parseSuffixQuantity( "mm", 1.0e-3 );
+
+                    if( !quantityMeters )
+                        parseSuffixQuantity( "mil", 25.4e-6 );
+
+                    if( !quantityMeters )
+                        parseSuffixQuantity( "in", 0.0254 );
+
+                    if( !quantityMeters )
+                        continue;
+
+                    PADS_TYPED_ATTRIBUTE attribute;
+                    attribute.name = attrName;
+                    attribute.type = PADS_ATTRIBUTE_TYPE::QUANTITY;
+                    attribute.value = *quantityMeters;
+                    viaAttributes.push_back( std::move( attribute ) );
+                }
+
+                if( !viaAttributes.empty() )
+                {
+                    size_t matches = 0;
+
+                    for( ROUTE& route : m_routes )
+                    {
+                        for( VIA& via : route.vias )
+                        {
+                            if( via.name != viaDefName
+                                || via.location.x != viaX
+                                || via.location.y != viaY )
+                            {
+                                continue;
+                            }
+
+                            for( const PADS_TYPED_ATTRIBUTE& attribute : viaAttributes )
+                            {
+                                auto existing = std::find_if(
+                                        via.attributes.begin(), via.attributes.end(),
+                                        [&]( const PADS_TYPED_ATTRIBUTE& aExisting )
+                                        {
+                                            return aExisting.name == attribute.name;
+                                        } );
+
+                                if( existing == via.attributes.end() )
+                                    via.attributes.push_back( attribute );
+                                else
+                                    *existing = attribute;
+                            }
+
+                            ++matches;
+                        }
+                    }
+
+                }
+
+                // The block braces were consumed locally, just like PART blocks.
+                braceDepth = savedDepth;
+            }
+
+            continue;
         }
 
         // Parse per-instance attribute blocks: PART <refdes> { key value ... }

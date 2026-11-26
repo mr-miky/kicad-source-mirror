@@ -33,6 +33,7 @@
 
 #include "pads_layer_mapper.h"
 #include "pads_parser.h"
+#include <utility>
 
 class BOARD;
 class FOOTPRINT;
@@ -69,6 +70,9 @@ public:
     PADS_PCB_CONVERTER( BOARD* aBoard, REPORTER* aReporter );
 
     BOARD* GetBoard() const { return m_board; }
+
+    /** Put importer/source version information in the visible title-block comments. */
+    void SetSourceVersionComment( const wxString& aComment );
 
     KIFONT::FONT* GetPadsRomansimFont() const { return m_padsRomansimFont; }
 
@@ -160,6 +164,46 @@ PADS_UNIT_CONVERTER& UnitConverter() { return m_unitConverter; }
                                int aWidth ) const;
 
     void LoadTexts( const std::vector<PADS_IO::TEXT>& aTexts );
+
+    /**
+     * Convert decoded PADS teardrops to KiCad.
+     *
+     * ASCII and binary readers both populate PADS_IO::TEARDROP; source-format
+     * quirks stay in the parsers, while KiCad anchor selection, native teardrop
+     * parameters and static fallback are shared here.
+     */
+    /**
+     * Materialize normalized PADS route geometry as KiCad copper.
+     *
+     * PADS ASCII can repeat one physical segment in several logical pin-pair
+     * traversals, while binary route graphs can also expose the same physical
+     * object more than once. De-duplicate only here, after parsing, so the
+     * logical PADS route/teardrop semantics remain intact in the IR.
+     *
+     * @param aAllowUnconnected permits binary physical copper whose route has
+     *        no net name.
+     * @param aMinimumWidth clamps source widths to this KiCad width when
+     *        non-zero (ASCII legacy behaviour); when zero, a non-positive
+     *        width is rejected (binary legacy behaviour).
+     * @return number of duplicate physical route pieces suppressed.
+     */
+    struct VIA_LOAD_OPTIONS
+    {
+        bool allowUnconnected = false;
+        int minimumSize = 0;
+        std::set<std::pair<int, int>> excludedPositions;
+        std::set<std::string> excludedNames;
+    };
+
+    size_t LoadTracks( const std::vector<PADS_IO::ROUTE>& aRoutes,
+                       bool aAllowUnconnected, int aMinimumWidth );
+
+    size_t LoadVias( const std::vector<PADS_IO::ROUTE>& aRoutes,
+                     const VIA_LOAD_OPTIONS& aOptions );
+
+
+    void LoadTeardrops( const std::vector<PADS_IO::ROUTE>& aRoutes,
+                        bool aImportMetadata, bool aGenerateCopper );
 
     void ConfigureTestPointPad( PAD* aPad ) const;
 

@@ -182,6 +182,7 @@ public:
 
     int      GetLayerCount() const { return m_parameters.layer_count; }
     uint16_t GetVersion() const { return m_version; }
+    const std::string& GetGeneratorVersion() const { return m_generatorVersion; }
 
     std::vector<LAYER_INFO> GetLayerInfos() const;
 
@@ -215,6 +216,13 @@ private:
         int32_t     y = 0;
         std::string netName;
         int         viaIndex = -1;
+        // Section-60 T+9.  Zero means no local attribute overrides.
+        uint32_t    attributeHandle = 0;
+        // Resolved structural link inside the 0x44-byte post-layer attribute graph.
+        uint32_t    attributeValueClass = 0;
+        uint32_t    attributeValuePointer = 0;
+        std::optional<double> attributeQuantityMeters;
+        std::string attributeName;
         bool        relationshipNet = false;
     };
 
@@ -418,6 +426,10 @@ private:
     BINARY_CURSOR               m_cursor{ m_data };
 
     uint16_t m_version = 0;
+
+    // PADS CAM metadata version, e.g. V4.0. This is the most useful
+    // human-facing version when matching a binary board to an ASCII dialect.
+    std::string m_generatorVersion;
 
     // Coordinate origin from the serialized board-setup block.
     int32_t m_originX = 0;

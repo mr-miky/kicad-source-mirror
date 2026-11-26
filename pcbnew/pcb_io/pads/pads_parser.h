@@ -20,6 +20,7 @@
 #pragma once
 
 #include <string>
+#include <variant>
 #include <vector>
 #include <map>
 #include <optional>
@@ -398,6 +399,37 @@ struct VIA_DEF
     bool has_mask_back = false;   ///< Stack includes bottom soldermask, layer 28
 };
 
+/**
+ * Semantic PADS object attribute.
+ *
+ * Binary-format graph handles, class pointers and value-pool pointers must not
+ * escape the source parser. ASCII and binary importers normalize attributes
+ * into this representation before the common converter consumes them.
+ *
+ * QUANTITY values decoded from the binary database are stored in SI units.
+ */
+enum class PADS_ATTRIBUTE_TYPE
+{
+    UNKNOWN,
+    BOOLEAN,
+    INTEGER,
+    FLOAT,
+    QUANTITY,
+    TEXT,
+    LIST
+};
+
+using PADS_ATTRIBUTE_VALUE =
+        std::variant<std::monostate, bool, int64_t, double, std::string>;
+
+struct PADS_TYPED_ATTRIBUTE
+{
+    std::string          name;
+    PADS_ATTRIBUTE_TYPE  type = PADS_ATTRIBUTE_TYPE::UNKNOWN;
+    PADS_ATTRIBUTE_VALUE value;
+};
+
+
 struct VIA
 {
     std::string name;
@@ -405,6 +437,7 @@ struct VIA
     std::vector<PAD_STACK_LAYER> stack;
     int                          start_layer = 0;
     int                          end_layer = 0;
+    std::vector<PADS_TYPED_ATTRIBUTE> attributes;
 };
 
 enum class POUR_STYLE
