@@ -210,19 +210,25 @@ private:
     /// One placed via recovered from the section-60 junction ring. relationshipNet records
     /// whether netName came from the section-49 relationship graph, which outranks the
     /// record's own net index when co-located vias disagree.
+    struct VIA_ATTRIBUTE_REF
+    {
+        uint32_t                   valueClass = 0;
+        uint32_t                   valuePointer = 0;
+        std::string                name;
+        std::optional<double>      quantityMeters;
+        std::optional<std::string> textValue;
+        size_t                     nameDepth = 0;
+    };
+
     struct VIA_LOCATION
     {
         int32_t     x = 0;
         int32_t     y = 0;
         std::string netName;
         int         viaIndex = -1;
-        // Section-60 T+9.  Zero means no local attribute overrides.
+        // Section-60 T+9. Zero means no local attribute overrides.
         uint32_t    attributeHandle = 0;
-        // Resolved structural link inside the 0x44-byte post-layer attribute graph.
-        uint32_t    attributeValueClass = 0;
-        uint32_t    attributeValuePointer = 0;
-        std::optional<double> attributeQuantityMeters;
-        std::string attributeName;
+        std::vector<VIA_ATTRIBUTE_REF> attributes;
         bool        relationshipNet = false;
     };
 

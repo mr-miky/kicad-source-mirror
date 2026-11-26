@@ -5136,7 +5136,21 @@ void PARSER::parseSectionMISC( std::ifstream& aStream )
                     while( !attrValue.empty() && attrValue.front() == ' ' )
                         attrValue.erase( attrValue.begin() );
 
-                    if( attrName != "CAM.Solder mask.Adjust" || attrValue.empty() )
+                    if( attrValue.empty() )
+                        continue;
+
+                    if( attrName == "TEST.FreeText" )
+                    {
+                        PADS_TYPED_ATTRIBUTE attribute;
+                        attribute.name = attrName;
+                        attribute.type = PADS_ATTRIBUTE_TYPE::TEXT;
+                        attribute.value = attrValue;
+
+                        viaAttributes.push_back( std::move( attribute ) );
+                        continue;
+                    }
+
+                    if( attrName != "CAM.Solder mask.Adjust" )
                         continue;
 
                     std::optional<double> quantityMeters;
@@ -5188,7 +5202,6 @@ void PARSER::parseSectionMISC( std::ifstream& aStream )
 
                 if( !viaAttributes.empty() )
                 {
-                    size_t matches = 0;
 
                     for( ROUTE& route : m_routes )
                     {
@@ -5215,8 +5228,6 @@ void PARSER::parseSectionMISC( std::ifstream& aStream )
                                 else
                                     *existing = attribute;
                             }
-
-                            ++matches;
                         }
                     }
 

@@ -2867,13 +2867,22 @@ std::vector<BINARY_PARSER::VIA_LOCATION> BINARY_PARSER::decodeViaLocations()
         return {};
     };
 
-    // PADS post-layer local-attribute graph v1.
-    // Controlled VIA tests show fixed 0x44-byte nodes.  A node is self-identifying at
-    // +0x00/+0x04/+0x20/+0x24.  The VIA T+9 handle names a root node; following +0x0c
-    // twice reaches the value node.  Its +0x1c field is the shared value-node class and
-    // +0x3c is the relocation-domain pointer to the serialized value slot.
+    // PADS multi-attribute local graph v3.
+    //
+    // Section-60 T+9 points at a per-object root. root +0x10 is the local
+    // attribute count and root +0x0c points at the first top-level attribute
+    // node. Top-level siblings form a circular intrusive list through the
+    // +0x20/+0x24 handle. Within one hierarchical attribute, +0x0c walks
+    // toward the next name component.
+    //
+    // The node owning the value is not necessarily the final name component.
+    // CAM.Solder mask.Adjust proves that the usable valueClass/valuePointer
+    // live on the first chain node whose class resolves to the complete
+    // semantic attribute name.
     constexpr size_t PADS_ATTR_NODE_BYTES = 0x44;
-    std::map<uint32_t, size_t> attributeNodes;
+    constexpr size_t PADS_ATTR_MAX_CHAIN = 32;
+    std::map<uint32_t, size_t> strictAttributeNodes;
+    std::vector<size_t> attributeNodeOffsets;
     size_t attributeGraphEnd = 0;
     bool hasViaAttributes = false;
 
@@ -2884,26 +2893,67 @@ std::vector<BINARY_PARSER::VIA_LOCATION> BINARY_PARSER::decodeViaLocations()
     {
         for( size_t offset = 0; offset + PADS_ATTR_NODE_BYTES <= m_data.size(); ++offset )
         {
-            uint32_t handle = m_cursor.U32At( offset );
+            const uint32_t objectHandle = m_cursor.U32At( offset + 0x00 );
+            const uint32_t siblingHandle = m_cursor.U32At( offset + 0x20 );
 
-            if( handle == 0 )
+            if( objectHandle == 0 || siblingHandle == 0
+                || m_cursor.U32At( offset + 0x04 ) != objectHandle
+                || m_cursor.U32At( offset + 0x24 ) != siblingHandle )
+            {
+                continue;
+            }
+
+            bool sameDomain = false;
+
+            for( const VIA_LOCATION& via : viaLocations )
+            {
+                if( via.attributeHandle != 0
+                    && ( objectHandle & 0xFF000000U )
+                       == ( via.attributeHandle & 0xFF000000U ) )
+                {
+                    sameDomain = true;
+                    break;
+                }
+            }
+
+            if( !sameDomain )
                 continue;
 
-            if( m_cursor.U32At( offset + 0x04 ) == handle
-                && m_cursor.U32At( offset + 0x20 ) == handle
-                && m_cursor.U32At( offset + 0x24 ) == handle )
-            {
-                attributeNodes.try_emplace( handle, offset );
-                attributeGraphEnd = std::max( attributeGraphEnd,
-                                              offset + PADS_ATTR_NODE_BYTES );
-            }
+            attributeNodeOffsets.push_back( offset );
+            attributeGraphEnd = std::max( attributeGraphEnd,
+                                          offset + PADS_ATTR_NODE_BYTES );
+
+            if( objectHandle == siblingHandle )
+                strictAttributeNodes.try_emplace( objectHandle, offset );
         }
 
-        auto nodeOffset = [&]( uint32_t aHandle ) -> std::optional<size_t>
+        auto strictNodeOffset = [&]( uint32_t aHandle ) -> std::optional<size_t>
         {
-            auto it = attributeNodes.find( aHandle );
-            return it == attributeNodes.end() ? std::nullopt
-                                              : std::optional<size_t>( it->second );
+            auto it = strictAttributeNodes.find( aHandle );
+            return it == strictAttributeNodes.end() ? std::nullopt
+                                                    : std::optional<size_t>( it->second );
+        };
+
+        auto relatedNodeOffset = [&]( uint32_t aObjectHandle,
+                                      uint32_t aExpectedParent ) -> std::optional<size_t>
+        {
+            std::optional<size_t> found;
+
+            for( size_t offset : attributeNodeOffsets )
+            {
+                if( m_cursor.U32At( offset + 0x00 ) != aObjectHandle
+                    || m_cursor.U32At( offset + 0x08 ) != aExpectedParent )
+                {
+                    continue;
+                }
+
+                if( found )
+                    return {};
+
+                found = offset;
+            }
+
+            return found;
         };
 
         for( VIA_LOCATION& via : viaLocations )
@@ -2911,123 +2961,551 @@ std::vector<BINARY_PARSER::VIA_LOCATION> BINARY_PARSER::decodeViaLocations()
             if( via.attributeHandle == 0 )
                 continue;
 
-            std::optional<size_t> rootNode = nodeOffset( via.attributeHandle );
+            std::optional<size_t> rootNode = strictNodeOffset( via.attributeHandle );
 
             if( !rootNode )
                 continue;
 
-            uint32_t firstHandle = m_cursor.U32At( *rootNode + 0x0c );
-            std::optional<size_t> firstNode = nodeOffset( firstHandle );
+            const uint32_t attributeCount = m_cursor.U32At( *rootNode + 0x10 );
+            uint32_t attributeHandle = m_cursor.U32At( *rootNode + 0x0c );
 
-            if( !firstNode )
+            if( attributeCount == 0 || attributeCount > 1024 || attributeHandle == 0 )
                 continue;
 
-            uint32_t valueHandle = m_cursor.U32At( *firstNode + 0x0c );
-            std::optional<size_t> valueNode = nodeOffset( valueHandle );
+            std::set<uint32_t> seenAttributes;
 
-            if( !valueNode )
-                continue;
+            for( uint32_t ordinal = 0; ordinal < attributeCount; ++ordinal )
+            {
+                if( !seenAttributes.insert( attributeHandle ).second )
+                    break;
 
-            via.attributeValueClass = m_cursor.U32At( *valueNode + 0x1c );
-            via.attributeValuePointer = m_cursor.U32At( *valueNode + 0x3c );
+                std::optional<size_t> firstNode =
+                        relatedNodeOffset( attributeHandle, via.attributeHandle );
 
-            via.attributeName =
-                    resolvePadsViaAttributeName( via.attributeValueClass );
+                if( !firstNode )
+                    break;
 
+                const uint32_t nextSiblingHandle = m_cursor.U32At( *firstNode + 0x20 );
+                size_t currentNode = *firstNode;
+                std::set<uint32_t> seenChain;
+                std::optional<VIA_ATTRIBUTE_REF> unresolvedValue;
+                bool resolvedAttribute = false;
 
-            // Temporary reverse-engineering trace. Keep this opt-in so normal imports
-            // remain silent while we validate the relocation-domain value link.
+                for( size_t depth = 0; depth < PADS_ATTR_MAX_CHAIN; ++depth )
+                {
+                    const uint32_t currentHandle = m_cursor.U32At( currentNode + 0x00 );
+
+                    if( !seenChain.insert( currentHandle ).second )
+                        break;
+
+                    const uint32_t valueClass = m_cursor.U32At( currentNode + 0x1c );
+                    const uint32_t valuePointer = m_cursor.U32At( currentNode + 0x3c );
+                    const std::string attributeName =
+                            resolvePadsViaAttributeName( valueClass );
+
+                    // A known semantic name always wins.  In particular, do not
+                    // let an earlier unresolved value-bearing node hide the later
+                    // CAM.Solder mask.Adjust node in a multi-attribute save.
+                    if( !attributeName.empty() )
+                    {
+                        VIA_ATTRIBUTE_REF attribute;
+                        attribute.valueClass = valueClass;
+                        attribute.valuePointer = valuePointer;
+                        attribute.name = attributeName;
+                        attribute.nameDepth = depth + 1;
+                        via.attributes.push_back( std::move( attribute ) );
+                        resolvedAttribute = true;
+                        break;
+                    }
+
+                    // Preserve one unresolved value-bearing node only as a
+                    // fallback for custom attribute types such as TEST.FreeText.
+                    // Continue walking the chain in case a known name resolves
+                    // later (the CAM branch does exactly that).
+                    if( valuePointer != 0 && !unresolvedValue )
+                    {
+                        VIA_ATTRIBUTE_REF attribute;
+                        attribute.valueClass = valueClass;
+                        attribute.valuePointer = valuePointer;
+                        attribute.nameDepth = depth + 1;
+                        unresolvedValue = std::move( attribute );
+                    }
+
+                    const uint32_t nextHandle = m_cursor.U32At( currentNode + 0x0c );
+
+                    if( nextHandle == 0 )
+                        break;
+
+                    const uint32_t expectedParent = m_cursor.U32At( currentNode + 0x20 );
+                    std::optional<size_t> nextNode =
+                            relatedNodeOffset( nextHandle, expectedParent );
+
+                    if( !nextNode )
+                        break;
+
+                    currentNode = *nextNode;
+                }
+
+                if( !resolvedAttribute && unresolvedValue )
+                    via.attributes.push_back( std::move( *unresolvedValue ) );
+
+                attributeHandle = nextSiblingHandle;
+            }
         }
     }
 
-    // PADS post-layer value pool v1.
+    // PADS local-attribute value records are 24 bytes:
+    //   +0x04 == 0x80000000, +0x08 == 0, +0x0c == type.
+    // QUANTITY (0x68) stores an IEEE-754 double at +0x10 in SI units.
     //
-    // Controlled local-VIA attribute tests establish:
-    //   - the fixed 0x44-byte attribute-node graph ends first;
-    //   - a 12-byte separator follows it;
-    //   - value slots use a 24-byte virtual/physical stride;
-    //   - +0x04 == 0x80000000 and +0x08 == 0 mark an active value;
-    //   - +0x0c == 0x68 is a QUANTITY;
-    //   - +0x10 is an IEEE-754 little-endian double in SI units.
-    //
-    // Derive relocation from the database itself instead of hardcoding it.
+    // Multi-attribute saves may insert extra tables between the graph and the
+    // physical value records. First validate the legacy graph-end relocation;
+    // otherwise derive a unique relocation from all resolved QUANTITY pointers
+    // and all structurally valid QUANTITY records. No relocation is hardcoded.
     constexpr size_t PADS_ATTR_VALUE_SEPARATOR_BYTES = 12;
     constexpr size_t PADS_ATTR_VALUE_BYTES = 24;
     constexpr uint32_t PADS_ATTR_VALUE_ACTIVE = 0x80000000;
     constexpr uint32_t PADS_ATTR_VALUE_QUANTITY = 0x68;
+    auto isQuantityRecord = [&]( size_t aOffset ) -> bool
+    {
+        if( aOffset + PADS_ATTR_VALUE_BYTES > m_data.size()
+            || m_cursor.U32At( aOffset + 0x04 ) != PADS_ATTR_VALUE_ACTIVE
+            || m_cursor.U32At( aOffset + 0x08 ) != 0
+            || m_cursor.U32At( aOffset + 0x0c ) != PADS_ATTR_VALUE_QUANTITY )
+        {
+            return false;
+        }
 
-    uint32_t valueDomain = 0;
-    uint32_t virtualValuePoolBase = UINT32_MAX;
+        uint64_t bits = 0;
+
+        for( size_t byte = 0; byte < sizeof( bits ); ++byte )
+            bits |= static_cast<uint64_t>( m_cursor.U8At( aOffset + 0x10 + byte ) )
+                    << ( byte * 8 );
+
+        double quantity = 0.0;
+        std::memcpy( &quantity, &bits, sizeof( quantity ) );
+        return std::isfinite( quantity );
+    };
+
+    std::vector<uint32_t> quantityPointers;
 
     for( const VIA_LOCATION& via : viaLocations )
     {
-        if( via.attributeValuePointer != 0 )
+        for( const VIA_ATTRIBUTE_REF& attribute : via.attributes )
         {
-            valueDomain = via.attributeValuePointer & 0xFF000000U;
-            break;
+            if( attribute.name == "CAM.Solder mask.Adjust"
+                && attribute.valuePointer != 0 )
+            {
+                quantityPointers.push_back( attribute.valuePointer );
+            }
         }
     }
 
-    if( valueDomain != 0 && attributeGraphEnd != 0 )
+    std::optional<uint32_t> valueRelocation;
+
+    if( !quantityPointers.empty() && attributeGraphEnd != 0 )
     {
-        for( const auto& [handle, offset] : attributeNodes )
-        {
-            (void) handle;
-            uint32_t pointer = m_cursor.U32At( offset + 0x3c );
-
-            if( pointer != 0 && ( pointer & 0xFF000000U ) == valueDomain )
-                virtualValuePoolBase = std::min( virtualValuePoolBase, pointer );
-        }
-
-        const size_t physicalValuePoolBase =
+        const uint32_t virtualBase =
+                *std::min_element( quantityPointers.begin(), quantityPointers.end() );
+        const size_t physicalBase =
                 attributeGraphEnd + PADS_ATTR_VALUE_SEPARATOR_BYTES;
 
-        if( virtualValuePoolBase != UINT32_MAX
-            && virtualValuePoolBase >= physicalValuePoolBase )
+        if( virtualBase >= physicalBase )
         {
-            const uint32_t valueRelocation =
-                    virtualValuePoolBase - static_cast<uint32_t>( physicalValuePoolBase );
+            const uint32_t legacyRelocation =
+                    virtualBase - static_cast<uint32_t>( physicalBase );
+            bool valid = true;
 
-            for( VIA_LOCATION& via : viaLocations )
+            for( uint32_t pointer : quantityPointers )
             {
-                if( via.attributeValuePointer == 0
-                    || via.attributeValuePointer < valueRelocation )
+                if( pointer < legacyRelocation
+                    || !isQuantityRecord(
+                            static_cast<size_t>( pointer - legacyRelocation ) ) )
+                {
+                    valid = false;
+                    break;
+                }
+            }
+
+            if( valid )
+                valueRelocation = legacyRelocation;
+        }
+    }
+
+    // PADS value-pool relocation corroboration v3.
+    //
+    // Matching only the known CAM QUANTITY pointers is insufficient: this board
+    // contains many valid QUANTITY records whose spacing accidentally matches
+    // the two controlled vias, producing several false relocations.  The true
+    // relocation is shared by the complete post-layer attribute graph, so score
+    // every candidate against all graph value pointers.  A correct relocation
+    // maps far more pointers onto structurally valid value records than a false
+    // candidate does.
+    //
+    // Observed value-record tags in the controlled board are:
+    //   0x68       QUANTITY
+    //   0x6c       FREETEXT/TEXT
+    //   0xffffffff empty/sentinel value slot
+    // Other active tags remain acceptable for scoring; the structural framing
+    // (+0x04 active, +0x08 zero) is the primary discriminator.
+    if( !valueRelocation && !quantityPointers.empty() )
+    {
+        std::vector<size_t> quantityRecords;
+
+        for( size_t offset = 0;
+             offset + PADS_ATTR_VALUE_BYTES <= m_data.size();
+             ++offset )
+        {
+            if( isQuantityRecord( offset ) )
+                quantityRecords.push_back( offset );
+        }
+
+        std::set<uint32_t> candidates;
+        const uint32_t firstPointer = quantityPointers.front();
+
+        for( size_t offset : quantityRecords )
+        {
+            if( firstPointer >= offset )
+                candidates.insert( firstPointer - static_cast<uint32_t>( offset ) );
+        }
+
+        for( size_t i = 1; i < quantityPointers.size() && !candidates.empty(); ++i )
+        {
+            std::set<uint32_t> surviving;
+
+            for( uint32_t candidate : candidates )
+            {
+                const uint32_t pointer = quantityPointers[i];
+
+                if( pointer >= candidate
+                    && isQuantityRecord(
+                            static_cast<size_t>( pointer - candidate ) ) )
+                {
+                    surviving.insert( candidate );
+                }
+            }
+
+            candidates.swap( surviving );
+        }
+
+        std::vector<uint32_t> graphValuePointers;
+        graphValuePointers.reserve( attributeNodeOffsets.size() );
+
+        for( size_t nodeOffset : attributeNodeOffsets )
+        {
+            const uint32_t pointer = m_cursor.U32At( nodeOffset + 0x3c );
+
+            if( pointer != 0 )
+                graphValuePointers.push_back( pointer );
+        }
+
+        size_t bestScore = 0;
+        std::optional<uint32_t> bestCandidate;
+        bool tied = false;
+
+        for( uint32_t candidate : candidates )
+        {
+            size_t score = 0;
+
+            for( uint32_t pointer : graphValuePointers )
+            {
+                if( pointer < candidate )
+                    continue;
+
+                const size_t valueOffset =
+                        static_cast<size_t>( pointer - candidate );
+
+                if( valueOffset + PADS_ATTR_VALUE_BYTES > m_data.size() )
+                    continue;
+
+                if( m_cursor.U32At( valueOffset + 0x04 ) == PADS_ATTR_VALUE_ACTIVE
+                    && m_cursor.U32At( valueOffset + 0x08 ) == 0 )
+                {
+                    ++score;
+                }
+            }
+
+            if( !bestCandidate || score > bestScore )
+            {
+                bestCandidate = candidate;
+                bestScore = score;
+                tied = false;
+            }
+            else if( score == bestScore )
+            {
+                tied = true;
+            }
+        }
+
+        if( bestCandidate && bestScore != 0 && !tied )
+            valueRelocation = *bestCandidate;
+    }
+
+    // Keep the validated v3 QUANTITY path isolated.  FREETEXT is
+    // decoded afterwards and cannot influence relocation discovery or CAM state.
+    if( valueRelocation )
+    {
+        for( VIA_LOCATION& via : viaLocations )
+        {
+            for( VIA_ATTRIBUTE_REF& attribute : via.attributes )
+            {
+                if( attribute.name != "CAM.Solder mask.Adjust"
+                    || attribute.valuePointer < *valueRelocation )
                 {
                     continue;
                 }
 
                 const size_t valueOffset =
-                        static_cast<size_t>( via.attributeValuePointer - valueRelocation );
+                        static_cast<size_t>( attribute.valuePointer - *valueRelocation );
 
-                if( valueOffset < physicalValuePoolBase
-                    || valueOffset + PADS_ATTR_VALUE_BYTES > m_data.size() )
-                {
+                if( !isQuantityRecord( valueOffset ) )
                     continue;
-                }
-
-                if( m_cursor.U32At( valueOffset + 0x04 ) != PADS_ATTR_VALUE_ACTIVE
-                    || m_cursor.U32At( valueOffset + 0x08 ) != 0
-                    || m_cursor.U32At( valueOffset + 0x0c ) != PADS_ATTR_VALUE_QUANTITY )
-                {
-                    continue;
-                }
 
                 uint64_t bits = 0;
 
                 for( size_t byte = 0; byte < sizeof( bits ); ++byte )
-                {
-                    bits |= static_cast<uint64_t>( m_cursor.U8At( valueOffset + 0x10 + byte ) )
+                    bits |= static_cast<uint64_t>(
+                                    m_cursor.U8At( valueOffset + 0x10 + byte ) )
                             << ( byte * 8 );
-                }
 
                 double quantity = 0.0;
                 std::memcpy( &quantity, &bits, sizeof( quantity ) );
+                attribute.quantityMeters = quantity;
+            }
+        }
+    }
 
-                if( std::isfinite( quantity ) )
-                    via.attributeQuantityMeters = quantity;
+    // PADS generic custom FREETEXT stream resolver v1.
+    //
+    // Custom attribute definitions do not use the built-in "Strings" controller:
+    // controlled saves show that their text records are serialized in a separate
+    // stream and that the stream handles are not referenced elsewhere in the DB.
+    // Consequently there is no trustworthy pointer join equivalent to the built-in
+    // definition resolver.
+    //
+    // What is structural and repeatable is the ordering.  For each unresolved 0x6c
+    // value class, PADS serializes:
+    //
+    //   <name component 0> ... <name component N-1> <value 0> ... <value M-1>
+    //
+    // where N is the graph-derived nameDepth and M is the number of VIA instances
+    // carrying that same (valueClass, nameDepth).  Resolve all custom FREETEXT
+    // groups in value-pool order and require the custom text stream to be consumed
+    // exactly.  If any structural check fails, leave the attributes unresolved.
+    // No literal attribute or value strings are matched here.
+    constexpr uint32_t PADS_ATTR_VALUE_FREETEXT = 0x6c;
 
+    if( valueRelocation )
+    {
+        struct TEXT_ATTRIBUTE_SLOT
+        {
+            size_t             valueOffset = 0;
+            VIA_ATTRIBUTE_REF* attribute = nullptr;
+        };
+
+        struct TEXT_ATTRIBUTE_GROUP
+        {
+            uint32_t                         valueClass = 0;
+            size_t                           nameDepth = 0;
+            std::vector<TEXT_ATTRIBUTE_SLOT> slots;
+        };
+
+        using TEXT_GROUP_KEY = std::pair<uint32_t, size_t>;
+        std::map<TEXT_GROUP_KEY, TEXT_ATTRIBUTE_GROUP> groupsByKey;
+
+        for( VIA_LOCATION& via : viaLocations )
+        {
+            for( VIA_ATTRIBUTE_REF& attribute : via.attributes )
+            {
+                // Built-in attributes are already resolved by the generic name
+                // resolver.  Only unresolved fallback nodes belong to this path.
+                if( !attribute.name.empty()
+                    || attribute.nameDepth == 0
+                    || attribute.valuePointer < *valueRelocation )
+                {
+                    continue;
+                }
+
+                const size_t valueOffset =
+                        static_cast<size_t>( attribute.valuePointer - *valueRelocation );
+
+                if( valueOffset + PADS_ATTR_VALUE_BYTES > m_data.size()
+                    || m_cursor.U32At( valueOffset + 0x04 ) != PADS_ATTR_VALUE_ACTIVE
+                    || m_cursor.U32At( valueOffset + 0x08 ) != 0
+                    || m_cursor.U32At( valueOffset + 0x0c ) != PADS_ATTR_VALUE_FREETEXT )
+                {
+                    continue;
+                }
+
+                const TEXT_GROUP_KEY key{ attribute.valueClass, attribute.nameDepth };
+                TEXT_ATTRIBUTE_GROUP& group = groupsByKey[key];
+                group.valueClass = attribute.valueClass;
+                group.nameDepth = attribute.nameDepth;
+                group.slots.push_back( { valueOffset, &attribute } );
+            }
+        }
+
+        if( !groupsByKey.empty() )
+        {
+            struct CUSTOM_TEXT_RECORD
+            {
+                size_t      offset = 0;
+                std::string text;
+            };
+
+            std::vector<CUSTOM_TEXT_RECORD> customTextRecords;
+
+            // Custom text record observed in controlled saves:
+            //   +0x00 u16 serialized length
+            //   +0x02 u16 0xffff
+            //   +0x04 u32 stream-local handle (0x10xxxxxx domain)
+            // followed, within the short record header, by duplicate
+            // { allocated, used } u16 lengths and printable payload.
+            for( size_t offset = 0; offset + 32 <= m_data.size(); ++offset )
+            {
+                const uint16_t serializedLength = m_cursor.U16At( offset + 0x00 );
+
+                if( serializedLength == 0 || serializedLength > 4096
+                    || m_cursor.U16At( offset + 0x02 ) != 0xffff )
+                {
+                    continue;
+                }
+
+                const uint32_t stringHandle = m_cursor.U32At( offset + 0x04 );
+
+                if( ( stringHandle & 0xff000000U ) != 0x10000000U )
+                    continue;
+
+                std::optional<size_t> payloadOffset;
+
+                for( size_t probe = offset + 8;
+                     probe + 4 + serializedLength <= m_data.size()
+                     && probe < offset + 24;
+                     ++probe )
+                {
+                    if( m_cursor.U16At( probe ) == serializedLength
+                        && m_cursor.U16At( probe + 2 ) == serializedLength )
+                    {
+                        payloadOffset = probe + 4;
+                        break;
+                    }
+                }
+
+                if( !payloadOffset )
+                    continue;
+
+                std::string text;
+                text.reserve( serializedLength );
+                bool printable = true;
+
+                for( uint16_t i = 0; i < serializedLength; ++i )
+                {
+                    const uint8_t ch = m_cursor.U8At( *payloadOffset + i );
+
+                    if( ch == 0 )
+                        break;
+
+                    if( ch < 0x20 || ch > 0x7e )
+                    {
+                        printable = false;
+                        break;
+                    }
+
+                    text.push_back( static_cast<char>( ch ) );
+                }
+
+                if( printable && !text.empty() )
+                    customTextRecords.push_back( { offset, std::move( text ) } );
             }
 
+            std::sort( customTextRecords.begin(), customTextRecords.end(),
+                       []( const CUSTOM_TEXT_RECORD& aLeft,
+                           const CUSTOM_TEXT_RECORD& aRight )
+                       {
+                           return aLeft.offset < aRight.offset;
+                       } );
+
+            std::vector<TEXT_ATTRIBUTE_GROUP*> orderedGroups;
+            orderedGroups.reserve( groupsByKey.size() );
+
+            for( auto& [key, group] : groupsByKey )
+            {
+                (void) key;
+
+                std::sort( group.slots.begin(), group.slots.end(),
+                           []( const TEXT_ATTRIBUTE_SLOT& aLeft,
+                               const TEXT_ATTRIBUTE_SLOT& aRight )
+                           {
+                               return aLeft.valueOffset < aRight.valueOffset;
+                           } );
+
+                orderedGroups.push_back( &group );
+            }
+
+            std::sort( orderedGroups.begin(), orderedGroups.end(),
+                       []( const TEXT_ATTRIBUTE_GROUP* aLeft,
+                           const TEXT_ATTRIBUTE_GROUP* aRight )
+                       {
+                           return aLeft->slots.front().valueOffset
+                                  < aRight->slots.front().valueOffset;
+                       } );
+
+            size_t requiredRecords = 0;
+
+            for( const TEXT_ATTRIBUTE_GROUP* group : orderedGroups )
+                requiredRecords += group->nameDepth + group->slots.size();
+
+            // Because the custom stream currently has no pointer join back into
+            // the graph, exact consumption is the discriminator against unrelated
+            // printable data elsewhere in the binary.
+            if( requiredRecords == customTextRecords.size() )
+            {
+                size_t cursor = 0;
+                bool valid = true;
+
+                for( TEXT_ATTRIBUTE_GROUP* group : orderedGroups )
+                {
+                    if( group->nameDepth == 0
+                        || cursor + group->nameDepth + group->slots.size()
+                                   > customTextRecords.size() )
+                    {
+                        valid = false;
+                        break;
+                    }
+
+                    std::string attributeName;
+
+                    for( size_t component = 0; component < group->nameDepth; ++component )
+                    {
+                        if( component != 0 )
+                            attributeName += '.';
+
+                        attributeName += customTextRecords[cursor + component].text;
+                    }
+
+                    cursor += group->nameDepth;
+
+                    for( TEXT_ATTRIBUTE_SLOT& slot : group->slots )
+                    {
+                        slot.attribute->name = attributeName;
+                        slot.attribute->textValue = customTextRecords[cursor].text;
+                        ++cursor;
+                    }
+                }
+
+                if( !valid || cursor != customTextRecords.size() )
+                {
+                    // Do not publish a partially reconstructed custom stream.
+                    for( TEXT_ATTRIBUTE_GROUP* group : orderedGroups )
+                    {
+                        for( TEXT_ATTRIBUTE_SLOT& slot : group->slots )
+                        {
+                            slot.attribute->name.clear();
+                            slot.attribute->textValue.reset();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3060,36 +3538,10 @@ std::vector<BINARY_PARSER::VIA_LOCATION> BINARY_PARSER::decodeViaLocations()
             existing.attributeHandle = via.attributeHandle;
 
 
-        if( existing.attributeValuePointer != 0 && via.attributeValuePointer != 0
-            && existing.attributeValuePointer != via.attributeValuePointer )
-        {
-            THROW_IO_ERROR( "Conflicting co-located PADS via attribute value pointers" );
-        }
-
-        if( existing.attributeValuePointer == 0 )
-        {
-            existing.attributeValueClass = via.attributeValueClass;
-            existing.attributeValuePointer = via.attributeValuePointer;
-        }
-
-
-        if( !existing.attributeName.empty() && !via.attributeName.empty()
-            && existing.attributeName != via.attributeName )
-        {
-            THROW_IO_ERROR( "Conflicting co-located PADS via attribute names" );
-        }
-
-        if( existing.attributeName.empty() )
-            existing.attributeName = via.attributeName;
-
-        if( existing.attributeQuantityMeters && via.attributeQuantityMeters
-            && *existing.attributeQuantityMeters != *via.attributeQuantityMeters )
-        {
-            THROW_IO_ERROR( "Conflicting co-located PADS via attribute quantities" );
-        }
-
-        if( !existing.attributeQuantityMeters )
-            existing.attributeQuantityMeters = via.attributeQuantityMeters;
+        if( existing.attributes.empty() )
+            existing.attributes = std::move( via.attributes );
+        else if( !via.attributes.empty() && existing.attributeHandle != via.attributeHandle )
+            THROW_IO_ERROR( "Conflicting co-located PADS via attributes" );
 
         if( via.relationshipNet )
         {
@@ -3133,12 +3585,29 @@ std::map<std::string, ROUTE> BINARY_PARSER::seedRoutesFromVias( const std::vecto
         viaDef.start_layer = 1;
         viaDef.end_layer = m_parameters.layer_count;
 
-        if( !via.attributeName.empty() && via.attributeQuantityMeters )
+        for( const VIA_ATTRIBUTE_REF& binaryAttribute : via.attributes )
         {
+            if( binaryAttribute.name.empty() )
+                continue;
+
             PADS_TYPED_ATTRIBUTE attribute;
-            attribute.name = via.attributeName;
-            attribute.type = PADS_ATTRIBUTE_TYPE::QUANTITY;
-            attribute.value = *via.attributeQuantityMeters;
+            attribute.name = binaryAttribute.name;
+
+            if( binaryAttribute.quantityMeters )
+            {
+                attribute.type = PADS_ATTRIBUTE_TYPE::QUANTITY;
+                attribute.value = *binaryAttribute.quantityMeters;
+            }
+            else if( binaryAttribute.textValue )
+            {
+                attribute.type = PADS_ATTRIBUTE_TYPE::TEXT;
+                attribute.value = *binaryAttribute.textValue;
+            }
+            else
+            {
+                continue;
+            }
+
             viaDef.attributes.push_back( std::move( attribute ) );
         }
 
